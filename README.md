@@ -66,6 +66,42 @@ I'll be the one you're looking for
 the one you're looking for
 ```
 
+## Docker
+
+If you'd rather not install `ffmpeg` and the torch/whisperx stack on your
+host, there's a `Dockerfile` that bundles everything. The image is CPU-only
+(~660 MB — the wav2vec2 model downloads to a mounted cache volume on first
+run, not baked into the image) and uses `python:3.11-slim` as the base.
+
+```bash
+# Build once. Takes a while — whisperx pulls torch, transformers, etc.
+docker build -t lyricsync:latest .
+```
+
+The typical invocation mounts your current directory at `/work` inside the
+container and persists the wav2vec2 / HuggingFace model cache in a named
+volume so you don't re-download ~1 GB on every run:
+
+```bash
+# Using the wrapper script (recommended):
+./run.sh align video.mp4 lyrics.txt --output-dir ./out
+
+# Or the raw docker run equivalent:
+docker run --rm -it \
+    -v "$PWD":/work \
+    -v lyricsync-cache:/cache \
+    lyricsync:latest align video.mp4 lyrics.txt --output-dir ./out
+```
+
+The first alignment run will download the wav2vec2 phoneme model (several
+hundred MB) into the `lyricsync-cache` volume — expect a minute or two of
+network time before alignment actually starts. Subsequent runs reuse the
+cache and skip the download.
+
+GPU support is a v1+ concern; the image ships CPU-only torch wheels
+(`--extra-index-url https://download.pytorch.org/whl/cpu`) to keep the
+image from ballooning past 5 GB with CUDA libraries we can't use anyway.
+
 ## Development
 
 ```bash

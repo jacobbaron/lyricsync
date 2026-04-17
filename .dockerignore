@@ -1,0 +1,48 @@
+# VCS
+.git
+.gitignore
+
+# Python caches
+__pycache__
+**/__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+.eggs
+build
+dist
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Virtual envs
+.venv
+venv
+env
+
+# uv
+.uv-cache
+
+# Editor / OS
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Project output / artifacts
+out
+*.srt
+*.vtt
+*.ass
+*.wav
+preview.mp4
+alignment.json
+
+# Model caches (never ship these into build context)
+.cache
+huggingface
+torch_cache
+
+# Claude / demo
+.claude
+demo_example
