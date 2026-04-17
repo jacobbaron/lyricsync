@@ -20,6 +20,7 @@ def _line(text: str, start: float, end: float) -> AlignedLine:
 
 def test_escape_handles_special_chars():
     assert escape_drawtext("plain") == "plain"
+    assert escape_drawtext("1, 2") == r"1\, 2"
     assert escape_drawtext("a:b") == r"a\:b"
     assert escape_drawtext("50%") == r"50\%"
     assert escape_drawtext("it's") == r"it\'s"
@@ -42,8 +43,8 @@ def test_filter_contains_one_entry_per_line():
     # chained with commas — ffmpeg's filter separator
     assert vf.count("drawtext=") == 2
     # each line's time window shows up in its enable= clause
-    assert "between(t,1.000,2.000)" in vf
-    assert "between(t,3.000,4.500)" in vf
+    assert r"between(t\,1.000\,2.000)" in vf
+    assert r"between(t\,3.000\,4.500)" in vf
     # text values are quoted
     assert "text='first'" in vf
     assert "text='second'" in vf
@@ -63,3 +64,10 @@ def test_filter_escapes_colons_in_text():
     result = AlignmentResult(lines=(_line("1:23 a.m.", 0.0, 1.0),))
     vf = build_drawtext_filter(result)
     assert r"1\:23" in vf
+
+
+def test_filter_escapes_commas_in_text():
+    # commas would otherwise split chained filters unexpectedly
+    result = AlignmentResult(lines=(_line("1, 2, 3, 4!", 0.0, 1.0),))
+    vf = build_drawtext_filter(result)
+    assert r"1\, 2\, 3\, 4!" in vf

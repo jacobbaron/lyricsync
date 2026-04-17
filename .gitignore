@@ -33,9 +33,8 @@ out/
 preview.mp4
 alignment.json
 
-# Demo video files (>100 MB, over GitHub limit — store locally)
-demo_example/*.mov
-demo_example/*.mp4
+# Demo assets (large video + local lyrics; keep out of repo)
+demo_example/
 
 # But don't ignore test fixtures
 !tests/fixtures/**
