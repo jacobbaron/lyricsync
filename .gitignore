@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv
+.uv-cache/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Project output
+out/
+*.srt
+*.vtt
+*.ass
+*.wav
+preview.mp4
+alignment.json
+
+# But don't ignore test fixtures
+!tests/fixtures/**
