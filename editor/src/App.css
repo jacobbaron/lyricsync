@@ -1,0 +1,148 @@
+.shell {
+  max-width: 52rem;
+  margin: 0 auto;
+  padding: 1.25rem 1rem 2rem;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    sans-serif;
+  color: #e8e8ed;
+  background: #121218;
+  min-height: 100vh;
+}
+
+.top h1 {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.row button,
+.row select {
+  font: inherit;
+}
+
+.row button {
+  padding: 0.35rem 0.65rem;
+  border-radius: 6px;
+  border: 1px solid #3a3a44;
+  background: #1e1e28;
+  color: inherit;
+  cursor: pointer;
+}
+
+.row button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.row button.primary {
+  border-color: #4c6fff;
+  background: #2a3a8a;
+}
+
+.muted {
+  color: #9898a8;
+  font-size: 0.9rem;
+}
+
+.err {
+  color: #f88;
+  margin: 0 0 0.75rem;
+}
+
+.transport {
+  margin-bottom: 1rem;
+}
+
+.transport audio {
+  width: 100%;
+  max-height: 2.5rem;
+}
+
+.lines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.line-block {
+  margin-bottom: 0.5rem;
+}
+
+.line-hit {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid #2a2a34;
+  background: #1a1a22;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.line-hit .times {
+  display: block;
+  font-size: 0.75rem;
+  color: #9898a8;
+  font-variant-numeric: tabular-nums;
+}
+
+.line-hit .txt {
+  display: block;
+  margin-top: 0.2rem;
+}
+
+.line-hit.sel,
+.word.sel {
+  border-color: #4c6fff;
+  background: #222838;
+}
+
+.word-row {
+  border: 1px solid #2a2a34;
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+  background: #1a1a22;
+}
+
+.line-label {
+  display: block;
+  font-size: 0.8rem;
+  color: #9898a8;
+  margin-bottom: 0.35rem;
+}
+
+.words {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.word {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.25rem 0.4rem;
+  border-radius: 6px;
+  border: 1px solid #333;
+  background: #16161c;
+  color: inherit;
+  cursor: pointer;
+}
+
+.word .times {
+  display: block;
+  font-size: 0.65rem;
+  color: #7878a0;
+  font-variant-numeric: tabular-nums;
+}

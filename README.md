@@ -11,11 +11,11 @@ v0 scope:
 - Audio extraction via `ffmpeg` (16 kHz mono wav).
 - Forced alignment via WhisperX's `align()` + wav2vec2 phoneme model,
   using the provided lyrics as the fixed transcript.
-- Output: `captions.srt` and `preview.mp4` (original video with the
-  current lyric line overlaid via `ffmpeg drawtext`).
+- Output: `alignment.json` (word-level), `captions.srt`, `preview.mp4`
+  (line captions via ffmpeg `subtitles`), and extracted `audio.wav`.
 
-No vocal separation, no plugin Protocols, no VTT/ASS/JSON, no
-active-word highlighting yet — those are v1. The point of v0 is to
+No vocal separation, no plugin Protocols, no VTT/ASS export, no
+karaoke preview yet — those are v1+. The point of v0 is to
 find out whether raw WhisperX alignment on a mixed-down music video is
 good enough to justify the rest.
 
@@ -47,12 +47,23 @@ pipx install .
 
 ```bash
 lyricsync align path/to/video.mp4 path/to/lyrics.txt
-# → ./out/captions.srt
-# → ./out/preview.mp4
+# → ./out/alignment.json, ./out/audio.wav, ./out/captions.srt, ./out/preview.mp4
 
 lyricsync align video.mp4 lyrics.txt --output-dir ./my-out --device cuda
 lyricsync align --help
 ```
+
+**Timing editor (optional).** Install `starlette` + `uvicorn` with
+`uv sync --extra editor` (or `--extra dev`). Then:
+
+```bash
+lyricsync serve -o ./out
+# Open http://127.0.0.1:8765/ — adjust timings, Save, then regenerate deliverables:
+lyricsync render path/to/video.mp4 -o ./out
+```
+
+Rebuild the bundled web UI after editing `editor/`: `cd editor && npm ci && npm run build`
+(requires Node.js only at build time).
 
 **Lyrics file format.** One caption line per line. Blank lines are
 preserved as gaps but aren't emitted as captions. No timestamps — that's
@@ -119,13 +130,17 @@ in v0.
 
 ```
 src/lyricsync/
-  cli.py         # typer entrypoint
-  lyrics.py      # lyrics file parsing
-  extract.py     # ffmpeg audio extraction
-  align.py       # WhisperX wav2vec2 forced alignment
-  alignment.py   # AlignmentResult dataclasses + word→line aggregation
-  srt.py         # SRT writer
-  preview.py     # drawtext preview renderer
+  cli.py            # typer entrypoint (align, render, serve)
+  lyrics.py         # lyrics file parsing
+  extract.py        # ffmpeg audio extraction
+  align.py          # WhisperX wav2vec2 forced alignment
+  alignment.py      # AlignmentResult dataclasses + word→line aggregation
+  alignment_json.py # alignment.json read/write
+  serve_app.py      # local Starlette app for the timing editor
+  editor_static/    # built Vite UI (run `npm run build` in editor/)
+  srt.py            # SRT writer
+  preview.py        # preview MP4 (subtitles burn-in)
+editor/             # Vite + React timing editor source
 tests/
 ```
 
