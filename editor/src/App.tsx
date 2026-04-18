@@ -6,13 +6,18 @@ const NUDGE_SEC = 0.05
 const DRAG_THRESHOLD_PX = 4
 const DRAG_MS_PER_PX = 2
 const DRAG_MS_PER_PX_COARSE = 20
+const EDGE_HANDLE_PX = 14
+const ZOOM_PAD_SEC = 2.0
 
 type DragAnchor = 'both' | 'start' | 'end'
+
 type DragState = {
   lineIdx: number
   anchor: DragAnchor
   startClientX: number
+  msPerPx: number
   deltaSec: number
+  source: 'list' | 'zoom'
 }
 
 function cloneLines(lines: AlignedLine[]): AlignedLine[] {
@@ -48,6 +53,33 @@ function lineFullySelected(
   return line.words.every((_, wi) => selected.has(wordKey(lineIdx, wi)))
 }
 
+// The exclusively-selected line, if any: returns the line index iff all
+// selected word keys belong to a single fully-selected line. Used to
+// decide when the zoom-loop sub-panel should appear.
+function getSingleSelectedLine(
+  lines: AlignedLine[],
+  selected: Set<string>,
+): number | null {
+  if (selected.size === 0) return null
+  let target: number | null = null
+  for (const key of selected) {
+    const m = /^W(\d+)-(\d+)$/.exec(key)
+    if (!m) return null
+    const li = Number(m[1])
+    if (target === null) target = li
+    else if (target !== li) return null
+  }
+  if (target === null) return null
+  if (!lineFullySelected(lines[target], target, selected)) return null
+  return target
+}
+
+function hitTestAnchor(relX: number, boxWidth: number): DragAnchor {
+  if (relX < EDGE_HANDLE_PX) return 'start'
+  if (relX > boxWidth - EDGE_HANDLE_PX) return 'end'
+  return 'both'
+}
+
 export default function App() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -61,9 +93,12 @@ export default function App() {
   const [saving, setSaving] = useState(false)
   const [playingLineIdx, setPlayingLineIdx] = useState<number | null>(null)
   const [dragState, setDragState] = useState<DragState | null>(null)
+  const [loopEnabled, setLoopEnabled] = useState(false)
+  const [currentTime, setCurrentTime] = useState(0)
 
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const suppressNextClickRef = useRef(false)
+  const zoomPanelRef = useRef<HTMLDivElement | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -132,6 +167,8 @@ export default function App() {
     [lines],
   )
 
+  // Shift ALL selected words by deltaSec. Used for 'both'-anchor drags
+  // and the existing ±50ms buttons.
   const applyNudge = useCallback(
     (deltaSec: number) => {
       if (selected.size === 0) return
@@ -155,14 +192,75 @@ export default function App() {
     [selected, pushUndo],
   )
 
-  const selectedCount = useMemo(() => selected.size, [selected])
+  // Shift one edge of a single line: 'start' moves the first word's
+  // start; 'end' moves the last word's end. Interior word timings are
+  // unchanged. Used by edge-drag in the main list and the zoom-loop view.
+  const applyEdgeShift = useCallback(
+    (lineIdx: number, anchor: 'start' | 'end', deltaSec: number) => {
+      if (deltaSec === 0) return
+      pushUndo()
+      setLines((prev) => {
+        const next = cloneLines(prev)
+        const line = next[lineIdx]
+        if (line.words.length === 0) return prev
+        if (anchor === 'start') {
+          const w = line.words[0]
+          // Clamp: don't push start past end, and never below 0.
+          const newStart = Math.max(0, Math.min(w.end, w.start + deltaSec))
+          w.start = newStart
+        } else {
+          const w = line.words[line.words.length - 1]
+          // Clamp: don't drag end before start.
+          const newEnd = Math.max(w.start, w.end + deltaSec)
+          w.end = newEnd
+        }
+        next[lineIdx] = recomputeLine(line)
+        return next
+      })
+      setDirty(true)
+    },
+    [pushUndo],
+  )
 
-  // Playback-position highlight: scan lines for the one whose window
-  // contains the audio's current time. Linear scan; line counts are small.
+  const selectedCount = useMemo(() => selected.size, [selected])
+  const singleSelectedLine = useMemo(
+    () => getSingleSelectedLine(lines, selected),
+    [lines, selected],
+  )
+
+  // Seek the audio element to a given time and start playback. Used by
+  // the ▶ "jump to" button on each line and the zoom-loop controls.
+  const seekTo = useCallback((sec: number, play = true) => {
+    const a = audioRef.current
+    if (!a) return
+    a.currentTime = Math.max(0, sec)
+    setCurrentTime(a.currentTime)
+    if (play) void a.play().catch(() => {})
+  }, [])
+
+  // Playback-position highlight + zoom-loop wrap-around. Scans lines
+  // for the one whose window contains the current time; if looping is
+  // active and the time has passed the selected line's end (+ pad),
+  // wraps back to the window start.
   const handleTimeUpdate = useCallback(() => {
     const a = audioRef.current
     if (!a) return
     const t = a.currentTime
+    if (
+      loopEnabled &&
+      singleSelectedLine !== null &&
+      lines[singleSelectedLine]
+    ) {
+      const line = lines[singleSelectedLine]
+      const winStart = Math.max(0, line.start - ZOOM_PAD_SEC)
+      const winEnd = line.end + ZOOM_PAD_SEC
+      if (t >= winEnd || t < winStart) {
+        a.currentTime = winStart
+        setCurrentTime(winStart)
+        return
+      }
+    }
+    setCurrentTime(t)
     let found: number | null = null
     for (let i = 0; i < lines.length; i++) {
       const L = lines[i]
@@ -172,16 +270,17 @@ export default function App() {
       }
     }
     setPlayingLineIdx(found)
-  }, [lines])
+  }, [lines, loopEnabled, singleSelectedLine])
 
-  // Drag-to-shift: pointerdown selects (if not already selected) and
-  // starts a drag; pointermove accumulates delta; pointerup commits via
-  // the existing applyNudge. The DragAnchor field is plumbed through so
-  // edge-drag ('start'/'end') is a drop-in future change.
+  // Drag-to-shift (list view). Hit-tests for edge vs. body anchor.
+  // Keyboard activation goes through onClick as before.
   const handleLinePointerDown = useCallback(
     (li: number, e: React.PointerEvent<HTMLButtonElement>) => {
       if (view !== 'line') return
-      if (e.button !== undefined && e.button !== 0) return // left button only
+      if (e.button !== undefined && e.button !== 0) return
+      const rect = e.currentTarget.getBoundingClientRect()
+      const relX = e.clientX - rect.left
+      const anchor = hitTestAnchor(relX, rect.width)
       e.currentTarget.setPointerCapture(e.pointerId)
       if (!lineFullySelected(lines[li], li, selected)) {
         selectLineWords(li, e.shiftKey)
@@ -189,9 +288,11 @@ export default function App() {
       suppressNextClickRef.current = true
       setDragState({
         lineIdx: li,
-        anchor: 'both',
+        anchor,
         startClientX: e.clientX,
+        msPerPx: DRAG_MS_PER_PX,
         deltaSec: 0,
+        source: 'list',
       })
     },
     [view, lines, selected, selectLineWords],
@@ -200,47 +301,65 @@ export default function App() {
   const handleLinePointerMove = useCallback(
     (e: React.PointerEvent<HTMLButtonElement>) => {
       setDragState((prev) => {
-        if (!prev) return prev
+        if (!prev || prev.source !== 'list') return prev
         const rawDelta = e.clientX - prev.startClientX
         if (Math.abs(rawDelta) < DRAG_THRESHOLD_PX && prev.deltaSec === 0) {
           return prev
         }
         const msPerPx = e.shiftKey ? DRAG_MS_PER_PX_COARSE : DRAG_MS_PER_PX
-        return { ...prev, deltaSec: (rawDelta * msPerPx) / 1000 }
+        return { ...prev, msPerPx, deltaSec: (rawDelta * msPerPx) / 1000 }
       })
     },
     [],
   )
 
+  const commitDrag = useCallback(
+    (d: DragState) => {
+      if (d.deltaSec === 0) return
+      if (d.anchor === 'both') {
+        applyNudge(d.deltaSec)
+      } else {
+        applyEdgeShift(d.lineIdx, d.anchor, d.deltaSec)
+      }
+    },
+    [applyNudge, applyEdgeShift],
+  )
+
   const handleLinePointerUp = useCallback(
     (_e: React.PointerEvent<HTMLButtonElement>) => {
-      if (dragState && dragState.deltaSec !== 0) {
-        applyNudge(dragState.deltaSec)
+      if (dragState && dragState.source === 'list') {
+        commitDrag(dragState)
       }
       setDragState(null)
     },
-    [dragState, applyNudge],
+    [dragState, commitDrag],
   )
 
-  const handleLinePointerCancel = useCallback(
-    (_e: React.PointerEvent<HTMLButtonElement>) => {
-      setDragState(null)
-    },
-    [],
-  )
+  const handleLinePointerCancel = useCallback(() => setDragState(null), [])
 
-  // Auto-scroll the playing line into view so long songs don't require
-  // manual scrolling to follow playback. `block: 'nearest'` avoids
-  // scrolling when the line is already on-screen.
+  // Auto-scroll the playing line into view during playback, but never
+  // during a drag (the user is interacting, don't yank the viewport).
   useEffect(() => {
-    if (playingLineIdx === null) return
+    if (playingLineIdx === null || dragState !== null) return
     const el = document.querySelector(
       `[data-line-idx="${playingLineIdx}"]`,
     )
     if (el instanceof HTMLElement) {
       el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
     }
-  }, [playingLineIdx])
+  }, [playingLineIdx, dragState])
+
+  // When the loop toggle flips on, seek to the window start so the
+  // user hears the loop from the beginning.
+  useEffect(() => {
+    if (!loopEnabled || singleSelectedLine === null) return
+    const line = lines[singleSelectedLine]
+    if (!line) return
+    const winStart = Math.max(0, line.start - ZOOM_PAD_SEC)
+    seekTo(winStart, true)
+    // Only re-fire when loop toggles on or the target line changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loopEnabled, singleSelectedLine])
 
   const save = useCallback(async () => {
     setSaving(true)
@@ -279,7 +398,27 @@ export default function App() {
   }
 
   const dragActive = dragState !== null
-  const dragDelta = dragState?.deltaSec ?? 0
+
+  // Compute the live-preview delta for a given line index, respecting
+  // anchor. 'both' shifts both edges; 'start'/'end' shift only one.
+  function previewDeltaFor(li: number): {
+    dStart: number
+    dEnd: number
+  } {
+    if (!dragState) return { dStart: 0, dEnd: 0 }
+    // For 'both' drags, the delta applies to every selected line; for
+    // edge drags, only to the dragged line.
+    if (dragState.anchor === 'both') {
+      const selHere = lineFullySelected(lines[li], li, selected)
+      return selHere
+        ? { dStart: dragState.deltaSec, dEnd: dragState.deltaSec }
+        : { dStart: 0, dEnd: 0 }
+    }
+    if (dragState.lineIdx !== li) return { dStart: 0, dEnd: 0 }
+    return dragState.anchor === 'start'
+      ? { dStart: dragState.deltaSec, dEnd: 0 }
+      : { dStart: 0, dEnd: dragState.deltaSec }
+  }
 
   return (
     <div className="shell">
@@ -333,8 +472,9 @@ export default function App() {
           </button>
         </div>
         <p className="muted hint">
-          Tip: click a line to select, drag horizontally to shift its timing
-          (Shift = coarse).
+          Tip: click a line to select. Drag the middle to shift both ends;
+          drag the left/right edge to move just that boundary. Shift =
+          coarse. ▶ jumps to that line.
         </p>
       </header>
 
@@ -358,14 +498,27 @@ export default function App() {
         </audio>
       </section>
 
+      {singleSelectedLine !== null ? (
+        <ZoomLoop
+          panelRef={zoomPanelRef}
+          line={lines[singleSelectedLine]}
+          lineIdx={singleSelectedLine}
+          currentTime={currentTime}
+          loopEnabled={loopEnabled}
+          setLoopEnabled={setLoopEnabled}
+          seekTo={seekTo}
+          setDragState={setDragState}
+          commitDrag={commitDrag}
+          previewDeltaFor={previewDeltaFor}
+        />
+      ) : null}
+
       <ul className="lines">
         {lines.map((line, li) => {
           const selectedHere = lineFullySelected(line, li, selected)
-          // Live drag preview: any selected line shifts with the current
-          // drag delta until commit. The committed state is unchanged.
-          const delta = dragActive && selectedHere ? dragDelta : 0
-          const displayStart = Math.max(0, line.start + delta)
-          const displayEnd = Math.max(displayStart, line.end + delta)
+          const { dStart, dEnd } = previewDeltaFor(li)
+          const displayStart = Math.max(0, line.start + dStart)
+          const displayEnd = Math.max(displayStart, line.end + dEnd)
           const isPlaying = playingLineIdx === li
           const classes = [
             'line-hit',
@@ -381,36 +534,54 @@ export default function App() {
               data-line-idx={li}
             >
               {view === 'line' ? (
-                <button
-                  type="button"
-                  className={classes}
-                  onPointerDown={(e) => handleLinePointerDown(li, e)}
-                  onPointerMove={handleLinePointerMove}
-                  onPointerUp={handleLinePointerUp}
-                  onPointerCancel={handleLinePointerCancel}
-                  onClick={(e) => {
-                    if (suppressNextClickRef.current) {
-                      suppressNextClickRef.current = false
+                <div className="line-row">
+                  <button
+                    type="button"
+                    className="jump-btn"
+                    title={`Jump to ${line.start.toFixed(2)}s`}
+                    onClick={(e) => {
                       e.preventDefault()
-                      return
-                    }
-                    // Keyboard activation path (Enter/Space) — pointerdown
-                    // didn't fire, so select here.
-                    selectLineWords(li, e.shiftKey)
-                  }}
-                >
-                  <span className="times">
-                    {displayStart.toFixed(3)} → {displayEnd.toFixed(3)}
-                    {delta !== 0 ? (
-                      <span className="drag-delta">
-                        {' '}
-                        ({delta >= 0 ? '+' : ''}
-                        {Math.round(delta * 1000)} ms)
-                      </span>
-                    ) : null}
-                  </span>
-                  <span className="txt">{line.text}</span>
-                </button>
+                      e.stopPropagation()
+                      seekTo(line.start, true)
+                    }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    ▶
+                  </button>
+                  <button
+                    type="button"
+                    className={classes}
+                    onPointerDown={(e) => handleLinePointerDown(li, e)}
+                    onPointerMove={handleLinePointerMove}
+                    onPointerUp={handleLinePointerUp}
+                    onPointerCancel={handleLinePointerCancel}
+                    onClick={(e) => {
+                      if (suppressNextClickRef.current) {
+                        suppressNextClickRef.current = false
+                        e.preventDefault()
+                        return
+                      }
+                      selectLineWords(li, e.shiftKey)
+                    }}
+                  >
+                    <span className="edge edge-l" />
+                    <span className="edge edge-r" />
+                    <span className="times">
+                      {displayStart.toFixed(3)} → {displayEnd.toFixed(3)}
+                      {dStart !== 0 || dEnd !== 0 ? (
+                        <span className="drag-delta">
+                          {' '}
+                          ({dStart !== dEnd
+                            ? dStart !== 0
+                              ? `start ${dStart >= 0 ? '+' : ''}${Math.round(dStart * 1000)} ms`
+                              : `end ${dEnd >= 0 ? '+' : ''}${Math.round(dEnd * 1000)} ms`
+                            : `${dStart >= 0 ? '+' : ''}${Math.round(dStart * 1000)} ms`})
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className="txt">{line.text}</span>
+                  </button>
+                </div>
               ) : (
                 <div
                   className={
@@ -447,5 +618,197 @@ export default function App() {
         })}
       </ul>
     </div>
+  )
+  // (dragActive is referenced by CSS via body-level state if desired
+  // in a future iteration; currently only used to gate auto-scroll.)
+  void dragActive
+}
+
+// ---------------------------------------------------------------------
+// Zoom-loop sub-panel
+// ---------------------------------------------------------------------
+
+type ZoomLoopProps = {
+  panelRef: React.RefObject<HTMLDivElement | null>
+  line: AlignedLine
+  lineIdx: number
+  currentTime: number
+  loopEnabled: boolean
+  setLoopEnabled: (v: boolean) => void
+  seekTo: (sec: number, play?: boolean) => void
+  setDragState: React.Dispatch<React.SetStateAction<DragState | null>>
+  commitDrag: (d: DragState) => void
+  previewDeltaFor: (li: number) => { dStart: number; dEnd: number }
+}
+
+function ZoomLoop({
+  panelRef,
+  line,
+  lineIdx,
+  currentTime,
+  loopEnabled,
+  setLoopEnabled,
+  seekTo,
+  setDragState,
+  commitDrag,
+  previewDeltaFor,
+}: ZoomLoopProps) {
+  const trackRef = useRef<HTMLDivElement | null>(null)
+
+  const winStart = Math.max(0, line.start - ZOOM_PAD_SEC)
+  const winEnd = line.end + ZOOM_PAD_SEC
+  const winDur = winEnd - winStart
+
+  const { dStart, dEnd } = previewDeltaFor(lineIdx)
+  const blockStart = Math.max(0, line.start + dStart)
+  const blockEnd = Math.max(blockStart, line.end + dEnd)
+
+  const pctStart = ((blockStart - winStart) / winDur) * 100
+  const pctEnd = ((blockEnd - winStart) / winDur) * 100
+  const pctWidth = Math.max(0.5, pctEnd - pctStart)
+  const pctPlayhead = ((currentTime - winStart) / winDur) * 100
+  const playheadInRange = pctPlayhead >= 0 && pctPlayhead <= 100
+
+  const startZoomDrag = useCallback(
+    (anchor: DragAnchor, e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.button !== undefined && e.button !== 0) return
+      const rect = trackRef.current?.getBoundingClientRect()
+      if (!rect) return
+      const secPerPx = winDur / rect.width
+      e.currentTarget.setPointerCapture(e.pointerId)
+      e.stopPropagation()
+      setDragState({
+        lineIdx,
+        anchor,
+        startClientX: e.clientX,
+        msPerPx: secPerPx * 1000,
+        deltaSec: 0,
+        source: 'zoom',
+      })
+    },
+    [lineIdx, setDragState, winDur],
+  )
+
+  const onZoomPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      setDragState((prev) => {
+        if (!prev || prev.source !== 'zoom') return prev
+        const rawDelta = e.clientX - prev.startClientX
+        const msPerPx = prev.msPerPx * (e.shiftKey ? 5 : 1)
+        return {
+          ...prev,
+          deltaSec: (rawDelta * msPerPx) / 1000,
+        }
+      })
+    },
+    [setDragState],
+  )
+
+  const onZoomPointerUp = useCallback(() => {
+    setDragState((prev) => {
+      if (prev && prev.source === 'zoom') commitDrag(prev)
+      return null
+    })
+  }, [commitDrag, setDragState])
+
+  // Time-ruler ticks every 100ms. Position by percentage so SVG/ruler
+  // resizes with the panel width.
+  const ticks: number[] = useMemo(() => {
+    const out: number[] = []
+    const startTick = Math.ceil(winStart * 10) / 10
+    for (let t = startTick; t <= winEnd + 1e-9; t += 0.1) {
+      out.push(Math.round(t * 1000) / 1000)
+    }
+    return out
+  }, [winStart, winEnd])
+
+  return (
+    <section className="zoom-loop" ref={panelRef}>
+      <div className="zoom-head">
+        <span className="zoom-title">
+          Zoom: <em>{line.text}</em>
+        </span>
+        <span className="zoom-times">
+          {blockStart.toFixed(3)} → {blockEnd.toFixed(3)} s
+        </span>
+        <button
+          type="button"
+          onClick={() => seekTo(winStart, true)}
+          title="Play from window start"
+        >
+          ▶ Play
+        </button>
+        <label className="loop-toggle">
+          <input
+            type="checkbox"
+            checked={loopEnabled}
+            onChange={(e) => setLoopEnabled(e.target.checked)}
+          />
+          Loop
+        </label>
+      </div>
+      <div
+        className="zoom-track"
+        ref={trackRef}
+        onPointerMove={onZoomPointerMove}
+        onPointerUp={onZoomPointerUp}
+        onPointerCancel={onZoomPointerUp}
+        onClick={(e) => {
+          // Click on empty track area seeks to that time.
+          if (e.target !== e.currentTarget) return
+          const rect = trackRef.current?.getBoundingClientRect()
+          if (!rect) return
+          const relX = e.clientX - rect.left
+          const t = winStart + (relX / rect.width) * winDur
+          seekTo(t, false)
+        }}
+      >
+        <div className="zoom-ruler" aria-hidden="true">
+          {ticks.map((t) => {
+            const pct = ((t - winStart) / winDur) * 100
+            const major = Math.abs(t - Math.round(t * 2) / 2) < 1e-6
+            return (
+              <span
+                key={t}
+                className={major ? 'tick major' : 'tick'}
+                style={{ left: `${pct}%` }}
+              >
+                {major ? (
+                  <span className="tick-label">{t.toFixed(1)}</span>
+                ) : null}
+              </span>
+            )
+          })}
+        </div>
+        <div
+          className="zoom-block"
+          style={{ left: `${pctStart}%`, width: `${pctWidth}%` }}
+          onPointerDown={(e) => startZoomDrag('both', e)}
+          title="Drag to shift both ends"
+        >
+          <div
+            className="zoom-handle zoom-handle-l"
+            onPointerDown={(e) => startZoomDrag('start', e)}
+            title="Drag to move start"
+          />
+          <div
+            className="zoom-handle zoom-handle-r"
+            onPointerDown={(e) => startZoomDrag('end', e)}
+            title="Drag to move end"
+          />
+        </div>
+        {playheadInRange ? (
+          <div
+            className="zoom-playhead"
+            style={{ left: `${pctPlayhead}%` }}
+            aria-hidden="true"
+          />
+        ) : null}
+      </div>
+      <p className="muted hint zoom-hint">
+        Click the track to seek. Drag the block body to shift both ends;
+        drag a side handle to move just that boundary. Shift = coarse.
+      </p>
+    </section>
   )
 }

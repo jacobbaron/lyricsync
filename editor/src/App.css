@@ -78,9 +78,39 @@
   margin-bottom: 0.5rem;
 }
 
+.line-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+
+.jump-btn {
+  flex: 0 0 auto;
+  align-self: stretch;
+  padding: 0 0.6rem;
+  border-radius: 8px;
+  border: 1px solid #2a2a34;
+  background: #15151d;
+  color: #9898a8;
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+
+.jump-btn:hover {
+  color: #f5a623;
+  border-color: #f5a623;
+  background: #1e1a14;
+}
+
 .line-hit {
   display: block;
-  width: 100%;
+  flex: 1 1 auto;
+  position: relative;
   text-align: left;
   padding: 0.5rem 0.65rem;
   border-radius: 8px;
@@ -92,6 +122,35 @@
   touch-action: none;
   user-select: none;
   transition: box-shadow 0.12s ease;
+  overflow: hidden;
+}
+
+/* Subtle vertical bars along the left/right edges of a line card to
+   hint that those strips are "grab the boundary" zones (14px wide,
+   matching EDGE_HANDLE_PX). Barely visible at rest; brightens on hover. */
+.line-hit .edge {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 14px;
+  pointer-events: none;
+  border-left: 1px dashed transparent;
+  border-right: 1px dashed transparent;
+  transition: border-color 0.12s ease;
+}
+.line-hit .edge-l {
+  left: 0;
+  border-left-color: #2f2f3a;
+}
+.line-hit .edge-r {
+  right: 0;
+  border-right-color: #2f2f3a;
+}
+.line-hit:hover .edge-l {
+  border-left-color: #555566;
+}
+.line-hit:hover .edge-r {
+  border-right-color: #555566;
 }
 
 .line-hit .times {
@@ -169,4 +228,144 @@
   font-size: 0.65rem;
   color: #7878a0;
   font-variant-numeric: tabular-nums;
+}
+
+/* -----------------------------------------------------------------
+   Zoom-loop sub-panel
+   ----------------------------------------------------------------- */
+
+.zoom-loop {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.75rem 0.55rem;
+  border: 1px solid #2a2a34;
+  border-radius: 8px;
+  background: #161622;
+}
+
+.zoom-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.zoom-title {
+  color: #9898a8;
+}
+.zoom-title em {
+  color: #e8e8ed;
+  font-style: normal;
+  font-weight: 500;
+}
+
+.zoom-times {
+  color: #9898a8;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+}
+
+.zoom-head button {
+  font: inherit;
+  padding: 0.25rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid #3a3a44;
+  background: #1e1e28;
+  color: inherit;
+  cursor: pointer;
+}
+
+.loop-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+  user-select: none;
+}
+.loop-toggle input {
+  accent-color: #f5a623;
+}
+
+.zoom-track {
+  position: relative;
+  height: 52px;
+  border-radius: 6px;
+  background: #101018;
+  border: 1px solid #232330;
+  touch-action: none;
+  user-select: none;
+}
+
+.zoom-ruler {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+}
+
+.zoom-ruler .tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #23233a;
+}
+.zoom-ruler .tick.major {
+  background: #34344c;
+}
+.zoom-ruler .tick-label {
+  position: absolute;
+  top: 2px;
+  left: 3px;
+  font-size: 0.65rem;
+  color: #5a5a74;
+  font-variant-numeric: tabular-nums;
+}
+
+.zoom-block {
+  position: absolute;
+  top: 16px;
+  bottom: 6px;
+  background: rgba(76, 111, 255, 0.22);
+  border: 1px solid #4c6fff;
+  border-radius: 4px;
+  cursor: ew-resize;
+}
+
+.zoom-handle {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 8px;
+  background: #4c6fff;
+  cursor: ew-resize;
+  opacity: 0.75;
+}
+.zoom-handle:hover {
+  opacity: 1;
+}
+.zoom-handle-l {
+  left: -4px;
+  border-radius: 3px 0 0 3px;
+}
+.zoom-handle-r {
+  right: -4px;
+  border-radius: 0 3px 3px 0;
+}
+
+.zoom-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #f5a623;
+  box-shadow: 0 0 6px rgba(245, 166, 35, 0.7);
+  pointer-events: none;
+  transform: translateX(-1px);
+}
+
+.zoom-hint {
+  margin: 0.35rem 0 0;
 }
