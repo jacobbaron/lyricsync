@@ -1,11 +1,12 @@
 """Preview MP4 rendering.
 
-v0 burns in line-level captions using ffmpeg's ``subtitles`` filter and a
-temporary SRT built from the same alignment as ``captions.srt`` (avoids
-fragile ``drawtext`` filtergraph escaping for punctuation).
+Burns in captions via an `AnimationRenderer` (default: ASS via libass).
+The renderer writes its native caption file (e.g. ``captions.ass``) and
+supplies the ``-vf`` filter string; this module just runs ffmpeg.
 
-``build_drawtext_filter`` / ``escape_drawtext`` remain for unit tests and
-optional future use.
+``build_drawtext_filter`` / ``escape_drawtext`` remain from v0 for unit
+tests and as a reference for filtergraph escaping — the drawtext code
+path is no longer used at runtime.
 """
 
 from __future__ import annotations
@@ -14,8 +15,8 @@ import subprocess
 from pathlib import Path
 
 from .alignment import AlignmentResult
+from .animation import AnimationRenderer, StylePreset, get_preset, get_renderer
 from .extract import require_ffmpeg
-from .srt import build_srt
 
 
 # Characters that need escaping inside a drawtext ``text='...'`` value.
@@ -77,29 +78,34 @@ def render_preview(
     video: Path,
     result: AlignmentResult,
     out_path: Path,
+    *,
+    renderer: AnimationRenderer | None = None,
+    style: StylePreset | None = None,
+    caption_path: Path | None = None,
 ) -> Path:
-    """Render a preview MP4 with captions burned in via ``subtitles``.
+    """Render a preview MP4 with animated captions burned in.
 
-    Uses a fast encoder preset — this is a verification render, not a
-    deliverable. Should complete well under real-time on CPU for a
-    typical 3-minute music video.
+    Defaults to the ASS backend with the ``classic`` style preset. The
+    caption artifact is written next to ``out_path`` (``preview.ass``)
+    and kept after render — it's a useful deliverable. Pass
+    ``caption_path`` to override its location (e.g. write ``captions.ass``
+    into the project directory).
     """
     ffmpeg = require_ffmpeg()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # `drawtext` filter chaining is brittle with real-world punctuation.
-    # For v0 preview reliability, render the same line-level timings via a
-    # temporary SRT + ffmpeg's `subtitles` filter.
-    temp_srt_path = out_path.with_suffix(".preview.srt")
-    temp_srt_path.write_text(build_srt(result), encoding="utf-8")
-    # ffmpeg's filtergraph treats `subtitles=out/foo` as `subtitles=out` + junk;
-    # wrap the path in single quotes and escape embedded quotes/colons/backslashes.
-    abs_srt = str(temp_srt_path.resolve())
-    escaped = (
-        abs_srt.replace("\\", r"\\")
-        .replace(":", r"\:")
-        .replace("'", r"\'")
-    )
-    vf = f"subtitles='{escaped}'"
+
+    if renderer is None:
+        renderer = get_renderer("ass")
+    if style is None:
+        style = get_preset("classic")
+
+    # Caption file goes beside the preview unless caller specifies.
+    if caption_path is None:
+        ext = ".ass" if renderer.name == "ass" else f".{renderer.name}"
+        caption_path = out_path.with_suffix(ext)
+    renderer.write_caption_file(result, style, caption_path)
+    vf = renderer.ffmpeg_video_filter(caption_path)
+
     cmd = [
         ffmpeg,
         "-y",
@@ -117,8 +123,5 @@ def render_preview(
         "copy",
         str(out_path),
     ]
-    try:
-        subprocess.run(cmd, check=True)
-    finally:
-        temp_srt_path.unlink(missing_ok=True)
+    subprocess.run(cmd, check=True)
     return out_path

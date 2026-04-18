@@ -72,19 +72,32 @@ def align(
         "--language",
         help="Language code for the wav2vec2 alignment model.",
     ),
+    style: str = typer.Option(
+        "classic",
+        "--style",
+        help="Caption animation style preset (classic|pop|neon|plain).",
+    ),
 ) -> None:
     """Align LYRICS_TXT to VIDEO and write captions.srt + preview.mp4."""
     # Imports deferred: whisperx+torch imports are slow, and we don't
     # want `--help` to pay that cost.
     from .align import run_whisperx_align
+    from .animation import get_preset
     from .extract import extract_audio
     from .lyrics import parse_lyrics
     from .preview import render_preview
     from .srt import write_srt
 
+    try:
+        style_preset = get_preset(style)
+    except KeyError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
     output_dir.mkdir(parents=True, exist_ok=True)
     audio_wav = output_dir / "audio.wav"
     srt_path = output_dir / "captions.srt"
+    ass_path = output_dir / "captions.ass"
     preview_path = output_dir / "preview.mp4"
 
     typer.echo(f"[1/5] Extracting audio -> {audio_wav}")
@@ -118,8 +131,15 @@ def align(
     write_srt(result, srt_path)
     typer.echo(f"       {srt_path}")
 
-    typer.echo(f"[5/5] Rendering preview -> {preview_path}")
-    render_preview(video, result, preview_path)
+    typer.echo(f"[5/5] Rendering preview -> {preview_path} (style: {style})")
+    render_preview(
+        video,
+        result,
+        preview_path,
+        style=style_preset,
+        caption_path=ass_path,
+    )
+    typer.echo(f"       {ass_path}")
 
     typer.echo(
         f"Done. {len(result.lines)} lines aligned. "
@@ -148,11 +168,23 @@ def render(
         "-a",
         help="Path to alignment.json (default: OUTPUT_DIR/alignment.json).",
     ),
+    style: str = typer.Option(
+        "classic",
+        "--style",
+        help="Caption animation style preset (classic|pop|neon|plain).",
+    ),
 ) -> None:
     """Rebuild captions.srt and preview.mp4 from a saved alignment.json."""
     from .alignment_json import read_alignment_json
+    from .animation import get_preset
     from .preview import render_preview
     from .srt import write_srt
+
+    try:
+        style_preset = get_preset(style)
+    except KeyError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
 
     path = alignment or (output_dir / "alignment.json")
     if not path.is_file():
@@ -160,12 +192,20 @@ def render(
         raise typer.Exit(1)
     result = read_alignment_json(path)
     srt_path = output_dir / "captions.srt"
+    ass_path = output_dir / "captions.ass"
     preview_path = output_dir / "preview.mp4"
     output_dir.mkdir(parents=True, exist_ok=True)
     typer.echo(f"Writing SRT -> {srt_path}")
     write_srt(result, srt_path)
-    typer.echo(f"Rendering preview -> {preview_path}")
-    render_preview(video, result, preview_path)
+    typer.echo(f"Rendering preview -> {preview_path} (style: {style})")
+    render_preview(
+        video,
+        result,
+        preview_path,
+        style=style_preset,
+        caption_path=ass_path,
+    )
+    typer.echo(f"       {ass_path}")
     typer.echo("Done.")
 
 

@@ -95,6 +95,9 @@ export default function App() {
   const [dragState, setDragState] = useState<DragState | null>(null)
   const [loopEnabled, setLoopEnabled] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
+  const [editingLineIdx, setEditingLineIdx] = useState<number | null>(null)
+  const [editingText, setEditingText] = useState('')
+  const [editingIsNew, setEditingIsNew] = useState(false)
 
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const suppressNextClickRef = useRef(false)
@@ -222,6 +225,119 @@ export default function App() {
     [pushUndo],
   )
 
+  // Reflow words evenly across [start, end] from raw text. Original
+  // per-word timings are lost — the user re-drags to refine, or v2 can
+  // offer "re-align this section" via WhisperX.
+  const reflowWords = useCallback(
+    (text: string, start: number, end: number): AlignedWord[] => {
+      const tokens = text.trim().split(/\s+/).filter(Boolean)
+      if (tokens.length === 0) return []
+      const dur = Math.max(0, end - start)
+      const step = tokens.length > 0 ? dur / tokens.length : 0
+      return tokens.map((t, i) => ({
+        text: t,
+        start: start + i * step,
+        end: start + (i + 1) * step,
+      }))
+    },
+    [],
+  )
+
+  const beginEdit = useCallback(
+    (li: number) => {
+      setEditingLineIdx(li)
+      setEditingText(lines[li].text)
+      setEditingIsNew(false)
+    },
+    [lines],
+  )
+
+  const cancelEdit = useCallback(() => {
+    // Canceling on a freshly-inserted line removes it.
+    if (editingIsNew && editingLineIdx !== null) {
+      const li = editingLineIdx
+      pushUndo()
+      setLines((prev) => prev.filter((_, i) => i !== li))
+      setSelected(new Set())
+      setDirty(true)
+    }
+    setEditingLineIdx(null)
+    setEditingText('')
+    setEditingIsNew(false)
+  }, [editingIsNew, editingLineIdx, pushUndo])
+
+  const commitEdit = useCallback(() => {
+    if (editingLineIdx === null) return
+    const li = editingLineIdx
+    const trimmed = editingText.trim()
+    pushUndo()
+    if (trimmed === '') {
+      // Empty save = delete.
+      setLines((prev) => prev.filter((_, i) => i !== li))
+      setSelected(new Set())
+    } else {
+      setLines((prev) => {
+        const next = cloneLines(prev)
+        const line = next[li]
+        const newWords = reflowWords(trimmed, line.start, line.end)
+        next[li] = recomputeLine({ ...line, text: trimmed, words: newWords })
+        return next
+      })
+    }
+    setDirty(true)
+    setEditingLineIdx(null)
+    setEditingText('')
+    setEditingIsNew(false)
+  }, [editingLineIdx, editingText, pushUndo, reflowWords])
+
+  // Insert a new blank line at index `idx`. Timings are taken from the
+  // gap between neighbors; when no gap exists, a 1-second window is
+  // carved out after the previous line (or before the first / after the
+  // last, at the list boundaries).
+  const insertLineAt = useCallback(
+    (idx: number) => {
+      pushUndo()
+      setLines((prev) => {
+        const next = cloneLines(prev)
+        let start: number
+        let end: number
+        const before = idx > 0 ? next[idx - 1] : null
+        const after = idx < next.length ? next[idx] : null
+        if (before && after) {
+          const gap = after.start - before.end
+          if (gap >= 0.4) {
+            start = before.end
+            end = after.start
+          } else {
+            // No room — carve out 1s after `before` and push the
+            // following lines wouldn't be right; instead, place the new
+            // line at `before.end` with a nominal 1s duration and let
+            // the user drag.
+            start = before.end
+            end = before.end + 1.0
+          }
+        } else if (before) {
+          start = before.end
+          end = before.end + 2.0
+        } else if (after) {
+          end = after.start
+          start = Math.max(0, end - 2.0)
+        } else {
+          start = 0
+          end = 2.0
+        }
+        const blank: AlignedLine = { text: '', start, end, words: [] }
+        next.splice(idx, 0, blank)
+        return next
+      })
+      setEditingLineIdx(idx)
+      setEditingText('')
+      setEditingIsNew(true)
+      setDirty(true)
+    },
+    [pushUndo],
+  )
+
   const selectedCount = useMemo(() => selected.size, [selected])
   const singleSelectedLine = useMemo(
     () => getSingleSelectedLine(lines, selected),
@@ -336,6 +452,70 @@ export default function App() {
   )
 
   const handleLinePointerCancel = useCallback(() => setDragState(null), [])
+
+  // Drive playback-position highlight from requestAnimationFrame rather
+  // than the browser's timeupdate event (which fires only ~4x/sec at
+  // browser-chosen intervals — highlight onset jitters run-to-run). RAF
+  // gives ~16ms precision. setPlayingLineIdx is a no-op when the index
+  // doesn't change, so 60fps polling is cheap.
+  useEffect(() => {
+    const a = audioRef.current
+    if (!a) return
+    let raf = 0
+    const tick = () => {
+      handleTimeUpdate()
+      raf = requestAnimationFrame(tick)
+    }
+    const start = () => {
+      if (raf === 0) raf = requestAnimationFrame(tick)
+    }
+    const stop = () => {
+      if (raf !== 0) {
+        cancelAnimationFrame(raf)
+        raf = 0
+      }
+    }
+    a.addEventListener('play', start)
+    a.addEventListener('pause', stop)
+    a.addEventListener('ended', stop)
+    if (!a.paused) start()
+    return () => {
+      stop()
+      a.removeEventListener('play', start)
+      a.removeEventListener('pause', stop)
+      a.removeEventListener('ended', stop)
+    }
+  }, [handleTimeUpdate])
+
+  // Global spacebar toggles play/pause. Ignored when focus is in a text
+  // field or the audio element's own controls (so the browser's native
+  // spacebar-on-focused-controls still works and we don't steal keys
+  // from form inputs).
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' && e.key !== ' ') return
+      const t = e.target as HTMLElement | null
+      if (t) {
+        const tag = t.tagName
+        if (
+          tag === 'INPUT' ||
+          tag === 'TEXTAREA' ||
+          tag === 'SELECT' ||
+          tag === 'AUDIO' ||
+          t.isContentEditable
+        ) {
+          return
+        }
+      }
+      const a = audioRef.current
+      if (!a) return
+      e.preventDefault()
+      if (a.paused) void a.play().catch(() => {})
+      else a.pause()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   // Auto-scroll the playing line into view during playback, but never
   // during a drag (the user is interacting, don't yank the viewport).
@@ -490,7 +670,6 @@ export default function App() {
           controls
           src="/api/audio"
           preload="metadata"
-          onTimeUpdate={handleTimeUpdate}
           onSeeked={handleTimeUpdate}
           onPause={handleTimeUpdate}
         >
@@ -514,12 +693,25 @@ export default function App() {
       ) : null}
 
       <ul className="lines">
+        {view === 'line' ? (
+          <li className="insert-row-wrap">
+            <button
+              type="button"
+              className="insert-row"
+              onClick={() => insertLineAt(0)}
+              title="Insert line at top"
+            >
+              +
+            </button>
+          </li>
+        ) : null}
         {lines.map((line, li) => {
           const selectedHere = lineFullySelected(line, li, selected)
           const { dStart, dEnd } = previewDeltaFor(li)
           const displayStart = Math.max(0, line.start + dStart)
           const displayEnd = Math.max(displayStart, line.end + dEnd)
           const isPlaying = playingLineIdx === li
+          const isEditing = editingLineIdx === li
           const classes = [
             'line-hit',
             selectedHere ? 'sel' : '',
@@ -533,7 +725,40 @@ export default function App() {
               className="line-block"
               data-line-idx={li}
             >
-              {view === 'line' ? (
+              {view === 'line' && isEditing ? (
+                <div className="line-edit">
+                  <textarea
+                    value={editingText}
+                    autoFocus
+                    onChange={(e) => setEditingText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') {
+                        e.preventDefault()
+                        cancelEdit()
+                      } else if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault()
+                        commitEdit()
+                      }
+                    }}
+                    placeholder="Line text…"
+                  />
+                  <div className="edit-actions">
+                    <span className="muted">
+                      {line.start.toFixed(3)} → {line.end.toFixed(3)}
+                    </span>
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={commitEdit}
+                    >
+                      Save
+                    </button>
+                    <button type="button" onClick={cancelEdit}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : view === 'line' ? (
                 <div className="line-row">
                   <button
                     type="button"
@@ -581,6 +806,19 @@ export default function App() {
                     </span>
                     <span className="txt">{line.text}</span>
                   </button>
+                  <button
+                    type="button"
+                    className="jump-btn edit-btn"
+                    title="Edit text"
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      beginEdit(li)
+                    }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    ✎
+                  </button>
                 </div>
               ) : (
                 <div
@@ -613,6 +851,18 @@ export default function App() {
                   </div>
                 </div>
               )}
+              {view === 'line' && !isEditing ? (
+                <div className="insert-row-wrap">
+                  <button
+                    type="button"
+                    className="insert-row"
+                    onClick={() => insertLineAt(li + 1)}
+                    title="Insert line below"
+                  >
+                    +
+                  </button>
+                </div>
+              ) : null}
             </li>
           )
         })}

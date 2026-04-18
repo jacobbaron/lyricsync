@@ -20,7 +20,14 @@ set -euo pipefail
 IMAGE="${LYRICSYNC_IMAGE:-lyricsync:latest}"
 CACHE_VOLUME="${LYRICSYNC_CACHE_VOLUME:-lyricsync-cache}"
 
-exec docker run --rm -it \
+# Allocate a TTY only when stdin is one. `-it` against a piped or
+# non-TTY stdin errors out with "the input device is not a TTY".
+TTY_FLAGS=()
+if [[ -t 0 && -t 1 ]]; then
+    TTY_FLAGS=(-it)
+fi
+
+exec docker run --rm "${TTY_FLAGS[@]}" \
     -v "$PWD":/work \
     -v "$CACHE_VOLUME":/cache \
     -w /work \
