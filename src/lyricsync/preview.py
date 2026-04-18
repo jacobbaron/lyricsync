@@ -91,13 +91,15 @@ def render_preview(
     # temporary SRT + ffmpeg's `subtitles` filter.
     temp_srt_path = out_path.with_suffix(".preview.srt")
     temp_srt_path.write_text(build_srt(result), encoding="utf-8")
-    subtitles_path = (
-        str(temp_srt_path)
-        .replace("\\", r"\\")
+    # ffmpeg's filtergraph treats `subtitles=out/foo` as `subtitles=out` + junk;
+    # wrap the path in single quotes and escape embedded quotes/colons/backslashes.
+    abs_srt = str(temp_srt_path.resolve())
+    escaped = (
+        abs_srt.replace("\\", r"\\")
         .replace(":", r"\:")
         .replace("'", r"\'")
     )
-    vf = f"subtitles={subtitles_path}"
+    vf = f"subtitles='{escaped}'"
     cmd = [
         ffmpeg,
         "-y",
