@@ -87,8 +87,11 @@
   border: 1px solid #2a2a34;
   background: #1a1a22;
   color: inherit;
-  cursor: pointer;
+  cursor: ew-resize;
   font: inherit;
+  touch-action: none;
+  user-select: none;
+  transition: box-shadow 0.12s ease;
 }
 
 .line-hit .times {
@@ -107,6 +110,27 @@
 .word.sel {
   border-color: #4c6fff;
   background: #222838;
+}
+
+/* Playback-position highlight: currently-playing line gets a warm
+   left-edge accent bar + soft glow. Distinct from `.sel` (blue fill)
+   so a line can be both "selected for editing" and "now playing"
+   simultaneously. */
+.line-hit.playing,
+.word-row.playing {
+  box-shadow:
+    inset 4px 0 0 #f5a623,
+    0 0 12px rgba(245, 166, 35, 0.35);
+}
+
+.drag-delta {
+  color: #f5a623;
+  font-variant-numeric: tabular-nums;
+}
+
+.hint {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
 }
 
 .word-row {
