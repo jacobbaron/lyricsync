@@ -18,6 +18,13 @@ env/
 # uv
 .uv-cache/
 
+# Secrets
+.env
+.env.local
+
+# Shorten POC output
+shorten/out/
+
 # Editors
 .vscode/
 .idea/

@@ -147,3 +147,11 @@ tests/
 Each stage is a plain function so v1 can slot in plugin `Protocol`s
 (Separator, Aligner, OutputFormatter, PreviewRenderer) without a
 rewrite.
+
+## Related: `shorten/` (POC)
+
+A separate POC for shortening spoken-word videos by transcribing them,
+picking which segments to keep, and stitching them back with ffmpeg.
+Lives in [`shorten/`](./shorten) and reuses this project's WhisperX
+dependency for tight word-level timestamps. See
+[`shorten/README.md`](./shorten/README.md).
