@@ -8,7 +8,7 @@ of the package. The "pick which segments to keep" step is done by a
 human (or an LLM in this chat) reading the transcript — there's no
 automated content selection.
 
-## Pipeline
+## Pipeline (single clip)
 
 ```
 video ──► transcribe.py ──► transcript.json ──► (human/LLM picks ranges)
@@ -24,6 +24,36 @@ video ──► transcribe.py ──► transcript.json ──► (human/LLM pic
                                         ▼
                                   critique.py (GPT-4o audio QA)
 ```
+
+## Pipeline (multi-clip)
+
+For multi-camera or multi-take sessions — e.g., a control-room phone and
+a booth phone capturing two sides of the same conversation, plus other
+clips from the same day:
+
+```
+clips/*.mov ──► sync.py ──► clips.json    # offsets from file metadata
+                  │              │         (hand-edit to fix sync drift)
+                  ▼              ▼
+   transcribe.py per clip ──► merge.py ──► merged.{json,txt}
+                                                 │
+                              ranges.json ◄──────┘  (LLM picks with source)
+                                     │
+                                     ▼
+                                splice.py ──► story.mp4
+```
+
+Multi-clip `ranges.json` entries carry a `source` field naming the clip
+each range comes from (filenames resolve against `clips.json`):
+
+```json
+[
+  {"source": "booth.mov",   "start": 12.40, "end": 15.46},
+  {"source": "control.mov", "start":  3.20, "end":  6.10}
+]
+```
+
+Same resolution + orientation across all clips is assumed (no scale/pad).
 
 ## Setup
 
