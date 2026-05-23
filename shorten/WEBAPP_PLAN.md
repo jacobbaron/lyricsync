@@ -92,18 +92,27 @@ point** — pick one per section before starting implementation.
 
 ### A. Heavy Compute Platform
 
-Where Whisper, wav2vec2 alignment, and ffmpeg rendering run.
+Where alignment and ffmpeg rendering run. Note that transcription itself
+happens via the OpenAI Whisper API — the platform only runs the surrounding
+orchestration and ffmpeg work, which takes **60–90 seconds of active CPU
+per session**. At that scale, all options below cost essentially the same
+(fractions of a cent per session); the decision is purely about developer
+experience and ops overhead.
 
 | Option | Pros | Cons |
 |---|---|---|
-| **Modal** *(recommended)* | Python-native (wrap existing scripts almost verbatim), GPU support, true scale-to-zero, per-second billing, large timeout support | Vendor lock-in on task decorator pattern |
-| **Google Cloud Run** | Docker-based (existing Dockerfile reusable), scales to zero, 60-min timeout | GPU support limited, more config overhead |
-| **AWS Lambda + ECS** | Mature ecosystem | Lambda 15-min limit too short for long transcriptions; ECS always-on |
-| **Fly.io Machines** | Start/stop on demand, simple | Manual orchestration; no native GPU |
+| **Modal** *(recommended)* | Python-native — add a decorator to existing scripts, done; GPU available if you later swap to local WhisperX; $30/mo free credits (more than enough); true scale-to-zero | Decorator pattern is Modal-specific |
+| **Google Cloud Run** | Scales to zero; 180k free vCPU-seconds/month; Docker-based | Requires HTTP server boilerplate, Cloud Run config, Artifact Registry push — substantially more setup than Modal for a Python script |
+| **Hetzner VPS (~$4/mo)** | Always warm, zero cold starts, SSH to debug, ffmpeg just works, simplest mental model | Small fixed cost; you manage the box |
+| **AWS Lambda** | Mature | 15-min timeout, no ffmpeg without a layer, no GPU |
 
-**Recommendation: Modal.** The existing Python scripts become Modal
-functions with a decorator. GPU available for WhisperX when speed
-matters. Billing is per second with no idle cost.
+**Recommendation: Modal.** The existing `shorten/` scripts are plain Python
+functions — Modal wraps them with a single decorator and handles packaging,
+scaling, and invocation. Cloud Run is a reasonable alternative if you're
+already in GCP, but it requires meaningfully more boilerplate (HTTP handler,
+Docker build/push pipeline, invocation wiring) for no cost or performance
+benefit at this scale. GPU is a one-line change if you later want local
+WhisperX instead of the Whisper API.
 
 ---
 
@@ -434,16 +443,38 @@ unprivileged without an authenticated session.
 
 All costs at personal/sporadic use levels.
 
+### What actually costs money
+
+Processing is fast (seconds, not minutes) so **platform compute is
+negligible**. The real costs are the API calls:
+
+| Item | Cost | Notes |
+|---|---|---|
+| OpenAI Whisper API | $0.006/min of audio | 15 min of clips ≈ $0.09 |
+| Anthropic Claude | $0.03–0.07/story gen | ~7k tokens in+out |
+| **API total per session** | **~$0.12–0.16** | Dominant cost |
+
+### Platform costs (monthly, idle)
+
 | Item | Cost | Notes |
 |---|---|---|
 | Vercel (Hobby) | $0/mo | Free for personal projects |
-| Supabase (Free) | $0/mo | Pauses after 1 week inactivity; upgrade to Pro ($25) if annoying |
-| Cloudflare R2 | ~$0–2/mo | 10 GB free storage, $0 egress |
-| Modal compute | ~$0.10–0.50/session | CPU seconds for transcription + ffmpeg; GPU optional |
-| OpenAI Whisper | ~$0.006/min of audio | 10 min of video ≈ $0.06 |
-| Anthropic Claude | ~$0.05–0.20/story gen | Depends on transcript length |
+| Supabase (Free) | $0/mo | Pauses after 1 week inactivity; upgrade to Pro ($25/mo) if annoying |
+| Cloudflare R2 | ~$0–1/mo | 10 GB free storage, $0 egress |
+| Modal compute | ~$0.001/session | 60–90s CPU × $0.0000131/core-sec — effectively free; well within $30/mo free tier |
 | **Total idle** | **~$0–5/mo** | |
-| **Per session** | **~$0.20–1.00** | 10-min multi-clip project |
+
+### Summary
+
+| | Cost |
+|---|---|
+| **Per session** (15 min of clips, 3 stories generated) | **~$0.13–0.18** |
+| **Heavy month** (20 sessions) | **~$2.60–3.60 in API costs** |
+| **Light month** (2–3 sessions) | **~$0.30–0.50** |
+
+The per-session cost is almost entirely Whisper + Claude. Modal compute
+rounds to zero. If cost matters, the only lever is reducing Whisper usage
+(shorter clips, or swapping to a cheaper API like Groq).
 
 ---
 
