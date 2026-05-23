@@ -22,6 +22,9 @@ env/
 .env
 .env.local
 
+# Claude Code local overrides (personal settings, not for repo)
+.claude/settings.local.json
+
 # Shorten POC output
 shorten/out/
 

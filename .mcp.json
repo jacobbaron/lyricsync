@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "cloudflare": {
+      "command": "npx",
+      "args": ["-y", "@cloudflare/mcp-server-cloudflare"]
+    },
+    "supabase": {
+      "command": "npx",
+      "args": ["-y", "@supabase/mcp-server-supabase", "--project-ref", "REPLACE_WITH_SUPABASE_PROJECT_REF"]
+    }
+  }
+}
