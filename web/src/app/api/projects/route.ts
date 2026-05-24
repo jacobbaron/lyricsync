@@ -4,6 +4,27 @@ import { createClient } from "@/lib/supabase/server";
 
 export const runtime = "nodejs";
 
+export async function GET() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user?.email) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { data, error } = await supabase
+    .from("projects")
+    .select("id, name, status, created_at")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  return NextResponse.json(data ?? []);
+}
+
 const Body = z.object({
   name: z.string().trim().min(1).max(200),
 });
