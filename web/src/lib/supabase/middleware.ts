@@ -5,8 +5,10 @@ export async function updateSession(request: NextRequest) {
   const supabaseUrl = process.env.SUPABASE_URL;
   const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 
+  const path = request.nextUrl.pathname;
+  const isAuthRoute = path === "/login" || path.startsWith("/auth");
+
   // Fail open if env vars aren't configured yet (fresh deploy without secrets).
-  // Requests still reach the app; auth is enforced once the vars are present.
   if (!supabaseUrl || !supabaseAnonKey) {
     return NextResponse.next({ request });
   }
@@ -37,9 +39,6 @@ export async function updateSession(request: NextRequest) {
       data: { user },
     } = await supabase.auth.getUser();
 
-    const path = request.nextUrl.pathname;
-    const isAuthRoute = path === "/login" || path.startsWith("/auth");
-
     // Auth routes are always reachable so a blocked user can re-authenticate.
     if (isAuthRoute) {
       if (user && user.email === process.env.ALLOWED_EMAIL && path === "/login") {
@@ -63,7 +62,8 @@ export async function updateSession(request: NextRequest) {
 
     return supabaseResponse;
   } catch {
-    // If Supabase is unreachable or throws, redirect to login rather than 500.
+    // Auth routes must never be redirected — that's what caused the loop.
+    if (isAuthRoute) return NextResponse.next({ request });
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     return NextResponse.redirect(url);
