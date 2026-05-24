@@ -74,17 +74,20 @@ export default async function ProjectPage({
   const supabase = await createClient();
   const { data: project, error } = await supabase
     .from("projects")
-    .select("id, name, status, created_at, clips(id, filename, status, error_message)")
+    .select("id, name, status, created_at, clips(id, filename, status)")
     .eq("id", projectId)
     .maybeSingle();
 
-  if (error || !project) notFound();
+  if (error) {
+    console.error("Project fetch error:", error.message);
+    throw new Error(error.message);
+  }
+  if (!project) notFound();
 
   const clips = (project.clips ?? []) as Array<{
     id: string;
     filename: string;
     status: ClipStatus;
-    error_message: string | null;
   }>;
 
   const banner = projectStatusBanner(project.status);
@@ -131,9 +134,6 @@ export default async function ProjectPage({
                       {clipStatusLabel(clip.status)}
                     </span>
                   </div>
-                  {clip.status === "error" && clip.error_message && (
-                    <p className="text-xs text-red-500">{clip.error_message}</p>
-                  )}
                 </li>
               ))}
             </ul>
