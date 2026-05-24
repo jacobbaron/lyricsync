@@ -42,6 +42,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
     .pip_install(
+        "fastapi[standard]>=0.115",
         "openai>=1.40",
         "boto3>=1.34",
         "supabase>=2.10",
@@ -91,7 +92,7 @@ def _set_project(sb, project_id: str, **fields) -> None:
 # ---------------------------------------------------------------------------
 
 @app.function(image=image, secrets=secrets, timeout=60)
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")
 async def transcribe_clip(request: Request) -> JSONResponse:
     """Vercel calls this endpoint; it authenticates, spawns the worker, and
     returns {"status": "accepted"} immediately so Vercel doesn't time out."""
