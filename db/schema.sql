@@ -35,10 +35,11 @@ create table projects (
 -- Clip: a single source video uploaded by the user.
 --
 -- status values:
---   'uploading'    — presigned PUT in flight or not yet started
---   'transcribing' — uploaded; Whisper job running
---   'aligned'      — transcript merged into the project timeline
---   'error'        — terminal failure for this clip
+--   'uploading'           — presigned PUT in flight or not yet started
+--   'uploading_complete'  — client confirmed PUT succeeded; awaiting transcribe kickoff
+--   'transcribing'        — Whisper job running
+--   'aligned'             — transcript merged into the project timeline
+--   'error'               — terminal failure for this clip
 create table clips (
   id                uuid primary key default gen_random_uuid(),
   project_id        uuid not null references projects(id) on delete cascade,
