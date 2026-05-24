@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { UploadArea } from "./UploadArea";
+import { TranscriptViewer } from "./TranscriptViewer";
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -246,13 +247,9 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
         </section>
       )}
 
-      {/* Transcript viewer placeholder — shown once transcription is done */}
-      {project.status === "transcribed" && (
-        <section className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-4 py-6 text-center">
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">
-            Transcript ready — viewer coming in P1-09
-          </p>
-        </section>
+      {/* Transcript viewer — shown once alignment is done */}
+      {(project.status === "transcribed" || project.status === "done") && (
+        <TranscriptViewer projectId={project.id} />
       )}
 
       {/* Upload area — only visible while project is still uploading */}
