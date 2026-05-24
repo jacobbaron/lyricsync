@@ -25,11 +25,12 @@ create extension if not exists "pgcrypto";
 --   'done'         — a cut has finished rendering
 --   'error'        — terminal failure; see app logs
 create table projects (
-  id         uuid primary key default gen_random_uuid(),
-  owner      text not null,
-  name       text not null,
-  status     text not null default 'uploading',
-  created_at timestamptz not null default now()
+  id            uuid primary key default gen_random_uuid(),
+  owner         text not null,
+  name          text not null,
+  status        text not null default 'uploading',
+  error_message text,
+  created_at    timestamptz not null default now()
 );
 
 -- Clip: a single source video uploaded by the user.
@@ -48,7 +49,8 @@ create table clips (
   duration_secs     double precision,
   global_start      double precision,
   transcript_r2_key text,
-  status            text not null default 'uploading'
+  status            text not null default 'uploading',
+  error_message     text
 );
 
 -- Story: a chosen cut (set of time ranges) that gets rendered into a video.
@@ -69,6 +71,7 @@ create table stories (
   ranges_json   jsonb,
   render_r2_key text,
   status        text not null default 'generating',
+  error_message text,
   created_at    timestamptz not null default now()
 );
 
