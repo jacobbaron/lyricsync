@@ -205,9 +205,11 @@ export function UploadArea({ projectId }: { projectId: string }) {
 
       setUploads((prev) => [...prev, ...newEntries]);
 
-      // Start all uploads in parallel; once all done, refresh server component
+      // Start all uploads in parallel; once all settle, refresh the server
+      // component and drop completed entries (they graduate to the Clips list).
       Promise.all(newEntries.map(uploadFile)).then(() => {
         router.refresh();
+        setUploads((prev) => prev.filter((u) => u.status !== "done"));
       });
     },
     [uploadFile, router],
