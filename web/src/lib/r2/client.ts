@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 export const UPLOAD_URL_TTL_SECONDS = 3600;
@@ -57,4 +57,16 @@ export async function presignClipUpload(
     ContentType: contentType,
   });
   return getSignedUrl(getClient(), cmd, { expiresIn: UPLOAD_URL_TTL_SECONDS });
+}
+
+/** Fetch an object from R2 and return its body as a string. */
+export async function getObjectText(key: string): Promise<string> {
+  const bucket = process.env.R2_BUCKET_NAME;
+  if (!bucket) {
+    throw new Error("R2 client misconfigured: R2_BUCKET_NAME not set.");
+  }
+  const cmd = new GetObjectCommand({ Bucket: bucket, Key: key });
+  const res = await getClient().send(cmd);
+  if (!res.Body) throw new Error(`Empty body for R2 key: ${key}`);
+  return res.Body.transformToString("utf-8");
 }
