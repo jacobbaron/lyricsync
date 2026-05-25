@@ -796,7 +796,7 @@ def _generate_worker(project_id: str, round_id: str) -> None:
     1. Load merged.json transcript from R2.
     2. Load the current generation round + all previous rounds from DB.
     3. Build a multi-turn conversation history so Claude has full context.
-    4. Call Claude claude-opus-4-5 with tool use to get 3 structured stories.
+    4. Call Claude with extended thinking + tool use to get 3 structured stories.
     5. Fill in the 3 placeholder story rows created by the Vercel route.
     6. Advance project status to 'stories_ready'.
     """
@@ -851,7 +851,8 @@ def _generate_worker(project_id: str, round_id: str) -> None:
         client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         response = client.messages.create(
             model="claude-opus-4-5",
-            max_tokens=4096,
+            max_tokens=16000,
+            thinking={"type": "enabled", "budget_tokens": 10000},
             system=_SYSTEM_PROMPT,
             tools=[_PROPOSE_STORIES_TOOL],
             tool_choice={"type": "any"},
