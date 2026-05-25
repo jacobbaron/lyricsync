@@ -15,7 +15,7 @@ export default async function ProjectPage({
   const supabase = await createClient();
   const { data: project, error } = await supabase
     .from("projects")
-    .select("id, name, status, created_at, clips(id, filename, status, error_message)")
+    .select("id, name, status, created_at, clips(id, filename, status, error_message, duration_secs)")
     .eq("id", projectId)
     .maybeSingle();
 
@@ -30,6 +30,7 @@ export default async function ProjectPage({
     filename: string;
     status: string;
     error_message?: string | null;
+    duration_secs?: number | null;
   }>;
 
   return (
@@ -62,8 +63,11 @@ export default async function ProjectPage({
             status: project.status as ProjectStatus,
           }}
           initialClips={clips.map((c) => ({
-            ...c,
+            id: c.id,
+            filename: c.filename,
             status: c.status as ClipStatus,
+            error_message: c.error_message,
+            duration_secs: c.duration_secs,
           }))}
         />
       </div>
