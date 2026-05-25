@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { UploadArea } from "./UploadArea";
 import { TranscriptViewer } from "./TranscriptViewer";
+import { RangePicker, type ClipMeta } from "./RangePicker";
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -27,6 +28,7 @@ interface Clip {
   filename: string;
   status: ClipStatus;
   error_message?: string | null;
+  duration_secs?: number | null;
 }
 
 interface Project {
@@ -250,6 +252,22 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
       {/* Transcript viewer — shown once alignment is done */}
       {(project.status === "transcribed" || project.status === "done") && (
         <TranscriptViewer projectId={project.id} />
+      )}
+
+      {/* Range picker — shown when transcription is complete */}
+      {project.status === "transcribed" && (
+        <RangePicker
+          projectId={project.id}
+          clips={clips
+            .filter((c) => c.status === "aligned")
+            .map(
+              (c): ClipMeta => ({
+                id: c.id,
+                filename: c.filename,
+                duration_secs: c.duration_secs ?? null,
+              }),
+            )}
+        />
       )}
 
       {/* Upload area — only visible while project is still uploading */}
