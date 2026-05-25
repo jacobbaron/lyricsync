@@ -6,7 +6,7 @@ Deploy:
 Implements:
     P1-06  transcribe_clip          — Whisper word-level transcription
     P1-07  align_and_merge          — WhisperX alignment + global timeline merge
-    P1-11  render_story (TODO)      — ffmpeg multi-clip render
+    P1-11  render_story             — ffmpeg multi-clip render
 
 Secrets:
     Create a Modal secret named "lyricsync-secrets" containing:
@@ -20,7 +20,8 @@ Secrets:
         MODAL_WEBHOOK_SECRET     # shared with Vercel
 
 After deploying, note the web endpoint URLs printed by Modal and set them as
-MODAL_TRANSCRIBE_URL and MODAL_ALIGN_URL in your Vercel environment variables.
+MODAL_TRANSCRIBE_URL, MODAL_ALIGN_URL, and MODAL_RENDER_URL in your Vercel
+environment variables.
 """
 from __future__ import annotations
 
@@ -507,3 +508,209 @@ def _align_worker(project_id: str) -> None:
         msg = str(exc)
         print(f"[align] error for project {project_id}: {msg}")
         _set_project(sb, project_id, status="error", error_message=msg[:500])
+
+
+# ---------------------------------------------------------------------------
+# P1-11: Render Story Task
+# ---------------------------------------------------------------------------
+
+# Reuse the base image — ffmpeg, boto3 and supabase are already present.
+# No PyTorch or WhisperX needed for rendering.
+
+# ffmpeg output params — mirrors shorten/splice.py
+_RENDER_PAD_S = 0.08        # seconds of padding around each trim point
+_RENDER_W = 1080
+_RENDER_H = 1920
+_RENDER_FPS = 30
+_RENDER_SR = 48000          # audio sample rate
+
+
+@app.function(image=image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def render_story(request: Request) -> JSONResponse:
+    """Vercel calls this endpoint; it authenticates, spawns the render worker,
+    and returns {"status": "accepted"} immediately so Vercel doesn't time out."""
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    story_id = body.get("story_id")
+    if not story_id:
+        raise HTTPException(status_code=400, detail="story_id required")
+
+    _render_worker.spawn(story_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(image=image, secrets=secrets, timeout=1800)
+def _render_worker(story_id: str) -> None:
+    """Render worker (P1-11).
+
+    1. Load story from DB (ranges_json, project_id).
+    2. Resolve each range's source filename to a clip r2_key.
+    3. Download only the unique source clips referenced in ranges.
+    4. Run ffmpeg filter_complex splice (mirrors shorten/splice.py):
+         - trim + normalize resolution/fps per segment
+         - concat all segments
+         - BT.709 8-bit yuv420p output for iPhone HDR compatibility
+    5. Upload output.mp4 to R2 at projects/<pid>/stories/<sid>/output.mp4.
+    6. Update story: status='done', render_r2_key set.
+    7. Update project: status='done' (only if still 'rendering').
+    """
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    # 1. Fetch story
+    row = sb.table("stories").select(
+        "id, project_id, ranges_json, status"
+    ).eq("id", story_id).maybe_single().execute()
+
+    if not row.data:
+        print(f"[render] story {story_id} not found — skipping")
+        return
+
+    story = row.data
+    project_id: str = story["project_id"]
+    ranges: list[dict] = story["ranges_json"] or []
+
+    if not ranges:
+        msg = "story has no ranges"
+        sb.table("stories").update({
+            "status": "error", "error_message": msg
+        }).eq("id", story_id).execute()
+        return
+
+    # 2. Fetch all clips for this project to resolve source → r2_key
+    clips_row = sb.table("clips").select(
+        "id, filename, r2_key"
+    ).eq("project_id", project_id).execute()
+    clip_map: dict[str, str] = {
+        c["filename"]: c["r2_key"] for c in (clips_row.data or [])
+    }
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            # 3. Download each unique source clip exactly once.
+            # inputs: r2_key → (local_path, ffmpeg_input_index)
+            inputs: dict[str, tuple[Path, int]] = {}
+            for rng in ranges:
+                source: str = rng["source"]
+                r2_key = clip_map.get(source)
+                if not r2_key:
+                    raise ValueError(f"source clip not found in project: {source!r}")
+                if r2_key not in inputs:
+                    ext = Path(r2_key).suffix or ".mp4"
+                    local_path = tmp / f"clip_{len(inputs)}{ext}"
+                    print(f"[render] downloading {r2_key}")
+                    r2.download_file(bucket, r2_key, str(local_path))
+                    inputs[r2_key] = (local_path, len(inputs))
+
+            # 4. Build ffmpeg filter_complex (mirrors shorten/splice.py exactly).
+            W, H = _RENDER_W, _RENDER_H
+            FPS, SR = _RENDER_FPS, _RENDER_SR
+            vnorm = (
+                f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"setsar=1,fps={FPS}"
+            )
+
+            items = []
+            for rng in ranges:
+                r2_key = clip_map[rng["source"]]
+                _, input_idx = inputs[r2_key]
+                start = max(0.0, float(rng["start"]) - _RENDER_PAD_S)
+                end = float(rng["end"]) + _RENDER_PAD_S
+                items.append({"input_idx": input_idx, "start": start, "end": end})
+
+            parts = []
+            for i, it in enumerate(items):
+                inp = it["input_idx"]
+                a, b = it["start"], it["end"]
+                parts.append(
+                    f"[{inp}:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,"
+                    f"{vnorm}[v{i}];"
+                    f"[{inp}:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,"
+                    f"aresample={SR},aformat=channel_layouts=stereo[a{i}]"
+                )
+            concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(items)))
+            parts.append(
+                f"{concat_in}concat=n={len(items)}:v=1:a=1[vc][a];"
+                "[vc]format=yuv420p[v]"
+            )
+            filter_complex = ";".join(parts)
+
+            output_path = tmp / "output.mp4"
+
+            # Build command: inputs in insertion order = ascending input_idx
+            cmd = ["ffmpeg", "-y"]
+            for local_path, _ in inputs.values():
+                cmd += ["-i", str(local_path)]
+            cmd += [
+                "-filter_complex", filter_complex,
+                "-map", "[v]", "-map", "[a]",
+                # Video codec — iPhone-friendly BT.709 8-bit
+                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-profile:v", "high",
+                "-colorspace", "bt709", "-color_primaries", "bt709",
+                "-color_trc", "bt709", "-color_range", "tv",
+                # Audio codec
+                "-c:a", "aac", "-b:a", "160k",
+                # Optimise for streaming / progressive download
+                "-movflags", "+faststart",
+                str(output_path),
+            ]
+
+            print(
+                f"[render] ffmpeg: {len(items)} segment(s) from "
+                f"{len(inputs)} source(s)"
+            )
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg exited {proc.returncode}:\n{proc.stderr[-3000:]}"
+                )
+
+            output_size = output_path.stat().st_size
+            print(
+                f"[render] output: {output_size / 1e6:.1f} MB → "
+                f"projects/{project_id}/stories/{story_id}/output.mp4"
+            )
+
+            # 5. Upload output MP4 to R2
+            output_key = f"projects/{project_id}/stories/{story_id}/output.mp4"
+            with output_path.open("rb") as f:
+                r2.put_object(
+                    Bucket=bucket,
+                    Key=output_key,
+                    Body=f,
+                    ContentType="video/mp4",
+                )
+            print(f"[render] uploaded {output_key}")
+
+            # 6. Mark story done
+            sb.table("stories").update({
+                "status": "done",
+                "render_r2_key": output_key,
+            }).eq("id", story_id).execute()
+
+            # 7. Advance project to 'done' only if it's still 'rendering'.
+            # A project could have multiple stories; only the first one triggers
+            # the project-level status change.
+            sb.table("projects").update({
+                "status": "done",
+            }).eq("id", project_id).eq("status", "rendering").execute()
+
+            print(f"[render] story {story_id} done ✓")
+
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        print(f"[render] error for story {story_id}: {msg}")
+        sb.table("stories").update({
+            "status": "error",
+            "error_message": msg[:500],
+        }).eq("id", story_id).execute()
