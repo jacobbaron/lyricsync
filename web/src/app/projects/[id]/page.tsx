@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { StatusPoller, type ProjectStatus, type ClipStatus } from "./StatusPoller";
+import { StatusPoller, type ProjectStatus, type ClipStatus, type Story } from "./StatusPoller";
 
 export default async function ProjectPage({
   params,
@@ -15,7 +15,7 @@ export default async function ProjectPage({
   const supabase = await createClient();
   const { data: project, error } = await supabase
     .from("projects")
-    .select("id, name, status, created_at, clips(id, filename, status, error_message, duration_secs)")
+    .select("id, name, status, created_at, clips(id, filename, status, error_message, duration_secs), stories(id, status, created_at)")
     .eq("id", projectId)
     .maybeSingle();
 
@@ -33,9 +33,14 @@ export default async function ProjectPage({
     duration_secs?: number | null;
   }>;
 
+  const stories = (project.stories ?? []) as Array<{
+    id: string;
+    status: string;
+    created_at: string;
+  }>;
+
   return (
     <main className="flex flex-col min-h-full">
-      {/* Header — static, no need to re-render on each poll */}
       <header className="flex items-center gap-3 px-4 py-4 border-b border-zinc-200 dark:border-zinc-800">
         <Link
           href="/"
@@ -48,13 +53,6 @@ export default async function ProjectPage({
       </header>
 
       <div className="flex flex-col gap-5 px-4 py-6 max-w-lg mx-auto w-full">
-        {/* StatusPoller handles:
-              - Live clip list + per-clip status badges
-              - Overall project status banner with progress count
-              - Auto-triggering /align once all clips are transcribed_raw
-              - Stopping polling when status is terminal
-              - UploadArea (only while uploading)
-              - Transcript viewer placeholder (once transcribed) */}
         <StatusPoller
           projectId={projectId}
           initialProject={{
@@ -68,6 +66,11 @@ export default async function ProjectPage({
             status: c.status as ClipStatus,
             error_message: c.error_message,
             duration_secs: c.duration_secs,
+          }))}
+          initialStories={stories.map((s) => ({
+            id: s.id,
+            status: s.status as Story["status"],
+            created_at: s.created_at,
           }))}
         />
       </div>

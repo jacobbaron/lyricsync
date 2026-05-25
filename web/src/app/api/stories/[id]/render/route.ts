@@ -41,12 +41,8 @@ export async function POST(
     .update({ status: "rendering", error_message: null })
     .eq("id", storyId);
 
-  // Also reset the project status if needed
-  await supabase
-    .from("projects")
-    .update({ status: "rendering" })
-    .eq("id", story.project_id)
-    .in("status", ["transcribed", "done", "error"]);
+  // Note: project status intentionally NOT changed — stays at 'transcribed'
+  // so the range picker remains available throughout.
 
   // Fire Modal render endpoint (fire-and-forget)
   const renderUrl = process.env.MODAL_RENDER_URL;
