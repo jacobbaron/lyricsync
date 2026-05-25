@@ -855,7 +855,7 @@ def _generate_worker(project_id: str, round_id: str) -> None:
             thinking={"type": "enabled", "budget_tokens": 10000},
             system=_SYSTEM_PROMPT,
             tools=[_PROPOSE_STORIES_TOOL],
-            tool_choice={"type": "any"},
+            tool_choice={"type": "auto"},
             messages=messages,
         )
 
