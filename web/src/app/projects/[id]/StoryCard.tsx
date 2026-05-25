@@ -10,12 +10,14 @@ interface RangeInput {
   source: string;
   start: string; // mm:ss or decimal string — raw input value
   end: string;
+  text?: string | null; // verbatim transcript excerpt for this cut
 }
 
 interface RangeData {
   source: string;
   start: number;
   end: number;
+  text?: string | null;
 }
 
 export interface StoryData {
@@ -56,7 +58,7 @@ function fmtDuration(secs: number): string {
 }
 
 function rangeToInput(r: RangeData): RangeInput {
-  return { source: r.source, start: secsToInput(r.start), end: secsToInput(r.end) };
+  return { source: r.source, start: secsToInput(r.start), end: secsToInput(r.end), text: r.text };
 }
 
 // ── sub-component ─────────────────────────────────────────────────────────
@@ -272,6 +274,12 @@ export function StoryCard({ story, clips, index }: Props) {
               {durLabel && (
                 <p className="text-xs text-zinc-400 dark:text-zinc-500 -mt-1">
                   max {durLabel}
+                </p>
+              )}
+              {/* Verbatim transcript excerpt this cut captures */}
+              {range.text && (
+                <p className="text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400 border-l-2 border-zinc-200 dark:border-zinc-700 pl-2">
+                  “{range.text}”
                 </p>
               )}
               {/* Start / End */}

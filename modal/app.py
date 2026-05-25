@@ -35,6 +35,15 @@ import modal
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
+# Pure transcript formatting + quote-matching helpers (stdlib only, unit-tested).
+# Modal automounts this sibling module when deploying app.py.
+from transcript import (
+    build_source_index,
+    format_transcript,
+    resolve_segments,
+    stories_as_text,
+)
+
 # ---------------------------------------------------------------------------
 # App + image
 # ---------------------------------------------------------------------------
@@ -526,11 +535,12 @@ gen_image = (
 )
 
 # Tool definition passed to Claude — forces structured JSON output.
+# Claude returns verbatim quotes; the code resolves them to timestamps.
 _PROPOSE_STORIES_TOOL = {
     "name": "propose_stories",
     "description": (
-        "Propose exactly 3 story cuts from the transcript. "
-        "Each story is an ordered list of source-clip segments."
+        "Propose exactly 3 story cuts from the transcript. Each story is an "
+        "ordered list of verbatim quotes drawn from the source clips."
     ),
     "input_schema": {
         "type": "object",
@@ -542,10 +552,7 @@ _PROPOSE_STORIES_TOOL = {
                 "maxItems": 3,
                 "items": {
                     "type": "object",
-                    "required": [
-                        "title", "description",
-                        "estimated_duration_secs", "ranges",
-                    ],
+                    "required": ["title", "description", "segments"],
                     "properties": {
                         "title": {
                             "type": "string",
@@ -558,36 +565,26 @@ _PROPOSE_STORIES_TOOL = {
                                 "work editorially"
                             ),
                         },
-                        "estimated_duration_secs": {
-                            "type": "number",
-                            "description": "Sum of all range durations in seconds",
-                        },
-                        "ranges": {
+                        "segments": {
                             "type": "array",
                             "minItems": 1,
                             "items": {
                                 "type": "object",
-                                "required": ["source", "start", "end"],
+                                "required": ["source", "quote"],
                                 "properties": {
                                     "source": {
                                         "type": "string",
                                         "description": (
-                                            "Exact filename of the source clip "
-                                            "(e.g. IMG_2418.MOV)"
+                                            "Exact filename from the transcript "
+                                            "section header (e.g. IMG_2415.mov)"
                                         ),
                                     },
-                                    "start": {
-                                        "type": "number",
+                                    "quote": {
+                                        "type": "string",
                                         "description": (
-                                            "Start time in seconds, LOCAL to "
-                                            "the source clip"
-                                        ),
-                                    },
-                                    "end": {
-                                        "type": "number",
-                                        "description": (
-                                            "End time in seconds, LOCAL to "
-                                            "the source clip"
+                                            "A verbatim, contiguous excerpt copied "
+                                            "from that source's transcript. Becomes "
+                                            "one continuous cut in the video."
                                         ),
                                     },
                                 },
@@ -604,105 +601,28 @@ _SYSTEM_PROMPT = """\
 You are a creative video editor. You have been given a merged transcript from \
 a multi-camera live recording session.
 
-The transcript shows word-level speech from each source clip, with LOCAL \
-timestamps (seconds relative to that clip's start). Use these local \
-timestamps when specifying ranges — they are what the render pipeline expects.
+The transcript is grouped by source clip under headers like \
+"=== IMG_2415.mov ===". Each paragraph is a continuous run of speech.
 
 Your job is to propose compelling short-form story cuts from this footage. \
-Each cut is an ordered list of segments; you may draw from any clip in any order.
+Each cut is an ordered list of segments drawn from any clip in any order.
+
+To specify a segment, give:
+- source: the exact filename from the section header
+- quote: a verbatim, contiguous excerpt copied from that source's transcript
+
+Each quote becomes one continuous cut. The system maps your quotes back to \
+precise video timestamps automatically — you never deal with timestamps. Copy \
+quotes exactly as they appear so they can be matched.
 
 Guidelines:
-- Each story should total 30–180 seconds (sum of range durations)
-- Cut at natural sentence or phrase boundaries based on the transcript
+- Each story should total roughly 30–180 seconds of speech
+- Quote complete thoughts or sentences — never isolated words
+- To skip a boring middle, use two separate segments instead of one long quote
 - Make the 3 options meaningfully distinct: different angles, moments, or arcs
-- Prefer complete thoughts over partial sentences
 - You may interleave clips (e.g. cut between cameras mid-conversation)
-- Source names must exactly match the filenames shown in the transcript\
+- The source must exactly match a filename from the transcript headers\
 """
-
-
-def _format_transcript(words: list[dict]) -> str:
-    """Format the merged word list into a readable transcript for Claude.
-
-    Groups words into utterances (consecutive words from the same source
-    with gaps < 1.5 s), then sorts utterances by global start time.
-    Shows LOCAL timestamps so Claude can copy them directly into ranges.
-    """
-    GAP_S = 1.5
-
-    by_source: dict[str, list[dict]] = {}
-    for w in words:
-        src = w.get("source", "?")
-        by_source.setdefault(src, []).append(w)
-
-    utterances: list[dict] = []
-    for src, ws in by_source.items():
-        ws.sort(key=lambda x: x["global_start"])
-        cur_start_local = ws[0]["local_start"]
-        cur_end_local   = ws[0]["local_end"]
-        cur_end_global  = ws[0]["global_end"]
-        cur_global      = ws[0]["global_start"]
-        cur_words: list[str] = []
-
-        for w in ws:
-            gap = w["global_start"] - cur_end_global
-            if cur_words and gap > GAP_S:
-                utterances.append({
-                    "source": src,
-                    "global_start": cur_global,
-                    "local_start": cur_start_local,
-                    "local_end": cur_end_local,
-                    "text": " ".join(cur_words),
-                })
-                cur_start_local = w["local_start"]
-                cur_end_local   = w["local_end"]
-                cur_end_global  = w["global_end"]
-                cur_global      = w["global_start"]
-                cur_words = []
-
-            cur_words.append((w.get("text") or "").strip())
-            cur_end_local  = w["local_end"]
-            cur_end_global = w["global_end"]
-
-        if cur_words:
-            utterances.append({
-                "source": src,
-                "global_start": cur_global,
-                "local_start": cur_start_local,
-                "local_end": cur_end_local,
-                "text": " ".join(cur_words),
-            })
-
-    utterances.sort(key=lambda u: u["global_start"])
-
-    lines: list[str] = []
-    for u in utterances:
-        ls = u["local_start"]
-        le = u["local_end"]
-        m_s, s_s = divmod(ls, 60)
-        m_e, s_e = divmod(le, 60)
-        ts = f"{int(m_s)}:{s_s:05.2f}–{int(m_e)}:{s_e:05.2f}"
-        lines.append(f"[{u['source']} | LOCAL {ts}]  {u['text']}")
-
-    return "\n".join(lines)
-
-
-def _stories_as_text(stories: list[dict]) -> str:
-    """Render a list of story dicts as a readable text block for conversation history."""
-    parts: list[str] = []
-    for i, s in enumerate(stories, 1):
-        dur = s.get("estimated_duration_secs")
-        dur_str = f"{dur:.0f}s" if dur else "?"
-        ranges_str = ", ".join(
-            f"{r['source']} {r['start']:.2f}–{r['end']:.2f}s"
-            for r in (s.get("ranges") or [])
-        )
-        parts.append(
-            f"Option {i}: \"{s['title']}\" ({dur_str})\n"
-            f"{s['description']}\n"
-            f"Ranges: {ranges_str}"
-        )
-    return "\n\n".join(parts)
 
 
 def _build_messages(
@@ -719,7 +639,10 @@ def _build_messages(
     first_content = f"Transcript:\n\n{transcript_text}"
     if round1_prompt:
         first_content += f"\n\nUser's request: {round1_prompt}"
-    first_content += "\n\nPropose 3 story options using the propose_stories tool."
+    first_content += (
+        "\n\nPropose 3 story options using the propose_stories tool, "
+        "quoting verbatim transcript text for each segment."
+    )
     messages.append({"role": "user", "content": first_content})
 
     # Alternate assistant/user turns for each previous round
@@ -743,7 +666,7 @@ def _build_messages(
                 "role": "assistant",
                 "content": (
                     "Here are my suggestions:\n\n"
-                    + _stories_as_text(round_stories)
+                    + stories_as_text(round_stories)
                 ),
             })
 
@@ -796,9 +719,9 @@ def _generate_worker(project_id: str, round_id: str) -> None:
     1. Load merged.json transcript from R2.
     2. Load the current generation round + all previous rounds from DB.
     3. Build a multi-turn conversation history so Claude has full context.
-    4. Call Claude with extended thinking + tool use to get 3 structured stories.
-    5. Fill in the 3 placeholder story rows created by the Vercel route.
-    6. Advance project status to 'stories_ready'.
+    4. Call Claude with extended thinking + tool use to get 3 stories of quotes.
+    5. Resolve each verbatim quote to a precise timestamp range (fail loud).
+    6. Fill in the 3 placeholder story rows and advance status to 'stories_ready'.
     """
     import anthropic
 
@@ -815,7 +738,7 @@ def _generate_worker(project_id: str, round_id: str) -> None:
         if not words:
             raise ValueError("merged.json is empty — run alignment first")
 
-        transcript_text = _format_transcript(words)
+        transcript_text = format_transcript(words)
 
         # 2. Load current round
         round_row = sb.table("generation_rounds").select(
@@ -868,20 +791,30 @@ def _generate_worker(project_id: str, round_id: str) -> None:
         stories: list[dict] = tool_use.input["stories"]
         print(f"[generate] Claude returned {len(stories)} stories")
 
-        # 5. Fill in the placeholder story rows (created by the Vercel route)
+        # 5. Resolve every quote to a timestamp range BEFORE touching the DB,
+        #    so a failed match leaves no partially-written round behind.
+        index_by_source = build_source_index(words)
+
+        resolved: list[dict] = []
+        for story_data in stories:
+            ranges = resolve_segments(story_data["segments"], index_by_source)
+            duration = sum(r["end"] - r["start"] for r in ranges)
+            resolved.append({
+                "title": story_data["title"],
+                "description": story_data["description"],
+                "estimated_duration_secs": round(duration, 1),
+                "ranges_json": ranges,
+                "status": "ready",
+            })
+
+        # 6. Fill in the placeholder story rows (created by the Vercel route)
         existing = sb.table("stories").select("id").eq(
             "generation_round_id", round_id
         ).order("created_at").execute()
         story_ids = [s["id"] for s in (existing.data or [])]
 
-        for story_data, story_id in zip(stories, story_ids):
-            sb.table("stories").update({
-                "title": story_data["title"],
-                "description": story_data["description"],
-                "estimated_duration_secs": story_data.get("estimated_duration_secs"),
-                "ranges_json": story_data["ranges"],
-                "status": "ready",
-            }).eq("id", story_id).execute()
+        for payload, story_id in zip(resolved, story_ids):
+            sb.table("stories").update(payload).eq("id", story_id).execute()
 
         # 6. Advance project
         sb.table("projects").update({
