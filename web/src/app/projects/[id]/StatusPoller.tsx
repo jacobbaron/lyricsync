@@ -155,6 +155,10 @@ interface Props {
 export function StatusPoller({ projectId, initialProject, initialClips }: Props) {
   const [project, setProject] = useState<Project>(initialProject);
   const [clips, setClips] = useState<Clip[]>(initialClips);
+  // Start collapsed if every clip is already done (page reload after transcription)
+  const [clipsOpen, setClipsOpen] = useState(
+    () => initialClips.some((c) => c.status !== "aligned" && c.status !== "error"),
+  );
   const alignTriggeredRef = useRef(false);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -191,7 +195,12 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
         if (!res.ok) return;
         const data = await res.json();
         setProject({ id: data.id, name: data.name, status: data.status });
-        setClips(data.clips ?? []);
+        const updated: Clip[] = data.clips ?? [];
+        setClips(updated);
+        // Collapse the clip list once all clips finish processing
+        if (updated.length > 0 && updated.every((c) => c.status === "aligned" || c.status === "error")) {
+          setClipsOpen(false);
+        }
       } catch {
         // Network blip — keep polling
       }
@@ -232,36 +241,50 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
         </p>
       )}
 
-      {/* Clip list */}
+      {/* Clip list — collapsible */}
       {clips.length > 0 && (
         <section>
-          <h2 className="text-xs font-medium uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-2">
-            Clips
-          </h2>
-          <ul className="flex flex-col gap-2">
-            {clips.map((clip) => (
-              <li
-                key={clip.id}
-                className="flex flex-col gap-1 rounded-xl border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm truncate text-zinc-800 dark:text-zinc-200">
-                    {clip.filename}
-                  </span>
-                  <span
-                    className={`shrink-0 text-xs font-mono ${clipColor(clip.status)}`}
-                  >
-                    {clipIcon(clip.status)} {clipLabel(clip.status)}
-                  </span>
-                </div>
-                {clip.status === "error" && clip.error_message && (
-                  <p className="text-xs text-red-500 truncate">
-                    {clip.error_message}
-                  </p>
-                )}
-              </li>
-            ))}
-          </ul>
+          <button
+            type="button"
+            onClick={() => setClipsOpen((o) => !o)}
+            className="flex w-full items-center gap-1.5 mb-2 group"
+          >
+            <h2 className="text-xs font-medium uppercase tracking-wide text-zinc-400 dark:text-zinc-500 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors">
+              Clips
+            </h2>
+            <span className="text-xs text-zinc-400 dark:text-zinc-500 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors">
+              · {clips.length}
+            </span>
+            <span className="ml-auto text-zinc-400 dark:text-zinc-500 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors text-xs">
+              {clipsOpen ? "▾" : "▸"}
+            </span>
+          </button>
+          {clipsOpen && (
+            <ul className="flex flex-col gap-2">
+              {clips.map((clip) => (
+                <li
+                  key={clip.id}
+                  className="flex flex-col gap-1 rounded-xl border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-sm truncate text-zinc-800 dark:text-zinc-200">
+                      {clip.filename}
+                    </span>
+                    <span
+                      className={`shrink-0 text-xs font-mono ${clipColor(clip.status)}`}
+                    >
+                      {clipIcon(clip.status)} {clipLabel(clip.status)}
+                    </span>
+                  </div>
+                  {clip.status === "error" && clip.error_message && (
+                    <p className="text-xs text-red-500 truncate">
+                      {clip.error_message}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
       )}
 
