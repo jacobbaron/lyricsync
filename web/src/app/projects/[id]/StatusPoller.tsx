@@ -106,7 +106,7 @@ function bannerText(
       );
       if (aligning) {
         return {
-          text: "All clips transcribed — running alignment…",
+          text: "All clips transcribed — merging transcripts…",
           color: "text-amber-500 dark:text-amber-400",
         };
       }
@@ -160,7 +160,9 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
 
   const isTerminal = TERMINAL_STATUSES.includes(project.status);
 
-  // Trigger alignment once when all clips reach transcribed_raw
+  // Trigger merge once when all clips reach transcribed_raw.
+  // Calls /merge (fast, Vercel-side JSON merge from raw Whisper transcripts).
+  // To re-enable WhisperX alignment instead, swap /merge → /align here.
   useEffect(() => {
     if (alignTriggeredRef.current) return;
     if (project.status !== "transcribing") return;
@@ -170,9 +172,9 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
     if (!allRaw) return;
 
     alignTriggeredRef.current = true;
-    console.log("[poll] all clips transcribed_raw → triggering align");
-    fetch(`/api/projects/${projectId}/align`, { method: "POST" }).catch(
-      (err) => console.error("[poll] align trigger failed:", err),
+    console.log("[poll] all clips transcribed_raw → triggering merge");
+    fetch(`/api/projects/${projectId}/merge`, { method: "POST" }).catch(
+      (err) => console.error("[poll] merge trigger failed:", err),
     );
   }, [clips, project.status, projectId]);
 
