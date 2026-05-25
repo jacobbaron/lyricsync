@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { UploadArea } from "./UploadArea";
 import { TranscriptViewer } from "./TranscriptViewer";
-import { RangePicker, type ClipMeta } from "./RangePicker";
+import { StoryGenerator } from "./StoryGenerator";
+import { StoryBrowser } from "./StoryBrowser";
+import type { ClipMeta } from "./RangePicker";
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -19,11 +21,11 @@ export type ProjectStatus =
   | "uploading"
   | "transcribing"
   | "transcribed"
+  | "generating_stories"
+  | "stories_ready"
   | "rendering"
   | "done"
   | "error";
-
-export type StoryStatus = "generating" | "rendering" | "done" | "error";
 
 interface Clip {
   id: string;
@@ -39,67 +41,52 @@ interface Project {
   status: ProjectStatus;
 }
 
-export interface Story {
-  id: string;
-  status: StoryStatus;
-  created_at: string;
-}
-
 // ── constants ──────────────────────────────────────────────────────────────
 
-const TERMINAL_STATUSES: ProjectStatus[] = ["transcribed", "done", "error"];
+// Statuses where the main project-level poller should stop
+const TERMINAL_STATUSES: ProjectStatus[] = [
+  "stories_ready",
+  "done",
+  "error",
+];
+
 const POLL_INTERVAL_MS = 3000;
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
 function clipLabel(status: ClipStatus): string {
   switch (status) {
-    case "uploading":      return "Uploading";
+    case "uploading": return "Uploading";
     case "uploading_complete": return "Queued";
-    case "transcribing":  return "Transcribing";
+    case "transcribing": return "Transcribing";
     case "transcribed_raw": return "Transcribed";
-    case "aligned":       return "Aligned";
-    case "error":         return "Error";
-    default:              return status;
+    case "aligned": return "Aligned";
+    case "error": return "Error";
+    default: return status;
   }
 }
 
 function clipColor(status: ClipStatus): string {
   switch (status) {
-    case "aligned":       return "text-green-600 dark:text-green-400";
-    case "error":         return "text-red-500";
+    case "aligned": return "text-green-600 dark:text-green-400";
+    case "error": return "text-red-500";
     case "transcribing":
-    case "uploading":     return "text-blue-500";
+    case "uploading": return "text-blue-500";
     case "transcribed_raw": return "text-amber-500 dark:text-amber-400";
-    default:              return "text-zinc-500 dark:text-zinc-400";
+    default: return "text-zinc-500 dark:text-zinc-400";
   }
 }
 
 function clipIcon(status: ClipStatus): string {
   switch (status) {
-    case "aligned":       return "✓";
-    case "error":         return "✗";
+    case "aligned": return "✓";
+    case "error": return "✗";
     case "transcribing":
-    case "uploading":     return "…";
+    case "uploading": return "…";
     case "transcribed_raw": return "⏳";
-    default:              return "·";
+    case "uploading_complete": return "·";
+    default: return "·";
   }
-}
-
-function storyBadge(status: StoryStatus): { label: string; cls: string } {
-  switch (status) {
-    case "done":      return { label: "Ready",     cls: "text-green-600 dark:text-green-400" };
-    case "rendering": return { label: "Rendering", cls: "text-blue-500" };
-    case "error":     return { label: "Error",     cls: "text-red-500" };
-    default:          return { label: status,      cls: "text-zinc-400" };
-  }
-}
-
-function fmtDate(iso: string): string {
-  return new Date(iso).toLocaleString(undefined, {
-    month: "short", day: "numeric",
-    hour: "numeric", minute: "2-digit",
-  });
 }
 
 function bannerText(
@@ -124,17 +111,32 @@ function bannerText(
         };
       }
       return {
-        text: total > 0
-          ? `Transcribing clips… (${done} of ${total} done)`
-          : "Transcribing clips…",
+        text:
+          total > 0
+            ? `Transcribing clips… (${done} of ${total} done)`
+            : "Transcribing clips…",
         color: "text-blue-500",
       };
     }
     case "transcribed":
       return {
-        text: "Transcription complete — ready to pick ranges",
+        text: "Transcription complete — generate story options below",
         color: "text-green-600 dark:text-green-400",
       };
+    case "generating_stories":
+      return {
+        text: "Generating story options…",
+        color: "text-blue-500",
+      };
+    case "stories_ready":
+      return {
+        text: "Story options ready",
+        color: "text-green-600 dark:text-green-400",
+      };
+    case "rendering":
+      return { text: "Rendering cut…", color: "text-blue-500" };
+    case "done":
+      return { text: "Done", color: "text-green-600 dark:text-green-400" };
     case "error":
       return { text: "An error occurred", color: "text-red-500" };
     default:
@@ -148,20 +150,15 @@ interface Props {
   projectId: string;
   initialProject: Project;
   initialClips: Clip[];
-  initialStories: Story[];
 }
 
-export function StatusPoller({
-  projectId,
-  initialProject,
-  initialClips,
-  initialStories,
-}: Props) {
+export function StatusPoller({ projectId, initialProject, initialClips }: Props) {
   const [project, setProject] = useState<Project>(initialProject);
   const [clips, setClips] = useState<Clip[]>(initialClips);
-  const [stories, setStories] = useState<Story[]>(initialStories);
   const alignTriggeredRef = useRef(false);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const isTerminal = TERMINAL_STATUSES.includes(project.status);
 
   // Trigger alignment once when all clips reach transcribed_raw
   useEffect(() => {
@@ -181,7 +178,6 @@ export function StatusPoller({
 
   // Poll while project is in a non-terminal state
   useEffect(() => {
-    const isTerminal = TERMINAL_STATUSES.includes(project.status);
     if (isTerminal) {
       if (pollingRef.current) clearInterval(pollingRef.current);
       return;
@@ -194,7 +190,6 @@ export function StatusPoller({
         const data = await res.json();
         setProject({ id: data.id, name: data.name, status: data.status });
         setClips(data.clips ?? []);
-        setStories(data.stories ?? []);
       } catch {
         // Network blip — keep polling
       }
@@ -204,11 +199,24 @@ export function StatusPoller({
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
     };
-  }, [project.status, projectId]);
+  }, [project.status, projectId, isTerminal]);
+
+  // Called by StoryGenerator (first generation) and StoryBrowser (re-generation).
+  // Optimistically advances local status so the poller resumes immediately.
+  const handleGenerationStarted = useCallback(() => {
+    setProject((prev) => ({ ...prev, status: "generating_stories" }));
+  }, []);
 
   const banner = bannerText(project.status, clips);
-  const isTerminal = TERMINAL_STATUSES.includes(project.status);
-  const hasAlignedClips = clips.some((c) => c.status === "aligned");
+
+  // Derived clip list for story components
+  const alignedClips: ClipMeta[] = clips
+    .filter((c) => c.status === "aligned")
+    .map((c) => ({
+      id: c.id,
+      filename: c.filename,
+      duration_secs: c.duration_secs ?? null,
+    }));
 
   return (
     <div className="flex flex-col gap-5">
@@ -238,12 +246,16 @@ export function StatusPoller({
                   <span className="text-sm truncate text-zinc-800 dark:text-zinc-200">
                     {clip.filename}
                   </span>
-                  <span className={`shrink-0 text-xs font-mono ${clipColor(clip.status)}`}>
+                  <span
+                    className={`shrink-0 text-xs font-mono ${clipColor(clip.status)}`}
+                  >
                     {clipIcon(clip.status)} {clipLabel(clip.status)}
                   </span>
                 </div>
                 {clip.status === "error" && clip.error_message && (
-                  <p className="text-xs text-red-500 truncate">{clip.error_message}</p>
+                  <p className="text-xs text-red-500 truncate">
+                    {clip.error_message}
+                  </p>
                 )}
               </li>
             ))}
@@ -252,53 +264,32 @@ export function StatusPoller({
       )}
 
       {/* Transcript viewer — shown once alignment is done */}
-      {hasAlignedClips && (
+      {(
+        project.status === "transcribed" ||
+        project.status === "generating_stories" ||
+        project.status === "stories_ready"
+      ) && (
         <TranscriptViewer projectId={project.id} />
       )}
 
-      {/* Existing cuts */}
-      {stories.length > 0 && (
-        <section>
-          <h2 className="text-xs font-medium uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-2">
-            Your Cuts
-          </h2>
-          <ul className="flex flex-col gap-2">
-            {stories
-              .slice()
-              .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-              .map((story) => {
-                const badge = storyBadge(story.status);
-                return (
-                  <li key={story.id}>
-                    <a
-                      href={`/stories/${story.id}`}
-                      className="flex items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
-                    >
-                      <span className="text-sm text-zinc-700 dark:text-zinc-300">
-                        {fmtDate(story.created_at)}
-                      </span>
-                      <span className={`shrink-0 text-xs font-medium ${badge.cls}`}>
-                        {badge.label}
-                      </span>
-                    </a>
-                  </li>
-                );
-              })}
-          </ul>
-        </section>
+      {/* Story generator — shown when transcription is complete (first generation) */}
+      {project.status === "transcribed" && (
+        <StoryGenerator
+          projectId={project.id}
+          onStarted={handleGenerationStarted}
+        />
       )}
 
-      {/* Range picker — always shown while aligned clips exist */}
-      {hasAlignedClips && (
-        <RangePicker
+      {/* Story browser — shown while generating and after stories are ready */}
+      {(
+        project.status === "generating_stories" ||
+        project.status === "stories_ready"
+      ) && (
+        <StoryBrowser
           projectId={project.id}
-          clips={clips
-            .filter((c) => c.status === "aligned")
-            .map((c): ClipMeta => ({
-              id: c.id,
-              filename: c.filename,
-              duration_secs: c.duration_secs ?? null,
-            }))}
+          clips={alignedClips}
+          isGenerating={project.status === "generating_stories"}
+          onGenerated={handleGenerationStarted}
         />
       )}
 

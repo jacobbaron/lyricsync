@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { StatusPoller, type ProjectStatus, type ClipStatus, type Story } from "./StatusPoller";
+import { StatusPoller, type ProjectStatus, type ClipStatus } from "./StatusPoller";
 
 export default async function ProjectPage({
   params,
@@ -15,7 +15,7 @@ export default async function ProjectPage({
   const supabase = await createClient();
   const { data: project, error } = await supabase
     .from("projects")
-    .select("id, name, status, created_at, clips(id, filename, status, error_message, duration_secs), stories(id, status, created_at)")
+    .select("id, name, status, created_at, clips(id, filename, status, error_message, duration_secs)")
     .eq("id", projectId)
     .maybeSingle();
 
@@ -31,12 +31,6 @@ export default async function ProjectPage({
     status: string;
     error_message?: string | null;
     duration_secs?: number | null;
-  }>;
-
-  const stories = (project.stories ?? []) as Array<{
-    id: string;
-    status: string;
-    created_at: string;
   }>;
 
   return (
@@ -66,11 +60,6 @@ export default async function ProjectPage({
             status: c.status as ClipStatus,
             error_message: c.error_message,
             duration_secs: c.duration_secs,
-          }))}
-          initialStories={stories.map((s) => ({
-            id: s.id,
-            status: s.status as Story["status"],
-            created_at: s.created_at,
           }))}
         />
       </div>

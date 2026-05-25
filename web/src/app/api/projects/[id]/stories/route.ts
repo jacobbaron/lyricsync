@@ -3,6 +3,86 @@ import { createClient } from "@/lib/supabase/server";
 
 export const runtime = "nodejs";
 
+// ── GET /api/projects/[id]/stories ────────────────────────────────────────
+// Returns all generation rounds with their stories, oldest-first.
+// Stories within each round are ordered by creation time.
+//
+// Response: { rounds: [{ id, round, prompt, created_at, stories: [...] }] }
+
+export async function GET(
+  _request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  const { id: projectId } = await context.params;
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user?.email) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { data: project } = await supabase
+    .from("projects")
+    .select("id")
+    .eq("id", projectId)
+    .maybeSingle();
+
+  if (!project) {
+    return NextResponse.json({ error: "Project not found" }, { status: 404 });
+  }
+
+  const { data: rounds, error: roundsError } = await supabase
+    .from("generation_rounds")
+    .select("id, round, prompt, created_at")
+    .eq("project_id", projectId)
+    .order("round", { ascending: true });
+
+  if (roundsError) {
+    return NextResponse.json({ error: roundsError.message }, { status: 500 });
+  }
+
+  if (!rounds || rounds.length === 0) {
+    return NextResponse.json({ rounds: [] });
+  }
+
+  const roundIds = rounds.map((r) => r.id);
+  const { data: stories, error: storiesError } = await supabase
+    .from("stories")
+    .select(
+      "id, generation_round_id, title, description, " +
+        "estimated_duration_secs, ranges_json, status, error_message, created_at",
+    )
+    .in("generation_round_id", roundIds)
+    .order("created_at", { ascending: true });
+
+  if (storiesError) {
+    return NextResponse.json({ error: storiesError.message }, { status: 500 });
+  }
+
+  type StoryRow = {
+    id: string;
+    generation_round_id: string;
+    title: string | null;
+    description: string | null;
+    estimated_duration_secs: number | null;
+    ranges_json: unknown;
+    status: string;
+    error_message: string | null;
+    created_at: string;
+  };
+
+  const byRound: Record<string, StoryRow[]> = {};
+  for (const s of (stories ?? []) as unknown as StoryRow[]) {
+    (byRound[s.generation_round_id] ??= []).push(s);
+  }
+
+  return NextResponse.json({
+    rounds: rounds.map((r) => ({ ...r, stories: byRound[r.id] ?? [] })),
+  });
+}
+
 // ── types ──────────────────────────────────────────────────────────────────
 
 interface Range {
