@@ -288,16 +288,20 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
         </section>
       )}
 
-      {/* Transcript viewer — shown once alignment is done */}
+      {/* Transcript viewer — shown once alignment is done. Stays visible through
+          all downstream statuses so users can reference it anytime. */}
       {(
         project.status === "transcribed" ||
         project.status === "generating_stories" ||
-        project.status === "stories_ready"
+        project.status === "stories_ready" ||
+        project.status === "rendering" ||
+        project.status === "done"
       ) && (
         <TranscriptViewer projectId={project.id} />
       )}
 
-      {/* Story generator — shown when transcription is complete (first generation) */}
+      {/* Story generator — shown when transcription is complete and no stories
+          have been generated yet (first generation). */}
       {project.status === "transcribed" && (
         <StoryGenerator
           projectId={project.id}
@@ -305,10 +309,14 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
         />
       )}
 
-      {/* Story browser — shown while generating and after stories are ready */}
+      {/* Story browser — once stories exist, always show. This includes
+          rendering/done so users can navigate back to in-flight or completed
+          stories from the project page. */}
       {(
         project.status === "generating_stories" ||
-        project.status === "stories_ready"
+        project.status === "stories_ready" ||
+        project.status === "rendering" ||
+        project.status === "done"
       ) && (
         <StoryBrowser
           projectId={project.id}
