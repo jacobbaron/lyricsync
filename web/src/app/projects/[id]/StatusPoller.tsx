@@ -39,6 +39,7 @@ interface Project {
   id: string;
   name: string;
   status: ProjectStatus;
+  error_message?: string | null;
 }
 
 // ── constants ──────────────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ function clipIcon(status: ClipStatus): string {
 function bannerText(
   status: ProjectStatus,
   clips: Clip[],
+  errorMessage?: string | null,
 ): { text: string; color: string } | null {
   switch (status) {
     case "uploading":
@@ -138,7 +140,12 @@ function bannerText(
     case "done":
       return { text: "Done", color: "text-green-600 dark:text-green-400" };
     case "error":
-      return { text: "Story generation failed — try again below", color: "text-red-500" };
+      return {
+        text: errorMessage
+          ? `Story generation failed: ${errorMessage} — try again below`
+          : "Story generation failed — try again below",
+        color: "text-red-500",
+      };
     default:
       return null;
   }
@@ -194,7 +201,12 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
         const res = await fetch(`/api/projects/${projectId}`);
         if (!res.ok) return;
         const data = await res.json();
-        setProject({ id: data.id, name: data.name, status: data.status });
+        setProject({
+          id: data.id,
+          name: data.name,
+          status: data.status,
+          error_message: data.error_message,
+        });
         const updated: Clip[] = data.clips ?? [];
         setClips(updated);
         // Collapse the clip list once all clips finish processing
@@ -218,7 +230,7 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
     setProject((prev) => ({ ...prev, status: "generating_stories" }));
   }, []);
 
-  const banner = bannerText(project.status, clips);
+  const banner = bannerText(project.status, clips, project.error_message);
 
   // Derived clip list for story components
   const alignedClips: ClipMeta[] = clips
