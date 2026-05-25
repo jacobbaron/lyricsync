@@ -246,7 +246,9 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
                   <span className="text-sm truncate text-zinc-800 dark:text-zinc-200">
                     {clip.filename}
                   </span>
-                  <span className={`shrink-0 text-xs font-mono ${clipColor(clip.status)}`}>
+                  <span
+                    className={`shrink-0 text-xs font-mono ${clipColor(clip.status)}`}
+                  >
                     {clipIcon(clip.status)} {clipLabel(clip.status)}
                   </span>
                 </div>

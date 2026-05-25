@@ -165,13 +165,11 @@ export async function POST(
     );
   }
 
-  // Update project status to rendering
-  await supabase
-    .from("projects")
-    .update({ status: "rendering" })
-    .eq("id", projectId);
+  // Note: project status intentionally NOT updated here — the project stays
+  // at 'transcribed' so the range picker remains available for new cuts.
+  // Individual stories track their own rendering lifecycle.
 
-  // Trigger render (P1-11 will wire this up)
+  // Trigger render
   const renderUrl = process.env.MODAL_RENDER_URL;
   const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
   if (renderUrl && webhookSecret) {

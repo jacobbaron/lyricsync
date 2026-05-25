@@ -35,7 +35,6 @@ export default async function ProjectPage({
 
   return (
     <main className="flex flex-col min-h-full">
-      {/* Header — static, no need to re-render on each poll */}
       <header className="flex items-center gap-3 px-4 py-4 border-b border-zinc-200 dark:border-zinc-800">
         <Link
           href="/"
@@ -48,13 +47,6 @@ export default async function ProjectPage({
       </header>
 
       <div className="flex flex-col gap-5 px-4 py-6 max-w-lg mx-auto w-full">
-        {/* StatusPoller handles:
-              - Live clip list + per-clip status badges
-              - Overall project status banner with progress count
-              - Auto-triggering /align once all clips are transcribed_raw
-              - Stopping polling when status is terminal
-              - UploadArea (only while uploading)
-              - Transcript viewer placeholder (once transcribed) */}
         <StatusPoller
           projectId={projectId}
           initialProject={{
