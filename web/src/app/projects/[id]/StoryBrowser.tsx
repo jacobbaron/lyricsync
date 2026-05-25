@@ -32,6 +32,11 @@ export function StoryBrowser({
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevIsGenerating = useRef(isGenerating);
 
+  // True when any story is still in a non-terminal state
+  const hasActiveStory = rounds.some((r) =>
+    r.stories.some((s) => s.status === "generating" || s.status === "rendering"),
+  );
+
   const fetchRounds = useCallback(async () => {
     try {
       const res = await fetch(`/api/projects/${projectId}/stories`);
@@ -57,9 +62,10 @@ export function StoryBrowser({
     prevIsGenerating.current = isGenerating;
   }, [isGenerating, fetchRounds]);
 
-  // Poll the stories endpoint while generating
+  // Poll while the project is generating stories OR while any story is rendering
+  const shouldPoll = isGenerating || hasActiveStory;
   useEffect(() => {
-    if (!isGenerating) {
+    if (!shouldPoll) {
       if (pollingRef.current) clearInterval(pollingRef.current);
       return;
     }
@@ -67,7 +73,7 @@ export function StoryBrowser({
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
     };
-  }, [isGenerating, fetchRounds]);
+  }, [shouldPoll, fetchRounds]);
 
   async function handleGenerate() {
     setSubmitting(true);
