@@ -557,7 +557,7 @@ def _render_worker(story_id: str) -> None:
          - BT.709 8-bit yuv420p output for iPhone HDR compatibility
     5. Upload output.mp4 to R2 at projects/<pid>/stories/<sid>/output.mp4.
     6. Update story: status='done', render_r2_key set.
-    7. Update project: status='done' (only if still 'rendering').
+       Project status is intentionally left unchanged ('transcribed').
     """
     sb = _supabase()
     r2 = _r2()
@@ -692,18 +692,13 @@ def _render_worker(story_id: str) -> None:
                 )
             print(f"[render] uploaded {output_key}")
 
-            # 6. Mark story done
+            # 6. Mark story done.
+            # Note: project status intentionally NOT changed — it stays at
+            # 'transcribed' so users can create additional cuts at any time.
             sb.table("stories").update({
                 "status": "done",
                 "render_r2_key": output_key,
             }).eq("id", story_id).execute()
-
-            # 7. Advance project to 'done' only if it's still 'rendering'.
-            # A project could have multiple stories; only the first one triggers
-            # the project-level status change.
-            sb.table("projects").update({
-                "status": "done",
-            }).eq("id", project_id).eq("status", "rendering").execute()
 
             print(f"[render] story {story_id} done ✓")
 
