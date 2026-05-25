@@ -19,8 +19,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Modal
-        run: pip install modal
+      - name: Install dependencies
+        run: pip install modal fastapi
 
       - name: Deploy
         run: modal deploy modal/app.py
