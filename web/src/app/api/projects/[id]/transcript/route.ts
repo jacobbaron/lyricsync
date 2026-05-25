@@ -28,7 +28,8 @@ export async function GET(
   if (!project) {
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
-  if (project.status !== "transcribed" && project.status !== "done") {
+  const TRANSCRIPT_READY = ["transcribed", "generating_stories", "stories_ready", "rendering", "done"];
+  if (!TRANSCRIPT_READY.includes(project.status)) {
     return NextResponse.json(
       { error: "Transcript not yet available", status: project.status },
       { status: 409 },
