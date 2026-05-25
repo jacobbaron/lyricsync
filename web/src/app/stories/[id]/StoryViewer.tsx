@@ -116,12 +116,16 @@ export function StoryViewer({ storyId, initialStory }: Props) {
   // Share to Photos via Web Share API.
   // iOS Safari: pass ONLY `files` (no title/text/url) — otherwise file
   // sharing silently fails. The Share Sheet will include "Save to Photos".
+  //
+  // We fetch through our own API proxy (/api/stories/[id]/video) rather than
+  // the R2 presigned URL directly — R2 doesn't include CORS headers so a
+  // direct fetch() fails with "Load Failed" even though <video src> works fine.
   const handleSaveToPhotos = useCallback(async () => {
     if (!urls) return;
     setSharing(true);
     setShareError(null);
     try {
-      const res = await fetch(urls.playback_url);
+      const res = await fetch(`/api/stories/${storyId}/video`);
       if (!res.ok) throw new Error("Could not fetch video");
       const blob = await res.blob();
       const file = new File([blob], "output.mp4", { type: "video/mp4" });
