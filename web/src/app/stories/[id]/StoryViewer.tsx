@@ -14,6 +14,11 @@ interface Story {
   render_r2_key?: string | null;
 }
 
+interface SignedUrls {
+  playback_url: string;
+  download_url: string;
+}
+
 // ── constants ─────────────────────────────────────────────────────────────
 
 const TERMINAL: StoryStatus[] = ["done", "error"];
@@ -28,9 +33,12 @@ interface Props {
 
 export function StoryViewer({ storyId, initialStory }: Props) {
   const [story, setStory] = useState<Story>(initialStory);
+  const [urls, setUrls] = useState<SignedUrls | null>(null);
+  const [urlError, setUrlError] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Poll while non-terminal
+  // Poll for status changes while non-terminal
   useEffect(() => {
     if (TERMINAL.includes(story.status)) {
       if (pollingRef.current) clearInterval(pollingRef.current);
@@ -54,44 +62,112 @@ export function StoryViewer({ storyId, initialStory }: Props) {
     };
   }, [story.status, storyId]);
 
-  // ── render ──────────────────────────────────────────────────────────────
+  // Fetch signed URLs once the story is done
+  useEffect(() => {
+    if (story.status !== "done") return;
+    fetch(`/api/stories/${storyId}/signed-url`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.error) throw new Error(data.error);
+        setUrls(data);
+      })
+      .catch((err: Error) => setUrlError(err.message));
+  }, [story.status, storyId]);
 
-  if (story.status === "error") {
+  // Retry — resets story to rendering and restarts the poll
+  async function handleRetry() {
+    setRetrying(true);
+    try {
+      await fetch(`/api/stories/${storyId}/render`, { method: "POST" });
+      setStory((prev) => ({
+        ...prev,
+        status: "rendering",
+        error_message: null,
+      }));
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  // ── render ───────────────────────────────────────────────────────────────
+
+  if (story.status === "done") {
     return (
-      <div className="rounded-xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950 px-5 py-4 flex flex-col gap-2">
-        <p className="text-sm font-medium text-red-600 dark:text-red-400">
-          Render failed
-        </p>
-        {story.error_message && (
-          <p className="text-xs text-red-500 font-mono">{story.error_message}</p>
+      <div className="flex flex-col gap-5">
+        {/* Video player */}
+        <div className="rounded-xl overflow-hidden bg-black">
+          {urls ? (
+            <video
+              src={urls.playback_url}
+              controls
+              playsInline
+              className="w-full max-h-[70vh]"
+            />
+          ) : urlError ? (
+            <div className="flex items-center justify-center h-48 text-sm text-red-400 px-4 text-center">
+              Could not load video: {urlError}
+            </div>
+          ) : (
+            <div className="flex items-center justify-center h-48 animate-pulse bg-zinc-900">
+              <span className="text-zinc-600 text-sm">Loading…</span>
+            </div>
+          )}
+        </div>
+
+        {/* Download — Content-Disposition:attachment set server-side so iOS
+            saves to Files instead of trying to play in Safari */}
+        {urls && (
+          <a
+            href={urls.download_url}
+            className="flex items-center justify-center gap-2 w-full rounded-xl bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:hover:bg-white px-4 py-3 text-sm font-semibold text-white dark:text-zinc-900 transition-colors"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 20 20"
+              fill="currentColor"
+              className="w-4 h-4 shrink-0"
+            >
+              <path d="M10.75 2.75a.75.75 0 0 0-1.5 0v8.614L6.295 8.235a.75.75 0 1 0-1.09 1.03l4.25 4.5a.75.75 0 0 0 1.09 0l4.25-4.5a.75.75 0 0 0-1.09-1.03l-2.955 3.129V2.75Z" />
+              <path d="M3.5 12.75a.75.75 0 0 0-1.5 0v2.5A2.75 2.75 0 0 0 4.75 18h10.5A2.75 2.75 0 0 0 18 15.25v-2.5a.75.75 0 0 0-1.5 0v2.5c0 .69-.56 1.25-1.25 1.25H4.75c-.69 0-1.25-.56-1.25-1.25v-2.5Z" />
+            </svg>
+            Save to device
+          </a>
         )}
       </div>
     );
   }
 
-  if (story.status === "done" && story.render_r2_key) {
-    // P1-12 will add inline video playback and a download button here.
+  if (story.status === "error") {
     return (
-      <div className="rounded-xl border border-green-200 dark:border-green-900 bg-green-50 dark:bg-green-950 px-5 py-4 flex flex-col gap-3">
-        <p className="text-sm font-medium text-green-700 dark:text-green-400">
-          Cut ready
-        </p>
-        <p className="text-xs text-zinc-500 dark:text-zinc-400">
-          Playback and download will be available in the next update.
-        </p>
+      <div className="flex flex-col gap-4">
+        <div className="rounded-xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950 px-5 py-4 flex flex-col gap-2">
+          <p className="text-sm font-medium text-red-600 dark:text-red-400">
+            Render failed
+          </p>
+          {story.error_message && (
+            <p className="text-xs text-red-500 font-mono break-words">
+              {story.error_message}
+            </p>
+          )}
+        </div>
+        <button
+          onClick={handleRetry}
+          disabled={retrying}
+          className="w-full rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-3 text-sm font-semibold text-zinc-800 dark:text-zinc-200 transition-colors"
+        >
+          {retrying ? "Starting…" : "Retry render"}
+        </button>
       </div>
     );
   }
 
-  // Rendering / generating
+  // Rendering / generating — pulse skeleton
   return (
     <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-5 py-6 flex flex-col gap-4">
-      <div className="flex items-center gap-3">
-        <span className="text-sm text-blue-500">
-          Rendering cut
-          <span className="ml-1 inline-block animate-pulse">·</span>
-        </span>
-      </div>
+      <p className="text-sm text-blue-500">
+        Rendering cut
+        <span className="ml-1 inline-block animate-pulse">·</span>
+      </p>
       <div className="flex flex-col gap-2 animate-pulse">
         {[80, 60, 75].map((w, i) => (
           <div
@@ -102,7 +178,8 @@ export function StoryViewer({ storyId, initialStory }: Props) {
         ))}
       </div>
       <p className="text-xs text-zinc-400 dark:text-zinc-500">
-        This usually takes a minute or two. You can leave this page and come back.
+        This usually takes a minute or two. You can leave this page and come
+        back.
       </p>
     </div>
   );

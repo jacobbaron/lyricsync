@@ -59,6 +59,33 @@ export async function presignClipUpload(
   return getSignedUrl(getClient(), cmd, { expiresIn: UPLOAD_URL_TTL_SECONDS });
 }
 
+/** Generate a presigned GET URL for reading an object.
+ *
+ * @param key               R2 object key
+ * @param expiresIn         TTL in seconds (default 3600)
+ * @param contentDisposition  Optional Content-Disposition override, e.g.
+ *                            `attachment; filename="output.mp4"` — tells the
+ *                            browser to save the file rather than play it.
+ */
+export async function presignDownload(
+  key: string,
+  expiresIn = 3600,
+  contentDisposition?: string,
+): Promise<string> {
+  const bucket = process.env.R2_BUCKET_NAME;
+  if (!bucket) {
+    throw new Error("R2 client misconfigured: R2_BUCKET_NAME not set.");
+  }
+  const cmd = new GetObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    ...(contentDisposition
+      ? { ResponseContentDisposition: contentDisposition }
+      : {}),
+  });
+  return getSignedUrl(getClient(), cmd, { expiresIn });
+}
+
 /** Fetch an object from R2 and return its body as a string. */
 export async function getObjectText(key: string): Promise<string> {
   const bucket = process.env.R2_BUCKET_NAME;
