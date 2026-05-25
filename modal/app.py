@@ -511,6 +511,394 @@ def _align_worker(project_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# P2-02: Generate Stories Task
+# ---------------------------------------------------------------------------
+
+# Separate image: adds the Anthropic SDK.  No heavy ML deps needed here.
+gen_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "fastapi[standard]>=0.115",
+        "boto3>=1.34",
+        "supabase>=2.10",
+        "anthropic>=0.34",
+    )
+)
+
+# Tool definition passed to Claude — forces structured JSON output.
+_PROPOSE_STORIES_TOOL = {
+    "name": "propose_stories",
+    "description": (
+        "Propose exactly 3 story cuts from the transcript. "
+        "Each story is an ordered list of source-clip segments."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["stories"],
+        "properties": {
+            "stories": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "title", "description",
+                        "estimated_duration_secs", "ranges",
+                    ],
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Short, evocative title for this story cut",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": (
+                                "2-3 sentences on what makes this story "
+                                "work editorially"
+                            ),
+                        },
+                        "estimated_duration_secs": {
+                            "type": "number",
+                            "description": "Sum of all range durations in seconds",
+                        },
+                        "ranges": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "required": ["source", "start", "end"],
+                                "properties": {
+                                    "source": {
+                                        "type": "string",
+                                        "description": (
+                                            "Exact filename of the source clip "
+                                            "(e.g. IMG_2418.MOV)"
+                                        ),
+                                    },
+                                    "start": {
+                                        "type": "number",
+                                        "description": (
+                                            "Start time in seconds, LOCAL to "
+                                            "the source clip"
+                                        ),
+                                    },
+                                    "end": {
+                                        "type": "number",
+                                        "description": (
+                                            "End time in seconds, LOCAL to "
+                                            "the source clip"
+                                        ),
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+
+_SYSTEM_PROMPT = """\
+You are a creative video editor. You have been given a merged transcript from \
+a multi-camera live recording session.
+
+The transcript shows word-level speech from each source clip, with LOCAL \
+timestamps (seconds relative to that clip's start). Use these local \
+timestamps when specifying ranges — they are what the render pipeline expects.
+
+Your job is to propose compelling short-form story cuts from this footage. \
+Each cut is an ordered list of segments; you may draw from any clip in any order.
+
+Guidelines:
+- Each story should total 30–180 seconds (sum of range durations)
+- Cut at natural sentence or phrase boundaries based on the transcript
+- Make the 3 options meaningfully distinct: different angles, moments, or arcs
+- Prefer complete thoughts over partial sentences
+- You may interleave clips (e.g. cut between cameras mid-conversation)
+- Source names must exactly match the filenames shown in the transcript\
+"""
+
+
+def _format_transcript(words: list[dict]) -> str:
+    """Format the merged word list into a readable transcript for Claude.
+
+    Groups words into utterances (consecutive words from the same source
+    with gaps < 1.5 s), then sorts utterances by global start time.
+    Shows LOCAL timestamps so Claude can copy them directly into ranges.
+    """
+    GAP_S = 1.5
+
+    by_source: dict[str, list[dict]] = {}
+    for w in words:
+        src = w.get("source", "?")
+        by_source.setdefault(src, []).append(w)
+
+    utterances: list[dict] = []
+    for src, ws in by_source.items():
+        ws.sort(key=lambda x: x["global_start"])
+        cur_start_local = ws[0]["local_start"]
+        cur_end_local   = ws[0]["local_end"]
+        cur_end_global  = ws[0]["global_end"]
+        cur_global      = ws[0]["global_start"]
+        cur_words: list[str] = []
+
+        for w in ws:
+            gap = w["global_start"] - cur_end_global
+            if cur_words and gap > GAP_S:
+                utterances.append({
+                    "source": src,
+                    "global_start": cur_global,
+                    "local_start": cur_start_local,
+                    "local_end": cur_end_local,
+                    "text": " ".join(cur_words),
+                })
+                cur_start_local = w["local_start"]
+                cur_end_local   = w["local_end"]
+                cur_end_global  = w["global_end"]
+                cur_global      = w["global_start"]
+                cur_words = []
+
+            cur_words.append((w.get("text") or "").strip())
+            cur_end_local  = w["local_end"]
+            cur_end_global = w["global_end"]
+
+        if cur_words:
+            utterances.append({
+                "source": src,
+                "global_start": cur_global,
+                "local_start": cur_start_local,
+                "local_end": cur_end_local,
+                "text": " ".join(cur_words),
+            })
+
+    utterances.sort(key=lambda u: u["global_start"])
+
+    lines: list[str] = []
+    for u in utterances:
+        ls = u["local_start"]
+        le = u["local_end"]
+        m_s, s_s = divmod(ls, 60)
+        m_e, s_e = divmod(le, 60)
+        ts = f"{int(m_s)}:{s_s:05.2f}–{int(m_e)}:{s_e:05.2f}"
+        lines.append(f"[{u['source']} | LOCAL {ts}]  {u['text']}")
+
+    return "\n".join(lines)
+
+
+def _stories_as_text(stories: list[dict]) -> str:
+    """Render a list of story dicts as a readable text block for conversation history."""
+    parts: list[str] = []
+    for i, s in enumerate(stories, 1):
+        dur = s.get("estimated_duration_secs")
+        dur_str = f"{dur:.0f}s" if dur else "?"
+        ranges_str = ", ".join(
+            f"{r['source']} {r['start']:.2f}–{r['end']:.2f}s"
+            for r in (s.get("ranges") or [])
+        )
+        parts.append(
+            f"Option {i}: \"{s['title']}\" ({dur_str})\n"
+            f"{s['description']}\n"
+            f"Ranges: {ranges_str}"
+        )
+    return "\n\n".join(parts)
+
+
+def _build_messages(
+    transcript_text: str,
+    current_round: dict,
+    prev_rounds: list[dict],
+    sb,
+) -> list[dict]:
+    """Build the Claude messages array from round history."""
+    messages: list[dict] = []
+
+    # Round 1 user message always includes the full transcript
+    round1_prompt = prev_rounds[0]["prompt"] if prev_rounds else current_round["prompt"]
+    first_content = f"Transcript:\n\n{transcript_text}"
+    if round1_prompt:
+        first_content += f"\n\nUser's request: {round1_prompt}"
+    first_content += "\n\nPropose 3 story options using the propose_stories tool."
+    messages.append({"role": "user", "content": first_content})
+
+    # Alternate assistant/user turns for each previous round
+    for rnd in prev_rounds:
+        # Load that round's stories to reconstruct the assistant's reply
+        result = sb.table("stories").select(
+            "title, description, estimated_duration_secs, ranges_json"
+        ).eq("generation_round_id", rnd["id"]).order("created_at").execute()
+        round_stories = [
+            {
+                "title": s["title"],
+                "description": s["description"],
+                "estimated_duration_secs": s["estimated_duration_secs"],
+                "ranges": s["ranges_json"],
+            }
+            for s in (result.data or [])
+            if s["title"]  # skip placeholder rows that never got filled
+        ]
+        if round_stories:
+            messages.append({
+                "role": "assistant",
+                "content": (
+                    "Here are my suggestions:\n\n"
+                    + _stories_as_text(round_stories)
+                ),
+            })
+
+        # The next user turn is the following round's prompt (if any) —
+        # but only append if there's a subsequent round after this one.
+        # The current round's prompt is added below.
+        next_prompt = current_round["prompt"] if rnd is prev_rounds[-1] else None
+        if next_prompt or rnd is not prev_rounds[-1]:
+            # Find next round's prompt from the list
+            idx = prev_rounds.index(rnd)
+            if idx + 1 < len(prev_rounds):
+                followup_prompt = prev_rounds[idx + 1]["prompt"] or "Generate 3 new options."
+            else:
+                followup_prompt = current_round["prompt"] or "Generate 3 new options."
+            messages.append({
+                "role": "user",
+                "content": f"{followup_prompt}\n\nPropose 3 new story options.",
+            })
+
+    # If there were no previous rounds, the first message already covers round 1.
+    # If there were previous rounds, the loop above added the current prompt as
+    # the last user turn. Either way we're done.
+    return messages
+
+
+@app.function(image=gen_image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def generate_stories(request: Request) -> JSONResponse:
+    """Vercel calls this endpoint; it authenticates, spawns the generation
+    worker, and returns {"status": "accepted"} immediately."""
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    project_id = body.get("project_id")
+    round_id = body.get("round_id")
+    if not project_id or not round_id:
+        raise HTTPException(status_code=400, detail="project_id and round_id required")
+
+    _generate_worker.spawn(project_id, round_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(image=gen_image, secrets=secrets, timeout=300)
+def _generate_worker(project_id: str, round_id: str) -> None:
+    """Story generation worker (P2-02).
+
+    1. Load merged.json transcript from R2.
+    2. Load the current generation round + all previous rounds from DB.
+    3. Build a multi-turn conversation history so Claude has full context.
+    4. Call Claude claude-opus-4-5 with tool use to get 3 structured stories.
+    5. Fill in the 3 placeholder story rows created by the Vercel route.
+    6. Advance project status to 'stories_ready'.
+    """
+    import anthropic
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    try:
+        # 1. Load merged.json
+        merged_key = f"projects/{project_id}/merged.json"
+        obj = r2.get_object(Bucket=bucket, Key=merged_key)
+        merged = json.loads(obj["Body"].read())
+        words = merged.get("words", [])
+        if not words:
+            raise ValueError("merged.json is empty — run alignment first")
+
+        transcript_text = _format_transcript(words)
+
+        # 2. Load current round
+        round_row = sb.table("generation_rounds").select(
+            "id, round, prompt"
+        ).eq("id", round_id).maybe_single().execute()
+        if not round_row.data:
+            raise ValueError(f"generation round {round_id} not found")
+        current_round = round_row.data
+        current_round_num: int = current_round["round"]
+
+        # 3. Load all *previous* rounds in order (rounds before current)
+        prev = sb.table("generation_rounds").select(
+            "id, round, prompt"
+        ).eq("project_id", project_id).lt(
+            "round", current_round_num
+        ).order("round").execute()
+        prev_rounds: list[dict] = prev.data or []
+
+        print(
+            f"[generate] project {project_id} round {current_round_num} "
+            f"(history: {len(prev_rounds)} prior round(s), "
+            f"{len(words)} words in transcript)"
+        )
+
+        # 4. Build messages and call Claude
+        messages = _build_messages(
+            transcript_text=transcript_text,
+            current_round=current_round,
+            prev_rounds=prev_rounds,
+            sb=sb,
+        )
+
+        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            system=_SYSTEM_PROMPT,
+            tools=[_PROPOSE_STORIES_TOOL],
+            tool_choice={"type": "any"},
+            messages=messages,
+        )
+
+        tool_use = next(
+            (b for b in response.content if b.type == "tool_use"), None
+        )
+        if not tool_use:
+            raise ValueError("Claude did not call the propose_stories tool")
+
+        stories: list[dict] = tool_use.input["stories"]
+        print(f"[generate] Claude returned {len(stories)} stories")
+
+        # 5. Fill in the placeholder story rows (created by the Vercel route)
+        existing = sb.table("stories").select("id").eq(
+            "generation_round_id", round_id
+        ).order("created_at").execute()
+        story_ids = [s["id"] for s in (existing.data or [])]
+
+        for story_data, story_id in zip(stories, story_ids):
+            sb.table("stories").update({
+                "title": story_data["title"],
+                "description": story_data["description"],
+                "estimated_duration_secs": story_data.get("estimated_duration_secs"),
+                "ranges_json": story_data["ranges"],
+                "status": "ready",
+            }).eq("id", story_id).execute()
+
+        # 6. Advance project
+        sb.table("projects").update({
+            "status": "stories_ready"
+        }).eq("id", project_id).execute()
+
+        print(f"[generate] project {project_id} → stories_ready ✓")
+
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        print(f"[generate] error for project {project_id}: {msg}")
+        sb.table("projects").update({
+            "status": "error",
+            "error_message": msg[:500],
+        }).eq("id", project_id).execute()
+
+
+# ---------------------------------------------------------------------------
 # P1-11: Render Story Task
 # ---------------------------------------------------------------------------
 
