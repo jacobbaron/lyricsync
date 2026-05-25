@@ -78,6 +78,7 @@ interface Props {
 export function TranscriptViewer({ projectId }: Props) {
   const [utterances, setUtterances] = useState<Utterance[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // copied key: `${utteranceIndex}:start` or `${utteranceIndex}:end`
   const [copied, setCopied] = useState<string | null>(null);
 
   useEffect(() => {
@@ -90,10 +91,10 @@ export function TranscriptViewer({ projectId }: Props) {
       .catch((err) => setError(err.message));
   }, [projectId]);
 
-  const copyTs = useCallback((ts: string) => {
-    navigator.clipboard.writeText(ts).then(() => {
-      setCopied(ts);
-      setTimeout(() => setCopied((c) => (c === ts ? null : c)), 1500);
+  const copyTs = useCallback((value: string, key: string) => {
+    navigator.clipboard.writeText(value).then(() => {
+      setCopied(key);
+      setTimeout(() => setCopied((c) => (c === key ? null : c)), 1500);
     });
   }, []);
 
@@ -134,25 +135,37 @@ export function TranscriptViewer({ projectId }: Props) {
       </h2>
       <ul className="flex flex-col gap-2">
         {utterances.map((u, i) => {
-          const ts = fmtTs(u.global_start);
-          const isCopied = copied === ts + u.source;
+          const startTs = fmtTs(u.global_start);
+          const endTs = fmtTs(u.global_end);
+          const startKey = `${i}:start`;
+          const endKey = `${i}:end`;
           return (
             <li
               key={i}
               className="rounded-xl border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
             >
-              {/* Source + timestamp row */}
+              {/* Source + start – end timestamp row */}
               <div className="flex items-center justify-between gap-2 mb-1">
                 <span className="text-xs font-medium text-zinc-400 dark:text-zinc-500 truncate">
                   {shortName(u.source)}
                 </span>
-                <button
-                  onClick={() => copyTs(ts + u.source)}
-                  title="Copy timestamp"
-                  className="shrink-0 text-xs font-mono text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
-                >
-                  {isCopied ? "✓ copied" : ts}
-                </button>
+                <span className="shrink-0 flex items-center gap-1 font-mono text-xs text-zinc-400 dark:text-zinc-500">
+                  <button
+                    onClick={() => copyTs(startTs, startKey)}
+                    title="Copy start time"
+                    className="hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+                  >
+                    {copied === startKey ? "✓" : startTs}
+                  </button>
+                  <span className="text-zinc-300 dark:text-zinc-600">–</span>
+                  <button
+                    onClick={() => copyTs(endTs, endKey)}
+                    title="Copy end time"
+                    className="hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+                  >
+                    {copied === endKey ? "✓" : endTs}
+                  </button>
+                </span>
               </div>
               {/* Utterance text */}
               <p className="text-sm leading-snug text-zinc-800 dark:text-zinc-200">
