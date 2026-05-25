@@ -78,6 +78,7 @@ interface Props {
 export function TranscriptViewer({ projectId }: Props) {
   const [utterances, setUtterances] = useState<Utterance[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
   // copied key: `${utteranceIndex}:start` or `${utteranceIndex}:end`
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -130,10 +131,22 @@ export function TranscriptViewer({ projectId }: Props) {
 
   return (
     <section>
-      <h2 className="text-xs font-medium uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-3">
-        Transcript
-      </h2>
-      <ul className="flex flex-col gap-2">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1.5 mb-3 group"
+      >
+        <h2 className="text-xs font-medium uppercase tracking-wide text-zinc-400 dark:text-zinc-500 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors">
+          Transcript
+        </h2>
+        <span className="text-xs text-zinc-400 dark:text-zinc-500 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors">
+          · {utterances.length}
+        </span>
+        <span className="ml-auto text-zinc-400 dark:text-zinc-500 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors text-xs">
+          {open ? "▾" : "▸"}
+        </span>
+      </button>
+      {open && <ul className="flex flex-col gap-2">
         {utterances.map((u, i) => {
           const startTs = fmtTs(u.global_start);
           const endTs = fmtTs(u.global_end);
@@ -174,7 +187,7 @@ export function TranscriptViewer({ projectId }: Props) {
             </li>
           );
         })}
-      </ul>
+      </ul>}
     </section>
   );
 }
