@@ -57,6 +57,10 @@ export function StoryViewer({ storyId, initialStory }: Props) {
   const [retrying, setRetrying] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
+  // Pre-fetched blob for Web Share API — must be ready before the tap so
+  // navigator.share() can be called synchronously within the user gesture.
+  const [videoBlob, setVideoBlob] = useState<Blob | null>(null);
+  const [blobLoading, setBlobLoading] = useState(false);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // True once we know the browser supports file sharing (checked client-side)
@@ -98,6 +102,21 @@ export function StoryViewer({ storyId, initialStory }: Props) {
       .catch((err: Error) => setUrlError(err.message));
   }, [story.status, storyId]);
 
+  // Pre-fetch the video blob for Web Share API as soon as the story is done.
+  // navigator.share() requires transient user activation — any async work
+  // inside the click handler (e.g. a fetch) expires the gesture before share()
+  // is reached, causing "not allowed" errors. Keeping the blob ready in state
+  // means the tap handler calls share() synchronously with no I/O in between.
+  useEffect(() => {
+    if (story.status !== "done" || !canShare) return;
+    setBlobLoading(true);
+    fetch(`/api/stories/${storyId}/video`)
+      .then((r) => (r.ok ? r.blob() : Promise.reject(new Error("fetch failed"))))
+      .then((blob) => setVideoBlob(blob))
+      .catch(() => { /* silently fail — share button stays hidden */ })
+      .finally(() => setBlobLoading(false));
+  }, [story.status, storyId, canShare]);
+
   // Retry — resets story to rendering and restarts the poll
   async function handleRetry() {
     setRetrying(true);
@@ -117,18 +136,15 @@ export function StoryViewer({ storyId, initialStory }: Props) {
   // iOS Safari: pass ONLY `files` (no title/text/url) — otherwise file
   // sharing silently fails. The Share Sheet will include "Save to Photos".
   //
-  // We fetch through our own API proxy (/api/stories/[id]/video) rather than
-  // the R2 presigned URL directly — R2 doesn't include CORS headers so a
-  // direct fetch() fails with "Load Failed" even though <video src> works fine.
+  // The blob is pre-fetched eagerly (see effect above) so this handler can
+  // call navigator.share() synchronously within the user gesture — any async
+  // work here would expire transient activation before share() is reached.
   const handleSaveToPhotos = useCallback(async () => {
-    if (!urls) return;
+    if (!videoBlob) return;
     setSharing(true);
     setShareError(null);
     try {
-      const res = await fetch(`/api/stories/${storyId}/video`);
-      if (!res.ok) throw new Error("Could not fetch video");
-      const blob = await res.blob();
-      const file = new File([blob], "output.mp4", { type: "video/mp4" });
+      const file = new File([videoBlob], "output.mp4", { type: "video/mp4" });
 
       if (!navigator.canShare({ files: [file] })) {
         throw new Error("Your browser doesn't support sharing video files");
@@ -144,7 +160,7 @@ export function StoryViewer({ storyId, initialStory }: Props) {
     } finally {
       setSharing(false);
     }
-  }, [urls]);
+  }, [videoBlob]);
 
   // ── render ───────────────────────────────────────────────────────────────
 
@@ -177,11 +193,11 @@ export function StoryViewer({ storyId, initialStory }: Props) {
             {canShare && (
               <button
                 onClick={handleSaveToPhotos}
-                disabled={sharing}
+                disabled={sharing || blobLoading || !videoBlob}
                 className="flex items-center justify-center gap-2 w-full rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-3 text-sm font-semibold text-white transition-colors"
               >
                 <ShareIcon />
-                {sharing ? "Downloading…" : "Save to Photos"}
+                {blobLoading ? "Preparing…" : sharing ? "Opening…" : "Save to Photos"}
               </button>
             )}
 
