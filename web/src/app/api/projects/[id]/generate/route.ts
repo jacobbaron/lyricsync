@@ -52,6 +52,15 @@ export async function POST(
     );
   }
 
+  // Clean up orphaned placeholder stories from the previous failed round
+  if (project.status === "error") {
+    await supabase
+      .from("stories")
+      .delete()
+      .eq("project_id", projectId)
+      .eq("status", "generating");
+  }
+
   // Determine round number (count existing rounds + 1)
   const { count } = await supabase
     .from("generation_rounds")

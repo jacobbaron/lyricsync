@@ -138,7 +138,7 @@ function bannerText(
     case "done":
       return { text: "Done", color: "text-green-600 dark:text-green-400" };
     case "error":
-      return { text: "An error occurred", color: "text-red-500" };
+      return { text: "Story generation failed — try again below", color: "text-red-500" };
     default:
       return null;
   }
@@ -295,7 +295,8 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
         project.status === "generating_stories" ||
         project.status === "stories_ready" ||
         project.status === "rendering" ||
-        project.status === "done"
+        project.status === "done" ||
+        project.status === "error"
       ) && (
         <TranscriptViewer projectId={project.id} />
       )}
@@ -311,12 +312,14 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
 
       {/* Story browser — once stories exist, always show. This includes
           rendering/done so users can navigate back to in-flight or completed
-          stories from the project page. */}
+          stories from the project page. Also shown on error so the user can
+          see any previously completed stories and retry generation. */}
       {(
         project.status === "generating_stories" ||
         project.status === "stories_ready" ||
         project.status === "rendering" ||
-        project.status === "done"
+        project.status === "done" ||
+        project.status === "error"
       ) && (
         <StoryBrowser
           projectId={project.id}
