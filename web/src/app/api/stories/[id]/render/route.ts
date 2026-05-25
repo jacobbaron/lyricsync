@@ -77,12 +77,13 @@ export async function POST(
 
   await supabase.from("stories").update(storyUpdate).eq("id", storyId);
 
-  // Also reset the project status if needed
+  // Reset project status to rendering only if it's in a P1-style terminal state.
+  // In P2 (stories_ready), leave the project status alone so StoryBrowser stays visible.
   await supabase
     .from("projects")
     .update({ status: "rendering" })
     .eq("id", story.project_id)
-    .in("status", ["transcribed", "stories_ready", "done", "error"]);
+    .in("status", ["transcribed", "done", "error"]);
 
   // Fire Modal render endpoint (fire-and-forget)
   const renderUrl = process.env.MODAL_RENDER_URL;

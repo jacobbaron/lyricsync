@@ -295,21 +295,34 @@ export function StoryCard({ story, clips, index }: Props) {
           );
         })}
 
-        <button onClick={addRange}
-          className="w-full rounded-lg border border-dashed border-zinc-200 dark:border-zinc-700 py-1.5 text-xs text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors">
-          + Add range
-        </button>
       </div>
 
       {submitError && <p className="text-xs text-red-500">{submitError}</p>}
 
-      <button
-        onClick={handleRender}
-        disabled={submitting || !allFilled || hasErrors}
-        className="w-full rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2.5 text-sm font-semibold text-white transition-colors"
-      >
-        {submitting ? "Starting render…" : "Render this cut"}
-      </button>
+      {/* Render / navigation button depending on story state */}
+      {story.status === "rendering" ? (
+        <a
+          href={`/stories/${story.id}`}
+          className="w-full rounded-xl bg-zinc-500 px-4 py-2.5 text-sm font-semibold text-white text-center block transition-colors"
+        >
+          Rendering… tap to check progress
+        </a>
+      ) : story.status === "done" ? (
+        <a
+          href={`/stories/${story.id}`}
+          className="w-full rounded-xl bg-green-600 hover:bg-green-700 px-4 py-2.5 text-sm font-semibold text-white text-center block transition-colors"
+        >
+          View result →
+        </a>
+      ) : (
+        <button
+          onClick={handleRender}
+          disabled={submitting || !allFilled || hasErrors}
+          className="w-full rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2.5 text-sm font-semibold text-white transition-colors"
+        >
+          {submitting ? "Starting render…" : "Render this cut"}
+        </button>
+      )}
     </div>
   );
 }
