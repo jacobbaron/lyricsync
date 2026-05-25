@@ -86,6 +86,21 @@ export async function presignDownload(
   return getSignedUrl(getClient(), cmd, { expiresIn });
 }
 
+/** Upload a JSON-serialisable value to R2. */
+export async function putObjectJson(key: string, data: unknown): Promise<void> {
+  const bucket = process.env.R2_BUCKET_NAME;
+  if (!bucket) {
+    throw new Error("R2 client misconfigured: R2_BUCKET_NAME not set.");
+  }
+  const cmd = new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: JSON.stringify(data),
+    ContentType: "application/json",
+  });
+  await getClient().send(cmd);
+}
+
 /** Fetch an object from R2 and return its body as a string. */
 export async function getObjectText(key: string): Promise<string> {
   const bucket = process.env.R2_BUCKET_NAME;
