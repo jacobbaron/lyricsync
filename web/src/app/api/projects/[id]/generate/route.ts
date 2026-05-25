@@ -44,6 +44,33 @@ export async function POST(
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
 
+  // If stuck in generating_stories, check whether the latest round is stale
+  // (>20 min old means the Modal worker was killed without updating the DB).
+  if (project.status === "generating_stories") {
+    const { data: latestRound } = await supabase
+      .from("generation_rounds")
+      .select("created_at")
+      .eq("project_id", projectId)
+      .order("round", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const stale =
+      latestRound &&
+      Date.now() - new Date(latestRound.created_at).getTime() > 20 * 60 * 1000;
+    if (!stale) {
+      return NextResponse.json(
+        { error: `Cannot generate stories from status '${project.status}'` },
+        { status: 409 },
+      );
+    }
+    // Stale worker — treat as error so cleanup and retry proceed below
+    await supabase
+      .from("projects")
+      .update({ status: "error", error_message: "Generation timed out — worker was killed. Please try again." })
+      .eq("id", projectId);
+    project.status = "error";
+  }
+
   const allowedStatuses = ["transcribed", "stories_ready", "error"];
   if (!allowedStatuses.includes(project.status)) {
     return NextResponse.json(
