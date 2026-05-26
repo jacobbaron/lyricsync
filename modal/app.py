@@ -645,8 +645,9 @@ def _build_messages(
     )
     messages.append({"role": "user", "content": first_content})
 
-    # Alternate assistant/user turns for each previous round
-    for rnd in prev_rounds:
+    # Alternate assistant/user turns for each previous round.
+    # Messages must always end with a user turn; we ensure that explicitly.
+    for i, rnd in enumerate(prev_rounds):
         # Load that round's stories to reconstruct the assistant's reply
         result = sb.table("stories").select(
             "title, description, estimated_duration_secs, ranges_json"
@@ -670,25 +671,17 @@ def _build_messages(
                 ),
             })
 
-        # The next user turn is the following round's prompt (if any) —
-        # but only append if there's a subsequent round after this one.
-        # The current round's prompt is added below.
-        next_prompt = current_round["prompt"] if rnd is prev_rounds[-1] else None
-        if next_prompt or rnd is not prev_rounds[-1]:
-            # Find next round's prompt from the list
-            idx = prev_rounds.index(rnd)
-            if idx + 1 < len(prev_rounds):
-                followup_prompt = prev_rounds[idx + 1]["prompt"] or "Generate 3 new options."
-            else:
-                followup_prompt = current_round["prompt"] or "Generate 3 new options."
-            messages.append({
-                "role": "user",
-                "content": f"{followup_prompt}\n\nPropose 3 new story options.",
-            })
+        # Always follow each assistant turn with a user turn.
+        is_last = i == len(prev_rounds) - 1
+        if is_last:
+            followup = current_round["prompt"] or "Generate 3 new story options."
+        else:
+            followup = prev_rounds[i + 1]["prompt"] or "Generate 3 new story options."
+        messages.append({
+            "role": "user",
+            "content": f"{followup}\n\nPropose 3 new story options.",
+        })
 
-    # If there were no previous rounds, the first message already covers round 1.
-    # If there were previous rounds, the loop above added the current prompt as
-    # the last user turn. Either way we're done.
     return messages
 
 
@@ -826,10 +819,13 @@ def _generate_worker(project_id: str, round_id: str) -> None:
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         print(f"[generate] error for project {project_id}: {msg}")
-        sb.table("projects").update({
-            "status": "error",
-            "error_message": msg[:500],
-        }).eq("id", project_id).execute()
+        try:
+            sb.table("projects").update({
+                "status": "error",
+                "error_message": msg[:500],
+            }).eq("id", project_id).execute()
+        except Exception as db_exc:
+            print(f"[generate] ALSO failed to write error to DB: {db_exc}")
 
 
 # ---------------------------------------------------------------------------
