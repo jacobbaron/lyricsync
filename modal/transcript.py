@@ -158,6 +158,7 @@ def resolve_segments(
             "start": round(m["start"], 2),
             "end": round(m["end"], 2),
             "text": m["text"],
+            "quote": quote,
         })
     return ranges
 

@@ -795,7 +795,13 @@ def _generate_worker(project_id: str, round_id: str) -> None:
 
         resolved: list[dict] = []
         for story_data in stories:
+            print(f"[generate] story '{story_data['title']}' — segments Claude chose:")
+            for seg in story_data.get("segments", []):
+                print(f"  [{seg.get('source')}] quote: {seg.get('quote', '')[:120]!r}")
             ranges = resolve_segments(story_data["segments"], index_by_source)
+            print(f"[generate]   resolved ranges:")
+            for r in ranges:
+                print(f"    [{r['source']}] {r['start']:.2f}s–{r['end']:.2f}s  text: {r['text'][:120]!r}")
             duration = sum(r["end"] - r["start"] for r in ranges)
             resolved.append({
                 "title": story_data["title"],
@@ -889,13 +895,14 @@ def _render_worker(story_id: str) -> None:
     # 1. Fetch story
     row = sb.table("stories").select(
         "id, project_id, ranges_json, status"
-    ).eq("id", story_id).maybe_single().execute()
+    ).eq("id", story_id).limit(1).execute()
+    rows = row.data or []
 
-    if not row.data:
+    if not rows:
         print(f"[render] story {story_id} not found — skipping")
         return
 
-    story = row.data
+    story = rows[0]
     project_id: str = story["project_id"]
     ranges: list[dict] = story["ranges_json"] or []
 
