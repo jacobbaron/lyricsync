@@ -59,6 +59,8 @@ image = (
         "boto3>=1.34",
         "supabase>=2.10",
     )
+    # Modal 1.x no longer automounts sibling modules — add transcript.py explicitly.
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
 )
 
 secrets = [modal.Secret.from_name("lyricsync-secrets")]
@@ -244,6 +246,7 @@ align_image = (
         "boto3>=1.34",
         "supabase>=2.10",
     )
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
 )
 
 
@@ -532,6 +535,7 @@ gen_image = (
         "supabase>=2.10",
         "anthropic>=0.34",
     )
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
 )
 
 # Tool definition passed to Claude — forces structured JSON output.
@@ -646,13 +650,14 @@ def _build_messages(
     messages.append({"role": "user", "content": first_content})
 
     # Alternate assistant/user turns for each previous round.
-    # Messages must always end with a user turn; we ensure that explicitly.
-    for i, rnd in enumerate(prev_rounds):
-        # Load that round's stories to reconstruct the assistant's reply
+    # Skip rounds with no completed stories (aborted/failed rounds) to avoid
+    # consecutive user messages, which the Claude API rejects.
+    completed_rounds = []
+    for rnd in prev_rounds:
         result = sb.table("stories").select(
             "title, description, estimated_duration_secs, ranges_json"
         ).eq("generation_round_id", rnd["id"]).order("created_at").execute()
-        round_stories = [
+        stories = [
             {
                 "title": s["title"],
                 "description": s["description"],
@@ -660,23 +665,22 @@ def _build_messages(
                 "ranges": s["ranges_json"],
             }
             for s in (result.data or [])
-            if s["title"]  # skip placeholder rows that never got filled
+            if s["title"]
         ]
-        if round_stories:
-            messages.append({
-                "role": "assistant",
-                "content": (
-                    "Here are my suggestions:\n\n"
-                    + stories_as_text(round_stories)
-                ),
-            })
+        if stories:
+            completed_rounds.append((rnd, stories))
 
-        # Always follow each assistant turn with a user turn.
-        is_last = i == len(prev_rounds) - 1
+    for i, (rnd, stories) in enumerate(completed_rounds):
+        messages.append({
+            "role": "assistant",
+            "content": "Here are my suggestions:\n\n" + stories_as_text(stories),
+        })
+        is_last = i == len(completed_rounds) - 1
         if is_last:
             followup = current_round["prompt"] or "Generate 3 new story options."
         else:
-            followup = prev_rounds[i + 1]["prompt"] or "Generate 3 new story options."
+            next_rnd = completed_rounds[i + 1][0]
+            followup = next_rnd["prompt"] or "Generate 3 new story options."
         messages.append({
             "role": "user",
             "content": f"{followup}\n\nPropose 3 new story options.",

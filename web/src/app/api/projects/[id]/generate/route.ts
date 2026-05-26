@@ -79,13 +79,29 @@ export async function POST(
     );
   }
 
-  // Clean up orphaned placeholder stories from the previous failed round
+  // Clean up orphaned placeholder stories and their generation_round rows
+  // from the previous failed round so they don't corrupt conversation history.
   if (project.status === "error") {
     await supabase
       .from("stories")
       .delete()
       .eq("project_id", projectId)
       .eq("status", "generating");
+    // Delete generation_round rows that now have no stories
+    const { data: allRounds } = await supabase
+      .from("generation_rounds")
+      .select("id")
+      .eq("project_id", projectId);
+    const { data: roundsWithStories } = await supabase
+      .from("stories")
+      .select("generation_round_id")
+      .eq("project_id", projectId)
+      .not("generation_round_id", "is", null);
+    const withStories = new Set((roundsWithStories ?? []).map((s) => s.generation_round_id));
+    const orphanIds = (allRounds ?? []).map((r) => r.id).filter((id) => !withStories.has(id));
+    if (orphanIds.length > 0) {
+      await supabase.from("generation_rounds").delete().in("id", orphanIds);
+    }
   }
 
   // Determine round number (count existing rounds + 1)
