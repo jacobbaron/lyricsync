@@ -738,12 +738,13 @@ def _generate_worker(project_id: str, round_id: str) -> None:
         transcript_text = format_transcript(words)
 
         # 2. Load current round
-        round_row = sb.table("generation_rounds").select(
+        round_result = sb.table("generation_rounds").select(
             "id, round, prompt"
-        ).eq("id", round_id).maybe_single().execute()
-        if not round_row.data:
+        ).eq("id", round_id).limit(1).execute()
+        rows = round_result.data or []
+        if not rows:
             raise ValueError(f"generation round {round_id} not found")
-        current_round = round_row.data
+        current_round = rows[0]
         current_round_num: int = current_round["round"]
 
         # 3. Load all *previous* rounds in order (rounds before current)

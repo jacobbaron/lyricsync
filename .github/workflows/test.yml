@@ -27,10 +27,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # transcript.py is stdlib-only; the quote-matching logic needs no heavy
-      # deps. (The whisperx-backed tests under lyricsync are not run here.)
       - name: Install pytest
         run: pip install pytest
 
-      - name: Run transcript / quote-matching tests
-        run: pytest tests/test_transcript_match.py -v
+      - name: Run unit tests
+        run: pytest tests/test_transcript_match.py tests/test_generate_worker.py -v
