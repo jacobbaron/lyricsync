@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { resolveAuth } from "@/lib/auth/resolve";
 
 export const runtime = "nodejs";
 
@@ -25,13 +25,11 @@ export async function POST(
 ) {
   const { id: storyId } = await context.params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const { supabase } = auth;
 
   // Parse optional ranges from body
   let newRanges: Range[] | undefined;

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { resolveAuth } from "@/lib/auth/resolve";
 
 export const runtime = "nodejs";
 
@@ -10,18 +10,16 @@ export const runtime = "nodejs";
 // Response: { rounds: [{ id, round, prompt, created_at, stories: [...] }] }
 
 export async function GET(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   const { id: projectId } = await context.params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const { supabase } = auth;
 
   const { data: project } = await supabase
     .from("projects")
@@ -100,13 +98,11 @@ export async function POST(
 ) {
   const { id: projectId } = await context.params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const { supabase } = auth;
 
   // Parse body
   let ranges: Range[];

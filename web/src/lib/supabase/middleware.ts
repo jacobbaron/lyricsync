@@ -8,6 +8,14 @@ export async function updateSession(request: NextRequest) {
   const path = request.nextUrl.pathname;
   const isAuthRoute = path === "/login" || path.startsWith("/auth");
 
+  // API routes authenticate themselves (cookie session OR API key) via
+  // resolveAuth in each handler. A bearer-token request carries no session
+  // cookie, so middleware must not gate /api — otherwise it would redirect to
+  // /login before the handler runs.
+  if (path.startsWith("/api/")) {
+    return NextResponse.next({ request });
+  }
+
   // Fail open if env vars aren't configured yet (fresh deploy without secrets).
   if (!supabaseUrl || !supabaseAnonKey) {
     return NextResponse.next({ request });

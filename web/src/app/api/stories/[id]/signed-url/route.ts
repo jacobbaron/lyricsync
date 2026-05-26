@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { resolveAuth } from "@/lib/auth/resolve";
 import { presignDownload } from "@/lib/r2/client";
 
 export const runtime = "nodejs";
@@ -13,18 +13,16 @@ export const runtime = "nodejs";
 const TTL = 3600; // 1 hour
 
 export async function GET(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   const { id: storyId } = await context.params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const { supabase } = auth;
 
   const { data: story } = await supabase
     .from("stories")
