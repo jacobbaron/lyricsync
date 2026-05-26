@@ -59,6 +59,8 @@ image = (
         "boto3>=1.34",
         "supabase>=2.10",
     )
+    # Modal 1.x no longer automounts sibling modules — add transcript.py explicitly.
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
 )
 
 secrets = [modal.Secret.from_name("lyricsync-secrets")]
@@ -244,6 +246,7 @@ align_image = (
         "boto3>=1.34",
         "supabase>=2.10",
     )
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
 )
 
 
@@ -532,6 +535,7 @@ gen_image = (
         "supabase>=2.10",
         "anthropic>=0.34",
     )
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
 )
 
 # Tool definition passed to Claude — forces structured JSON output.
