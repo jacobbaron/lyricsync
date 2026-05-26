@@ -705,7 +705,7 @@ async def generate_stories(request: Request) -> JSONResponse:
     return JSONResponse({"status": "accepted"})
 
 
-@app.function(image=gen_image, secrets=secrets, timeout=900)
+@app.function(image=gen_image, secrets=secrets, timeout=300)
 def _generate_worker(project_id: str, round_id: str) -> None:
     """Story generation worker (P2-02).
 
