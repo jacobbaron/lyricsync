@@ -30,6 +30,7 @@ interface MergedWord {
   local_end: number;
   source: string;         // clip filename — matches ranges_json source field
   source_path: string;    // R2 key of the original video
+  recorded_at: string | null; // ISO instant the source clip started recording
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -93,15 +94,20 @@ export async function POST(
   // Fetch all clips that have a transcript
   const { data: clips, error: clipsError } = await supabase
     .from("clips")
-    .select("id, filename, r2_key, transcript_r2_key, status")
+    .select("id, filename, r2_key, transcript_r2_key, status, recorded_at, created_at")
     .eq("project_id", projectId);
 
   if (clipsError) {
     return NextResponse.json({ error: clipsError.message }, { status: 500 });
   }
 
+  // Include both freshly transcribed clips and already-aligned ones. Re-merging
+  // over the full set (not just new clips) lets the user add videos to a project
+  // whose transcription already finished and rebuild the whole transcript.
   const transcribedClips = (clips ?? []).filter(
-    (c) => c.transcript_r2_key && c.status === "transcribed_raw",
+    (c) =>
+      c.transcript_r2_key &&
+      (c.status === "transcribed_raw" || c.status === "aligned"),
   );
 
   if (transcribedClips.length === 0) {
@@ -126,6 +132,9 @@ export async function POST(
 
     const allWords: MergedWord[] = [];
     for (const { clip, words } of wordLists) {
+      // Wall-clock anchor for the clip: real recording time when known,
+      // otherwise the upload time so the UI can always show a date/time.
+      const recordedAt = clip.recorded_at ?? clip.created_at ?? null;
       for (const w of words) {
         allWords.push({
           text: w.word,
@@ -135,6 +144,7 @@ export async function POST(
           local_end: w.end,
           source: clip.filename ?? "",
           source_path: clip.r2_key ?? "",
+          recorded_at: recordedAt,
         });
       }
     }

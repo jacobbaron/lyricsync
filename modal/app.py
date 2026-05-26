@@ -29,6 +29,7 @@ import json
 import os
 import subprocess
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import modal
@@ -160,6 +161,10 @@ def _transcribe_worker(clip_id: str) -> None:
             print(f"[transcribe] downloading {r2_key}")
             r2.download_file(bucket, r2_key, str(video_path))
 
+            # 1b. Read recording timestamp from metadata for wall-clock display.
+            recorded_at = _parse_creation_time(_get_creation_time(video_path))
+            print(f"[transcribe] recorded_at={recorded_at!r}")
+
             # 2. Extract audio — 16 kHz mono MP3 (matches transcribe.py)
             audio_path = tmp / "audio.mp3"
             subprocess.run(
@@ -218,6 +223,8 @@ def _transcribe_worker(clip_id: str) -> None:
             }
             if duration is not None:
                 update["duration_secs"] = float(duration)
+            if recorded_at is not None:
+                update["recorded_at"] = recorded_at
             _set_clip(sb, clip_id, **update)
 
     except Exception as exc:  # noqa: BLE001
@@ -278,6 +285,22 @@ def _get_creation_time(video_path: Path) -> str | None:
         tags.get("com.apple.quicktime.creationdate")
         or tags.get("creation_time")
     )
+
+
+def _parse_creation_time(raw: str | None) -> str | None:
+    """Normalize a metadata creation timestamp to an ISO-8601 instant string
+    Postgres timestamptz accepts, or None if it can't be parsed.
+
+    Apple's creationdate carries a numeric offset like '-0700'; the generic
+    creation_time tag is usually UTC ('...Z'). datetime.fromisoformat in 3.11
+    handles both once 'Z' is rewritten to '+00:00'.
+    """
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat()
+    except ValueError:
+        return None
 
 
 def _words_from(data: dict) -> list[dict]:
