@@ -53,11 +53,19 @@ export default async function Home() {
       <header className="flex items-center justify-between px-4 py-4 border-b border-zinc-200 dark:border-zinc-800">
         <h1 className="text-lg font-semibold tracking-tight">lyricsync</h1>
         {user && (
-          <form action="/auth/signout" method="post">
-            <button type="submit" className="text-xs text-zinc-500 dark:text-zinc-400">
-              Sign out
-            </button>
-          </form>
+          <div className="flex items-center gap-3">
+            <Link
+              href="/settings/keys"
+              className="text-xs text-zinc-500 dark:text-zinc-400 hover:underline"
+            >
+              API keys
+            </Link>
+            <form action="/auth/signout" method="post">
+              <button type="submit" className="text-xs text-zinc-500 dark:text-zinc-400">
+                Sign out
+              </button>
+            </form>
+          </div>
         )}
       </header>
 
