@@ -280,21 +280,21 @@ export function StoryCard({ story, clips, index }: Props) {
               )}
               {/* Transcript: show what Claude asked for and what was matched */}
               {(range.quote || range.text) && (
-                <div className=”flex flex-col gap-1 border-l-2 border-zinc-200 dark:border-zinc-700 pl-2”>
+                <div className="flex flex-col gap-1 border-l-2 border-zinc-200 dark:border-zinc-700 pl-2">
                   {range.quote && (
                     <div>
-                      <p className=”text-xs font-medium text-zinc-400 dark:text-zinc-500”>Claude chose:</p>
-                      <p className=”text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400”>”{range.quote}”</p>
+                      <p className="text-xs font-medium text-zinc-400 dark:text-zinc-500">Claude chose:</p>
+                      <p className="text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400">&ldquo;{range.quote}&rdquo;</p>
                     </div>
                   )}
                   {range.text && range.text !== range.quote && (
                     <div>
-                      <p className=”text-xs font-medium text-zinc-400 dark:text-zinc-500”>Matched to:</p>
-                      <p className=”text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400”>”{range.text}”</p>
+                      <p className="text-xs font-medium text-zinc-400 dark:text-zinc-500">Matched to:</p>
+                      <p className="text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400">&ldquo;{range.text}&rdquo;</p>
                     </div>
                   )}
                   {range.text && !range.quote && (
-                    <p className=”text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400”>”{range.text}”</p>
+                    <p className="text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400">&ldquo;{range.text}&rdquo;</p>
                   )}
                 </div>
               )}
