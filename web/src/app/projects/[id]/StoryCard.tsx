@@ -10,7 +10,8 @@ interface RangeInput {
   source: string;
   start: string; // mm:ss or decimal string — raw input value
   end: string;
-  text?: string | null; // verbatim transcript excerpt for this cut
+  text?: string | null; // resolved transcript text for this cut
+  quote?: string | null; // original verbatim quote Claude proposed
 }
 
 interface RangeData {
@@ -18,6 +19,7 @@ interface RangeData {
   start: number;
   end: number;
   text?: string | null;
+  quote?: string | null;
 }
 
 export interface StoryData {
@@ -58,7 +60,7 @@ function fmtDuration(secs: number): string {
 }
 
 function rangeToInput(r: RangeData): RangeInput {
-  return { source: r.source, start: secsToInput(r.start), end: secsToInput(r.end), text: r.text };
+  return { source: r.source, start: secsToInput(r.start), end: secsToInput(r.end), text: r.text, quote: r.quote };
 }
 
 // ── sub-component ─────────────────────────────────────────────────────────
@@ -276,11 +278,25 @@ export function StoryCard({ story, clips, index }: Props) {
                   max {durLabel}
                 </p>
               )}
-              {/* Verbatim transcript excerpt this cut captures */}
-              {range.text && (
-                <p className="text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400 border-l-2 border-zinc-200 dark:border-zinc-700 pl-2">
-                  “{range.text}”
-                </p>
+              {/* Transcript: show what Claude asked for and what was matched */}
+              {(range.quote || range.text) && (
+                <div className=”flex flex-col gap-1 border-l-2 border-zinc-200 dark:border-zinc-700 pl-2”>
+                  {range.quote && (
+                    <div>
+                      <p className=”text-xs font-medium text-zinc-400 dark:text-zinc-500”>Claude chose:</p>
+                      <p className=”text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400”>”{range.quote}”</p>
+                    </div>
+                  )}
+                  {range.text && range.text !== range.quote && (
+                    <div>
+                      <p className=”text-xs font-medium text-zinc-400 dark:text-zinc-500”>Matched to:</p>
+                      <p className=”text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400”>”{range.text}”</p>
+                    </div>
+                  )}
+                  {range.text && !range.quote && (
+                    <p className=”text-xs italic leading-relaxed text-zinc-500 dark:text-zinc-400”>”{range.text}”</p>
+                  )}
+                </div>
               )}
               {/* Start / End */}
               <div className="grid grid-cols-2 gap-2">
