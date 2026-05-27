@@ -53,7 +53,9 @@ create table clips (
   global_start      double precision,
   transcript_r2_key text,
   status            text not null default 'uploading',
-  error_message     text
+  error_message     text,
+  recorded_at       timestamptz,                       -- real recording time from video metadata (nullable)
+  created_at        timestamptz not null default now() -- upload time; timestamp fallback when recorded_at is null
 );
 
 -- GenerationRound: one round of LLM story generation for a project.

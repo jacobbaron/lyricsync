@@ -42,12 +42,15 @@ export async function POST(
     .update({ status: "transcribing" })
     .eq("id", clipId);
 
-  // Also transition project to transcribing if it's still at uploading
+  // Transition the project to transcribing from any settled state. This covers
+  // both the initial upload ('uploading') and adding clips to a project whose
+  // transcription already finished ('transcribed' and downstream states), which
+  // re-runs the merge over the full clip set once the new clip is transcribed.
   await supabase
     .from("projects")
-    .update({ status: "transcribing" })
+    .update({ status: "transcribing", error_message: null })
     .eq("id", clip.project_id)
-    .eq("status", "uploading");
+    .in("status", ["uploading", "transcribed", "stories_ready", "done", "error"]);
 
   // Invoke Modal asynchronously — fire and don't await the response body.
   // Modal's endpoint returns {"status":"accepted"} immediately and does the

@@ -70,7 +70,13 @@ function randomId() {
   return Math.random().toString(36).slice(2);
 }
 
-export function UploadArea({ projectId }: { projectId: string }) {
+export function UploadArea({
+  projectId,
+  onUploaded,
+}: {
+  projectId: string;
+  onUploaded?: () => void;
+}) {
   const [uploads, setUploads] = useState<UploadEntry[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const router = useRouter();
@@ -111,7 +117,7 @@ export function UploadArea({ projectId }: { projectId: string }) {
   );
 
   const uploadFile = useCallback(
-    async (entry: UploadEntry) => {
+    async (entry: UploadEntry): Promise<boolean> => {
       const { id, file } = entry;
 
       try {
@@ -183,12 +189,14 @@ export function UploadArea({ projectId }: { projectId: string }) {
         );
 
         updateEntry(id, { status: "done", progress: 100 });
+        return true;
       } catch (err) {
         xhrMap.current.delete(id);
         updateEntry(id, {
           status: "error",
           error: err instanceof Error ? err.message : "Upload failed",
         });
+        return false;
       }
     },
     [projectId, updateEntry],
@@ -207,12 +215,15 @@ export function UploadArea({ projectId }: { projectId: string }) {
 
       // Start all uploads in parallel; once all settle, refresh the server
       // component and drop completed entries (they graduate to the Clips list).
-      Promise.all(newEntries.map(uploadFile)).then(() => {
+      Promise.all(newEntries.map(uploadFile)).then((results) => {
         router.refresh();
         setUploads((prev) => prev.filter((u) => u.status !== "done"));
+        // If at least one upload succeeded, let the parent resume polling — the
+        // transcribe endpoint has flipped the project back to "transcribing".
+        if (results.some((ok) => ok)) onUploaded?.();
       });
     },
-    [uploadFile, router],
+    [uploadFile, router, onUploaded],
   );
 
   const anyActive = uploads.some(

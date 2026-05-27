@@ -10,6 +10,7 @@ interface Word {
   global_end: number;
   local_start: number;
   source: string;
+  recorded_at?: string | null;
 }
 
 interface Utterance {
@@ -17,6 +18,7 @@ interface Utterance {
   global_start: number;
   global_end: number;
   text: string;
+  recorded_at: string | null; // recording anchor of the source clip
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -36,6 +38,8 @@ function buildUtterances(words: Word[]): Utterance[] {
   for (const [source, ws] of Object.entries(bySource)) {
     ws.sort((a, b) => a.global_start - b.global_start);
 
+    // recorded_at is constant per source — capture it once.
+    const recordedAt = ws[0].recorded_at ?? null;
     let curStart = ws[0].global_start;
     let curEnd = ws[0].global_end;
     let curWords: string[] = [];
@@ -43,7 +47,7 @@ function buildUtterances(words: Word[]): Utterance[] {
     for (const w of ws) {
       const gap = w.global_start - curEnd;
       if (curWords.length > 0 && gap > GAP_THRESHOLD_S) {
-        utterances.push({ source, global_start: curStart, global_end: curEnd, text: curWords.join(" ") });
+        utterances.push({ source, global_start: curStart, global_end: curEnd, text: curWords.join(" "), recorded_at: recordedAt });
         curStart = w.global_start;
         curWords = [];
       }
@@ -51,7 +55,7 @@ function buildUtterances(words: Word[]): Utterance[] {
       curEnd = w.global_end;
     }
     if (curWords.length > 0) {
-      utterances.push({ source, global_start: curStart, global_end: curEnd, text: curWords.join(" ") });
+      utterances.push({ source, global_start: curStart, global_end: curEnd, text: curWords.join(" "), recorded_at: recordedAt });
     }
   }
 
@@ -62,6 +66,26 @@ function fmtTs(secs: number): string {
   const m = Math.floor(secs / 60);
   const s = Math.floor(secs % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+/**
+ * Format an offset within a clip as an absolute wall-clock date + time in the
+ * viewer's local timezone (e.g. "May 20, 2:34:07 PM"). `offsetSecs` is the
+ * word's local offset (== global offset in the no-offset merge). Falls back to
+ * the relative M:SS form when there's no recording anchor or it won't parse.
+ */
+function fmtClock(recordedAt: string | null, offsetSecs: number): string {
+  if (!recordedAt) return fmtTs(offsetSecs);
+  const base = new Date(recordedAt).getTime();
+  if (Number.isNaN(base)) return fmtTs(offsetSecs);
+  return new Date(base + offsetSecs * 1000).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
 }
 
 function shortName(filename: string): string {
@@ -148,8 +172,8 @@ export function TranscriptViewer({ projectId }: Props) {
       </button>
       {open && <ul className="flex flex-col gap-2">
         {utterances.map((u, i) => {
-          const startTs = fmtTs(u.global_start);
-          const endTs = fmtTs(u.global_end);
+          const startTs = fmtClock(u.recorded_at, u.global_start);
+          const endTs = fmtClock(u.recorded_at, u.global_end);
           const startKey = `${i}:start`;
           const endKey = `${i}:end`;
           return (

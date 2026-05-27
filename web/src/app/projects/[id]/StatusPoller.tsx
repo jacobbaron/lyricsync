@@ -53,6 +53,17 @@ const TERMINAL_STATUSES: ProjectStatus[] = [
 
 const POLL_INTERVAL_MS = 3000;
 
+// Settled statuses where it's safe to offer "add more videos". Excludes the
+// busy states (transcribing, generating_stories, rendering) where new uploads
+// would race in-flight processing.
+const ADD_VIDEOS_STATUSES: ProjectStatus[] = [
+  "uploading",
+  "transcribed",
+  "stories_ready",
+  "done",
+  "error",
+];
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 function clipLabel(status: ClipStatus): string {
@@ -166,24 +177,35 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
   const [clipsOpen, setClipsOpen] = useState(
     () => initialClips.some((c) => c.status !== "aligned" && c.status !== "error"),
   );
-  const alignTriggeredRef = useRef(false);
+  // Tracks the set of clips a merge has already been kicked off for, so polling
+  // doesn't fire duplicate POSTs while the merge is in flight. Keyed on the
+  // newly-transcribed clip ids so adding more videos later re-triggers a merge.
+  const mergeKeyRef = useRef<string | null>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const isTerminal = TERMINAL_STATUSES.includes(project.status);
 
-  // Trigger merge once when all clips reach transcribed_raw.
-  // Calls /merge (fast, Vercel-side JSON merge from raw Whisper transcripts).
-  // To re-enable WhisperX alignment instead, swap /merge → /align here.
+  // Trigger merge once the new clips are transcribed and nothing is still
+  // uploading/transcribing. Calls /merge (fast, Vercel-side JSON merge from raw
+  // Whisper transcripts), which rebuilds merged.json over every clip — including
+  // ones already aligned from a previous round. To re-enable WhisperX alignment
+  // instead, swap /merge → /align here.
   useEffect(() => {
-    if (alignTriggeredRef.current) return;
     if (project.status !== "transcribing") return;
     if (clips.length === 0) return;
 
-    const allRaw = clips.every((c) => c.status === "transcribed_raw");
-    if (!allRaw) return;
+    const newlyTranscribed = clips.filter((c) => c.status === "transcribed_raw");
+    const allSettled = clips.every(
+      (c) => c.status === "transcribed_raw" || c.status === "aligned",
+    );
+    // Need at least one fresh transcript, and no clip still in flight.
+    if (newlyTranscribed.length === 0 || !allSettled) return;
 
-    alignTriggeredRef.current = true;
-    console.log("[poll] all clips transcribed_raw → triggering merge");
+    const key = newlyTranscribed.map((c) => c.id).sort().join(",");
+    if (mergeKeyRef.current === key) return;
+
+    mergeKeyRef.current = key;
+    console.log("[poll] clips ready → triggering merge");
     fetch(`/api/projects/${projectId}/merge`, { method: "POST" }).catch(
       (err) => console.error("[poll] merge trigger failed:", err),
     );
@@ -228,6 +250,14 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
   // Optimistically advances local status so the poller resumes immediately.
   const handleGenerationStarted = useCallback(() => {
     setProject((prev) => ({ ...prev, status: "generating_stories" }));
+  }, []);
+
+  // Called by UploadArea once new uploads finish. Optimistically flips the
+  // project to "transcribing" (the transcribe endpoint does this server-side
+  // too) so polling resumes immediately — important when the project was in a
+  // terminal state like "done" or "stories_ready" and the poller had stopped.
+  const handleUploadStarted = useCallback(() => {
+    setProject((prev) => ({ ...prev, status: "transcribing" }));
   }, []);
 
   const banner = bannerText(project.status, clips, project.error_message);
@@ -341,15 +371,18 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
         />
       )}
 
-      {/* Upload area — only visible while project is still uploading */}
-      {project.status === "uploading" && (
+      {/* Upload area — visible while uploading and in any settled post-transcription
+          state, so users can add more videos to an already-transcribed project.
+          Hidden during busy states (transcribing/generating/rendering). Newly
+          uploaded clips are transcribed and the whole project re-merged. */}
+      {ADD_VIDEOS_STATUSES.includes(project.status) && (
         <section>
           {clips.length > 0 && (
             <h2 className="text-xs font-medium uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-2">
               Add More
             </h2>
           )}
-          <UploadArea projectId={projectId} />
+          <UploadArea projectId={projectId} onUploaded={handleUploadStarted} />
         </section>
       )}
     </div>
