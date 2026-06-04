@@ -154,3 +154,30 @@ create policy feedback_owner_all on feedback
   for all to authenticated
   using (exists (select 1 from stories s join projects p on p.id = s.project_id where s.id = feedback.story_id and p.owner = (auth.jwt() ->> 'email')))
   with check (exists (select 1 from stories s join projects p on p.id = s.project_id where s.id = feedback.story_id and p.owner = (auth.jwt() ->> 'email')));
+
+-- ---------------------------------------------------------------------------
+-- VIS-01: Visual analysis (development / experimentation harness)
+-- See db/migrations/20260604_add_visual_analyses.sql for rationale.
+-- One row per (clip, variant) Gemini analysis run.
+-- ---------------------------------------------------------------------------
+
+create table visual_analyses (
+  id            uuid primary key default gen_random_uuid(),
+  clip_id       uuid not null references clips(id) on delete cascade,
+  variant       text not null default 'flash',
+  status        text not null default 'analyzing',  -- analyzing | done | error
+  result        jsonb,
+  result_r2_key text,
+  debug         jsonb,
+  error         text,
+  created_at    timestamptz not null default now()
+);
+
+create index visual_analyses_clip_id_idx on visual_analyses(clip_id);
+
+alter table visual_analyses enable row level security;
+
+create policy visual_analyses_owner_all on visual_analyses
+  for all to authenticated
+  using (exists (select 1 from clips c join projects p on p.id = c.project_id where c.id = visual_analyses.clip_id and p.owner = (auth.jwt() ->> 'email')))
+  with check (exists (select 1 from clips c join projects p on p.id = c.project_id where c.id = visual_analyses.clip_id and p.owner = (auth.jwt() ->> 'email')));

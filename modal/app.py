@@ -7,6 +7,7 @@ Implements:
     P1-06  transcribe_clip          — Whisper word-level transcription
     P1-07  align_and_merge          — WhisperX alignment + global timeline merge
     P1-11  render_story             — ffmpeg multi-clip render
+    VIS-01 analyze_visuals          — Gemini timestamped visual description (dev)
 
 Secrets:
     Create a Modal secret named "lyricsync-secrets" containing:
@@ -17,11 +18,13 @@ Secrets:
         R2_BUCKET_NAME
         R2_ENDPOINT              # e.g. https://<account-id>.r2.cloudflarestorage.com
         OPENAI_API_KEY
+        ANTHROPIC_API_KEY        # Claude story generation
+        GEMINI_API_KEY           # Gemini visual analysis (VIS-01)
         MODAL_WEBHOOK_SECRET     # shared with Vercel
 
 After deploying, note the web endpoint URLs printed by Modal and set them as
-MODAL_TRANSCRIBE_URL, MODAL_ALIGN_URL, and MODAL_RENDER_URL in your Vercel
-environment variables.
+MODAL_TRANSCRIBE_URL, MODAL_ALIGN_URL, MODAL_RENDER_URL, MODAL_GENERATE_URL, and
+MODAL_ANALYZE_URL in your Vercel environment variables.
 """
 from __future__ import annotations
 
@@ -860,6 +863,282 @@ def _generate_worker(project_id: str, round_id: str) -> None:
             }).eq("id", project_id).execute()
         except Exception as db_exc:
             print(f"[generate] ALSO failed to write error to DB: {db_exc}")
+
+
+# ---------------------------------------------------------------------------
+# VIS-01: Analyze Visuals Task (development / experimentation harness)
+# ---------------------------------------------------------------------------
+#
+# Sends a clip to Gemini and asks for a timestamped description of what's on
+# screen (segments + highlight beats), so we can evaluate whether vision adds
+# useful editorial signal before wiring it into story generation.
+#
+# Built as an A/B harness: the request picks a `variant` (model + prompt
+# strategy + media resolution). Each run is stored as its own visual_analyses
+# row so variants can be compared side by side, and the full Gemini round-trip
+# (prompt, raw response, token usage, timings, file state, traceback) is kept in
+# the row's `debug` column for diagnosis via the API.
+
+analyze_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    .pip_install(
+        "fastapi[standard]>=0.115",
+        "boto3>=1.34",
+        "supabase>=2.10",
+        "google-genai>=0.3",
+    )
+    .add_local_file(Path(__file__).parent / "visual.py", "/root/visual.py")
+)
+
+# Variant registry — each is one "approach" to try. `media_resolution` is
+# applied best-effort (older SDKs ignore it). Add rows here to trial more.
+VISUAL_VARIANTS: dict[str, dict] = {
+    # The chosen default: cheap, fast, descriptions + highlight beats.
+    "flash": {
+        "model": "gemini-2.5-flash",
+        "strategy": "default",
+        "media_resolution": None,
+    },
+    # Same model/prompt at low media resolution — ~3x cheaper in tokens; use to
+    # judge how much visual detail we actually lose.
+    "flash_lowres": {
+        "model": "gemini-2.5-flash",
+        "strategy": "default",
+        "media_resolution": "MEDIA_RESOLUTION_LOW",
+    },
+    # Quality ceiling — Gemini 2.5 Pro, default resolution.
+    "pro": {
+        "model": "gemini-2.5-pro",
+        "strategy": "default",
+        "media_resolution": None,
+    },
+    # Editorial prompt — also returns ready-to-render suggested_clips.
+    "editorial": {
+        "model": "gemini-2.5-flash",
+        "strategy": "editorial",
+        "media_resolution": None,
+    },
+}
+DEFAULT_VISUAL_VARIANT = "flash"
+
+
+def _set_analysis(sb, analysis_id: str, **fields) -> None:
+    sb.table("visual_analyses").update(fields).eq("id", analysis_id).execute()
+
+
+def _probe_duration(video_path: Path) -> float | None:
+    """Return clip duration in seconds via ffprobe, or None if it can't be read."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+@app.function(image=analyze_image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def analyze_visuals(request: Request) -> JSONResponse:
+    """Vercel calls this endpoint; it authenticates, spawns the analysis worker,
+    and returns {"status": "accepted"} immediately.
+
+    Body: {"analysis_id": "<uuid>"} — the worker reads the clip + variant off
+    the pre-created visual_analyses row.
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    analysis_id = body.get("analysis_id")
+    if not analysis_id:
+        raise HTTPException(status_code=400, detail="analysis_id required")
+
+    _analyze_worker.spawn(analysis_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(image=analyze_image, secrets=secrets, timeout=600)
+def _analyze_worker(analysis_id: str) -> None:
+    """Visual analysis worker (VIS-01).
+
+    1. Load the visual_analyses row (variant) + its clip (r2_key, duration).
+    2. Download the clip from R2.
+    3. Upload it to the Gemini File API, poll until ACTIVE.
+    4. Ask the variant's model for timestamped visual JSON.
+    5. Parse + store result; persist the full round-trip in `debug`.
+    """
+    import time
+    import traceback
+
+    from visual import build_prompt, format_visual_track, parse_visual_response
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    # Diagnostic record — written back even on failure for API-side debugging.
+    debug: dict = {"steps": []}
+
+    def step(msg: str) -> None:
+        print(f"[analyze:{analysis_id}] {msg}")
+        debug["steps"].append(msg)
+
+    # 1. Load analysis row
+    row = sb.table("visual_analyses").select(
+        "id, clip_id, variant"
+    ).eq("id", analysis_id).maybe_single().execute()
+    if not row.data:
+        print(f"[analyze] analysis {analysis_id} not found — skipping")
+        return
+    analysis = row.data
+    clip_id = analysis["clip_id"]
+    variant_name = analysis["variant"] or DEFAULT_VISUAL_VARIANT
+    variant = VISUAL_VARIANTS.get(variant_name, VISUAL_VARIANTS[DEFAULT_VISUAL_VARIANT])
+    debug["variant"] = variant_name
+    debug["variant_config"] = variant
+
+    _set_analysis(sb, analysis_id, status="analyzing")
+
+    clip_row = sb.table("clips").select(
+        "id, r2_key, filename, project_id, duration_secs"
+    ).eq("id", clip_id).maybe_single().execute()
+    if not clip_row.data:
+        _set_analysis(
+            sb, analysis_id, status="error",
+            error="clip not found", debug=debug,
+        )
+        return
+    clip = clip_row.data
+    r2_key = clip["r2_key"]
+    project_id = clip["project_id"]
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            # 2. Download the clip
+            ext = Path(r2_key).suffix or ".mp4"
+            video_path = tmp / f"clip{ext}"
+            step(f"downloading {r2_key}")
+            r2.download_file(bucket, r2_key, str(video_path))
+            debug["file_size_bytes"] = video_path.stat().st_size
+
+            duration = clip.get("duration_secs") or _probe_duration(video_path)
+            debug["duration_secs"] = duration
+
+            prompt = build_prompt(duration, strategy=variant["strategy"])
+            debug["model"] = variant["model"]
+            debug["prompt"] = prompt
+
+            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+            # 3. Upload to the Gemini File API and wait until processed.
+            t0 = time.time()
+            step("uploading to Gemini File API")
+            gfile = client.files.upload(file=str(video_path))
+            while getattr(gfile.state, "name", str(gfile.state)) == "PROCESSING":
+                time.sleep(2)
+                gfile = client.files.get(name=gfile.name)
+            state = getattr(gfile.state, "name", str(gfile.state))
+            debug["gemini_file_name"] = gfile.name
+            debug["gemini_file_state"] = state
+            debug["upload_secs"] = round(time.time() - t0, 2)
+            if state != "ACTIVE":
+                raise RuntimeError(f"Gemini file processing ended in state {state}")
+
+            # 4. Generate. media_resolution is best-effort across SDK versions.
+            cfg_kwargs: dict = {"response_mime_type": "application/json", "temperature": 0.4}
+            mr = variant.get("media_resolution")
+            if mr:
+                try:
+                    cfg_kwargs["media_resolution"] = getattr(types.MediaResolution, mr)
+                except Exception as mr_exc:  # noqa: BLE001
+                    step(f"media_resolution {mr} unsupported by SDK: {mr_exc}")
+
+            t1 = time.time()
+            step(f"generate_content model={variant['model']}")
+            resp = client.models.generate_content(
+                model=variant["model"],
+                contents=[gfile, prompt],
+                config=types.GenerateContentConfig(**cfg_kwargs),
+            )
+            debug["generate_secs"] = round(time.time() - t1, 2)
+
+            raw_text = resp.text or ""
+            debug["raw_response"] = raw_text
+
+            usage = getattr(resp, "usage_metadata", None)
+            if usage is not None:
+                debug["usage"] = {
+                    "prompt_tokens": getattr(usage, "prompt_token_count", None),
+                    "candidates_tokens": getattr(usage, "candidates_token_count", None),
+                    "total_tokens": getattr(usage, "total_token_count", None),
+                }
+
+            # 5. Parse + persist
+            visual = parse_visual_response(raw_text, duration)
+            debug["counts"] = {
+                "segments": len(visual["segments"]),
+                "highlights": len(visual["highlights"]),
+                "suggested_clips": len(visual.get("suggested_clips", [])),
+            }
+            step(
+                f"parsed {debug['counts']['segments']} segments, "
+                f"{debug['counts']['highlights']} highlights"
+            )
+            print(format_visual_track(visual))
+
+            # Best-effort cleanup of the uploaded Gemini file.
+            try:
+                client.files.delete(name=gfile.name)
+            except Exception as del_exc:  # noqa: BLE001
+                step(f"file cleanup failed (non-fatal): {del_exc}")
+
+            # Persist the parsed track to R2 too, for parity with transcripts.
+            result_key = (
+                f"projects/{project_id}/clips/{clip_id}"
+                f"/visual.{variant_name}.json"
+            )
+            r2.put_object(
+                Bucket=bucket,
+                Key=result_key,
+                Body=json.dumps(visual).encode(),
+                ContentType="application/json",
+            )
+
+            _set_analysis(
+                sb, analysis_id,
+                status="done",
+                result=visual,
+                result_r2_key=result_key,
+                debug=debug,
+                error=None,
+            )
+            step("done ✓")
+
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        debug["traceback"] = traceback.format_exc()
+        print(f"[analyze] error for analysis {analysis_id}: {msg}")
+        _set_analysis(
+            sb, analysis_id, status="error", error=msg[:1000], debug=debug,
+        )
 
 
 # ---------------------------------------------------------------------------
