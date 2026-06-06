@@ -107,9 +107,10 @@ export async function POST(
           },
           body: JSON.stringify({ analysis_id: analysisId }),
         });
+        const text = await res.text().catch(() => "");
+        console.log(`[analyze] Modal responded ${res.status}: ${text}`);
         if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          console.error(`[analyze] Modal returned ${res.status}: ${text}`);
+          console.error(`[analyze] Modal error for ${analysisId}: ${text}`);
         }
       } catch (err) {
         console.error("[analyze] Modal trigger failed:", err);
