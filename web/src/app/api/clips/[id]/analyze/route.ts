@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
 
 export const runtime = "nodejs";
@@ -78,12 +78,16 @@ export async function POST(
     );
   }
 
-  // Invoke Modal — await so the serverless function doesn't exit before the
-  // fetch completes (fire-and-forget is silently killed by the Vercel runtime).
-  // Modal's endpoint returns {"status":"accepted"} immediately; the actual
-  // analysis runs in a spawned Modal container.
+  // Schedule the Modal call via after() so the 202 is returned immediately and
+  // Vercel keeps the function alive to complete the fetch after the response.
   //
-  // The analyze URL falls back to the known deployed URL so the VIS-01 harness
+  // Plain await times out on a cold-start of the analyze_image container (a
+  // separate Modal image from the main one used by transcribe/render, so it has
+  // no warm pool). after() solves both problems: the caller isn't blocked, and
+  // the fetch actually completes (unlike naked fire-and-forget which is killed
+  // the moment the response goes out).
+  //
+  // The URL falls back to the known deployed endpoint so the VIS-01 harness
   // works without an extra Vercel env var. Set MODAL_ANALYZE_URL to override.
   const analyzeUrl =
     process.env.MODAL_ANALYZE_URL ??
@@ -92,22 +96,25 @@ export async function POST(
   if (!webhookSecret) {
     console.warn("[analyze] MODAL_WEBHOOK_SECRET not set — analysis not triggered");
   } else {
-    try {
-      const res = await fetch(analyzeUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-webhook-secret": webhookSecret,
-        },
-        body: JSON.stringify({ analysis_id: analysis.id }),
-      });
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        console.error(`[analyze] Modal returned ${res.status}: ${text}`);
+    const analysisId = analysis.id;
+    after(async () => {
+      try {
+        const res = await fetch(analyzeUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-webhook-secret": webhookSecret,
+          },
+          body: JSON.stringify({ analysis_id: analysisId }),
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          console.error(`[analyze] Modal returned ${res.status}: ${text}`);
+        }
+      } catch (err) {
+        console.error("[analyze] Modal trigger failed:", err);
       }
-    } catch (err) {
-      console.error("[analyze] Modal trigger failed:", err);
-    }
+    });
   }
 
   return NextResponse.json(
