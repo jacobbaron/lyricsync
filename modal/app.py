@@ -888,6 +888,10 @@ analyze_image = (
         "supabase>=2.10",
         "google-genai>=0.3",
     )
+    # transcript.py must be present because app.py imports it at the module level;
+    # Modal's cloudpickle serialization captures those globals and the container
+    # crashes on startup if the module can't be imported.
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
     .add_local_file(Path(__file__).parent / "visual.py", "/root/visual.py")
 )
 
