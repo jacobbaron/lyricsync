@@ -1344,3 +1344,4 @@ def _render_worker(story_id: str) -> None:
             "status": "error",
             "error_message": msg[:500],
         }).eq("id", story_id).execute()
+
