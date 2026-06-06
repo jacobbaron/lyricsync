@@ -79,7 +79,13 @@ export async function POST(
   }
 
   // Fire Modal (fire-and-forget). If unconfigured, the row stays 'analyzing'.
-  const analyzeUrl = process.env.MODAL_ANALYZE_URL;
+  // The analyze endpoint URL isn't a secret (the call is gated by
+  // MODAL_WEBHOOK_SECRET), so fall back to the known deployed URL when the env
+  // var isn't set — keeps the VIS-01 dev harness working without a Vercel env
+  // change. Set MODAL_ANALYZE_URL to override (e.g. a new Modal workspace).
+  const analyzeUrl =
+    process.env.MODAL_ANALYZE_URL ??
+    "https://jacobbaron--lyricsync-analyze-visuals.modal.run";
   const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
   if (analyzeUrl && webhookSecret) {
     fetch(analyzeUrl, {
