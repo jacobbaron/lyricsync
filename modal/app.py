@@ -985,6 +985,9 @@ def _analyze_worker(analysis_id: str) -> None:
 
     from visual import build_prompt, format_visual_track, parse_visual_response
 
+    # sb is initialized before the try block so the except can write errors back.
+    # Use limit(1) instead of maybe_single() — maybe_single() throws an
+    # AttributeError in supabase-py 2.10+ (same bug fixed in the generate worker).
     sb = _supabase()
     r2 = _r2()
     bucket = os.environ["R2_BUCKET_NAME"]
@@ -996,14 +999,14 @@ def _analyze_worker(analysis_id: str) -> None:
         print(f"[analyze:{analysis_id}] {msg}")
         debug["steps"].append(msg)
 
-    # 1. Load analysis row
+    # 1. Load analysis row (limit(1) avoids the maybe_single() crash in supabase-py 2.10+)
     row = sb.table("visual_analyses").select(
         "id, clip_id, variant"
-    ).eq("id", analysis_id).maybe_single().execute()
+    ).eq("id", analysis_id).limit(1).execute()
     if not row.data:
         print(f"[analyze] analysis {analysis_id} not found — skipping")
         return
-    analysis = row.data
+    analysis = row.data[0]
     clip_id = analysis["clip_id"]
     variant_name = analysis["variant"] or DEFAULT_VISUAL_VARIANT
     variant = VISUAL_VARIANTS.get(variant_name, VISUAL_VARIANTS[DEFAULT_VISUAL_VARIANT])
@@ -1014,14 +1017,14 @@ def _analyze_worker(analysis_id: str) -> None:
 
     clip_row = sb.table("clips").select(
         "id, r2_key, filename, project_id, duration_secs"
-    ).eq("id", clip_id).maybe_single().execute()
+    ).eq("id", clip_id).limit(1).execute()
     if not clip_row.data:
         _set_analysis(
             sb, analysis_id, status="error",
             error="clip not found", debug=debug,
         )
         return
-    clip = clip_row.data
+    clip = clip_row.data[0]
     r2_key = clip["r2_key"]
     project_id = clip["project_id"]
 
