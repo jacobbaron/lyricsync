@@ -78,26 +78,36 @@ export async function POST(
     );
   }
 
-  // Fire Modal (fire-and-forget). If unconfigured, the row stays 'analyzing'.
-  // The analyze endpoint URL isn't a secret (the call is gated by
-  // MODAL_WEBHOOK_SECRET), so fall back to the known deployed URL when the env
-  // var isn't set — keeps the VIS-01 dev harness working without a Vercel env
-  // change. Set MODAL_ANALYZE_URL to override (e.g. a new Modal workspace).
+  // Invoke Modal — await so the serverless function doesn't exit before the
+  // fetch completes (fire-and-forget is silently killed by the Vercel runtime).
+  // Modal's endpoint returns {"status":"accepted"} immediately; the actual
+  // analysis runs in a spawned Modal container.
+  //
+  // The analyze URL falls back to the known deployed URL so the VIS-01 harness
+  // works without an extra Vercel env var. Set MODAL_ANALYZE_URL to override.
   const analyzeUrl =
     process.env.MODAL_ANALYZE_URL ??
     "https://jacobbaron--lyricsync-analyze-visuals.modal.run";
   const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (analyzeUrl && webhookSecret) {
-    fetch(analyzeUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": webhookSecret,
-      },
-      body: JSON.stringify({ analysis_id: analysis.id }),
-    }).catch((err) => console.error("[analyze] Modal trigger failed:", err));
+  if (!webhookSecret) {
+    console.warn("[analyze] MODAL_WEBHOOK_SECRET not set — analysis not triggered");
   } else {
-    console.warn("[analyze] MODAL_ANALYZE_URL not set — analysis not triggered");
+    try {
+      const res = await fetch(analyzeUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-webhook-secret": webhookSecret,
+        },
+        body: JSON.stringify({ analysis_id: analysis.id }),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(`[analyze] Modal returned ${res.status}: ${text}`);
+      }
+    } catch (err) {
+      console.error("[analyze] Modal trigger failed:", err);
+    }
   }
 
   return NextResponse.json(
