@@ -31,4 +31,4 @@ jobs:
         run: pip install pytest
 
       - name: Run unit tests
-        run: pytest tests/test_transcript_match.py tests/test_generate_worker.py -v
+        run: pytest tests/test_transcript_match.py tests/test_generate_worker.py tests/test_visual_parse.py -v
