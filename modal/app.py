@@ -897,38 +897,103 @@ analyze_image = (
 
 # Variant registry — each is one "approach" to try. `media_resolution` is
 # applied best-effort (older SDKs ignore it). Add rows here to trial more.
+# Each variant keys:
+#   model            — Gemini model id (gemini-3.5-flash is the current flash tier).
+#   strategy         — prompt builder strategy (see visual.build_prompt).
+#   media_resolution — None (default) | MEDIA_RESOLUTION_LOW|MEDIUM|HIGH; HIGH
+#                      gives more tokens/frame → finer facial-expression detail.
+#   fps              — frame sampling rate (Gemini defaults to 1 fps); raise to
+#                      catch fleeting expressions. None leaves the default.
+#   needs_transcript — download the clip's aligned transcript and feed it to the
+#                      prompt as ground-truth speech.
 VISUAL_VARIANTS: dict[str, dict] = {
     # The chosen default: cheap, fast, descriptions + highlight beats.
     "flash": {
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.5-flash",
         "strategy": "default",
         "media_resolution": None,
+        "fps": None,
+        "needs_transcript": False,
     },
-    # Same model/prompt at low media resolution — ~3x cheaper in tokens; use to
+    # Same model/prompt at low media resolution — cheaper in tokens; use to
     # judge how much visual detail we actually lose.
     "flash_lowres": {
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.5-flash",
         "strategy": "default",
         "media_resolution": "MEDIA_RESOLUTION_LOW",
-    },
-    # Quality ceiling — Gemini 2.5 Pro, default resolution.
-    "pro": {
-        "model": "gemini-2.5-pro",
-        "strategy": "default",
-        "media_resolution": None,
+        "fps": None,
+        "needs_transcript": False,
     },
     # Editorial prompt — also returns ready-to-render suggested_clips.
     "editorial": {
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.5-flash",
         "strategy": "editorial",
         "media_resolution": None,
+        "fps": None,
+        "needs_transcript": False,
     },
+    # Audio + visual: lean into Gemini hearing the audio. High media resolution
+    # and denser frame sampling for detailed facial-expression + vocal-tone reads.
+    "audio_aware": {
+        "model": "gemini-3.5-flash",
+        "strategy": "audio_aware",
+        "media_resolution": "MEDIA_RESOLUTION_HIGH",
+        "fps": 3,
+        "needs_transcript": False,
+    },
+    # Like audio_aware, but the aligned transcript is supplied as ground-truth
+    # text so the model relates visuals to speech without mis-hearing words.
+    "with_transcript": {
+        "model": "gemini-3.5-flash",
+        "strategy": "transcript",
+        "media_resolution": "MEDIA_RESOLUTION_HIGH",
+        "fps": 3,
+        "needs_transcript": True,
+    },
+    # Disabled — gemini-2.5-pro / 3.x pro tiers are ~10x flash and gave only
+    # marginally better selection in testing. Re-enable here if you want the
+    # quality ceiling back.
+    # "pro": {
+    #     "model": "gemini-3.1-pro-preview",
+    #     "strategy": "default",
+    #     "media_resolution": None,
+    #     "fps": None,
+    #     "needs_transcript": False,
+    # },
 }
 DEFAULT_VISUAL_VARIANT = "flash"
 
 
 def _set_analysis(sb, analysis_id: str, **fields) -> None:
     sb.table("visual_analyses").update(fields).eq("id", analysis_id).execute()
+
+
+def _format_clip_transcript(tdata: dict) -> str:
+    """Render transcript_aligned.json as compact timestamped lines for a prompt.
+
+    The aligned file is {language, duration, segments:[{text,start,end}], words}.
+    Prefer per-segment lines (clip-local seconds); fall back to per-word.
+    """
+    lines: list[str] = []
+    for seg in tdata.get("segments", []) or []:
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = seg.get("start")
+        end = seg.get("end")
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            lines.append(f"[{float(start):.1f}-{float(end):.1f}s] {text}")
+        else:
+            lines.append(text)
+    if not lines:  # no usable segments — stitch the word stream instead
+        words = [
+            str(w.get("word") or "").strip()
+            for w in (tdata.get("words") or [])
+            if w.get("word")
+        ]
+        if words:
+            lines.append(" ".join(words))
+    return "\n".join(lines)
 
 
 def _probe_duration(video_path: Path) -> float | None:
@@ -1020,7 +1085,7 @@ def _analyze_worker(analysis_id: str) -> None:
     _set_analysis(sb, analysis_id, status="analyzing")
 
     clip_row = sb.table("clips").select(
-        "id, r2_key, filename, project_id, duration_secs"
+        "id, r2_key, filename, project_id, duration_secs, transcript_r2_key"
     ).eq("id", clip_id).limit(1).execute()
     if not clip_row.data:
         _set_analysis(
@@ -1049,7 +1114,30 @@ def _analyze_worker(analysis_id: str) -> None:
             duration = clip.get("duration_secs") or _probe_duration(video_path)
             debug["duration_secs"] = duration
 
-            prompt = build_prompt(duration, strategy=variant["strategy"])
+            # Fetch the aligned transcript as ground-truth speech for the
+            # transcript strategy. Best-effort: if it's missing we still run,
+            # just without the transcript block.
+            transcript_text = None
+            if variant.get("needs_transcript"):
+                tkey = clip.get("transcript_r2_key")
+                if tkey:
+                    try:
+                        tpath = tmp / "transcript.json"
+                        r2.download_file(bucket, tkey, str(tpath))
+                        tdata = json.loads(tpath.read_text())
+                        transcript_text = _format_clip_transcript(tdata)
+                        step(f"loaded transcript ({len(transcript_text)} chars)")
+                    except Exception as t_exc:  # noqa: BLE001
+                        step(f"transcript fetch failed (non-fatal): {t_exc}")
+                else:
+                    step("no transcript_r2_key on clip — running without it")
+                debug["transcript_text"] = transcript_text
+
+            prompt = build_prompt(
+                duration,
+                strategy=variant["strategy"],
+                transcript_text=transcript_text,
+            )
             debug["model"] = variant["model"]
             debug["prompt"] = prompt
 
@@ -1078,11 +1166,30 @@ def _analyze_worker(analysis_id: str) -> None:
                 except Exception as mr_exc:  # noqa: BLE001
                     step(f"media_resolution {mr} unsupported by SDK: {mr_exc}")
 
+            # Custom frame sampling (fps) rides on the video Part's
+            # video_metadata; default is 1 fps which is too coarse for fleeting
+            # expressions. Build an explicit Part referencing the uploaded file
+            # so we can attach it; fall back to the plain form if unsupported.
+            fps = variant.get("fps")
+            video_part: object = gfile
+            if fps:
+                try:
+                    video_part = types.Part(
+                        file_data=types.FileData(
+                            file_uri=gfile.uri, mime_type=gfile.mime_type
+                        ),
+                        video_metadata=types.VideoMetadata(fps=fps),
+                    )
+                    step(f"sampling at fps={fps}")
+                except Exception as fps_exc:  # noqa: BLE001
+                    step(f"fps={fps} unsupported by SDK: {fps_exc}")
+                    video_part = gfile
+
             t1 = time.time()
             step(f"generate_content model={variant['model']}")
             resp = client.models.generate_content(
                 model=variant["model"],
-                contents=[gfile, prompt],
+                contents=[video_part, prompt],
                 config=types.GenerateContentConfig(**cfg_kwargs),
             )
             debug["generate_secs"] = round(time.time() - t1, 2)
