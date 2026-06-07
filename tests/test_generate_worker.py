@@ -34,6 +34,7 @@ def _load_app():
     modal_stub.App = MagicMock(return_value=MagicMock())
     modal_stub.Image = MagicMock()
     modal_stub.Secret = MagicMock()
+    modal_stub.Volume = MagicMock()
     modal_stub.fastapi_endpoint = lambda **kw: (lambda f: f)
     modal_stub.Mount = MagicMock()
     modal_stub.FilePatternMatcher = MagicMock()
