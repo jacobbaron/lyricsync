@@ -1449,10 +1449,10 @@ def _render_worker(story_id: str) -> None:
                         print(f"[render] cache hit {r2_key}")
                     else:
                         print(f"[render] downloading {r2_key}")
-                        # Download to a temp path first, then move into the cache
-                        # so a failed/partial download never leaves a bad entry.
-                        ext = Path(r2_key).suffix or ".mp4"
-                        staging = tmp / f"dl_{len(inputs)}{ext}"
+                        # Stage the download inside the cache dir (same
+                        # filesystem) so the atomic rename works — a temp dir on
+                        # another device would raise EXDEV on replace().
+                        staging = cached.with_name(cached.name + ".part")
                         r2.download_file(bucket, r2_key, str(staging))
                         staging.replace(cached)
                         downloaded_any = True
