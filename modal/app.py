@@ -1439,6 +1439,8 @@ def _render_worker(story_id: str) -> None:
             downloaded_any = False
             for rng in ranges:
                 source: str = rng["source"]
+                if source == "blank":
+                    continue
                 r2_key = clip_map.get(source)
                 if not r2_key:
                     raise ValueError(f"source clip not found in project: {source!r}")
@@ -1477,18 +1479,48 @@ def _render_worker(story_id: str) -> None:
             # decoding from 0 — and giving each segment its own input avoids the
             # filter-graph trim/concat mis-timing that occurs when many trims
             # share one long input.
-            seek_inputs: list[tuple[float, float, Path]] = []
+            # seek_inputs entries: (extra_cmd_args, Path|None) — Path is None for
+            # synthetic "blank" segments, which are sourced via lavfi instead of
+            # a seeked file input.
+            seek_inputs: list[list[str]] = []
             parts = []
+            in_idx = 0
             for i, rng in enumerate(ranges):
-                r2_key = clip_map[rng["source"]]
+                source = rng["source"]
+                if source == "blank":
+                    dur = float(rng["end"]) - float(rng["start"])
+                    seek_inputs.append([
+                        "-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:d={dur:.3f}:r={FPS}",
+                        "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={SR}",
+                    ])
+                    vidx, aidx = in_idx, in_idx + 1
+                    in_idx += 2
+                    vchain = f"[{vidx}:v]setpts=PTS-STARTPTS,{vnorm}"
+                    overlay = rng.get("overlay")
+                    if overlay and overlay.get("text"):
+                        draw = _build_drawtext(
+                            overlay, tmp / f"overlay_{i}.txt", seg_len=dur
+                        )
+                        vchain += f",{draw}"
+                    parts.append(
+                        f"{vchain}[v{i}];"
+                        f"[{aidx}:a]asetpts=PTS-STARTPTS,"
+                        f"aresample={SR},aformat=channel_layouts=stereo,"
+                        f"atrim=duration={dur:.3f}[a{i}]"
+                    )
+                    continue
+
+                r2_key = clip_map[source]
                 local_path, _ = inputs[r2_key]
                 a = max(0.0, float(rng["start"]) - _RENDER_PAD_S)
                 dur = (float(rng["end"]) + _RENDER_PAD_S) - a
-                seek_inputs.append((a, dur, local_path))
+                seek_inputs.append(["-ss", f"{a:.3f}", "-t", f"{dur:.3f}", "-i", str(local_path)])
+                vidx = in_idx
+                in_idx += 1
 
                 # Each input is already trimmed to the window; just reset PTS,
                 # normalise, and (optionally) draw the title-card overlay.
-                vchain = f"[{i}:v]setpts=PTS-STARTPTS,{vnorm}"
+                vchain = f"[{vidx}:v]setpts=PTS-STARTPTS,{vnorm}"
                 overlay = rng.get("overlay")
                 if overlay and overlay.get("text"):
                     draw = _build_drawtext(
@@ -1497,7 +1529,7 @@ def _render_worker(story_id: str) -> None:
                     vchain += f",{draw}"
                 parts.append(
                     f"{vchain}[v{i}];"
-                    f"[{i}:a]asetpts=PTS-STARTPTS,"
+                    f"[{vidx}:a]asetpts=PTS-STARTPTS,"
                     f"aresample={SR},aformat=channel_layouts=stereo[a{i}]"
                 )
             concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(ranges)))
@@ -1511,8 +1543,8 @@ def _render_worker(story_id: str) -> None:
 
             # Build command: one seeked input per range (order = filter indices).
             cmd = ["ffmpeg", "-y"]
-            for a, dur, local_path in seek_inputs:
-                cmd += ["-ss", f"{a:.3f}", "-t", f"{dur:.3f}", "-i", str(local_path)]
+            for input_args in seek_inputs:
+                cmd += input_args
             cmd += [
                 "-filter_complex", filter_complex,
                 "-map", "[v]", "-map", "[a]",
