@@ -65,7 +65,15 @@ image = (
     )
     # Modal 1.x no longer automounts sibling modules — add transcript.py explicitly.
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    # Title-card font for render-time text overlays (drawtext).
+    .add_local_file(
+        Path(__file__).parent / "assets" / "Montserrat.ttf",
+        "/root/overlay_font.ttf",
+    )
 )
+
+# Path to the bundled overlay font inside the container (see image above).
+OVERLAY_FONT = "/root/overlay_font.ttf"
 
 secrets = [modal.Secret.from_name("lyricsync-secrets")]
 
@@ -1290,6 +1298,50 @@ _RENDER_FPS = 30
 _RENDER_SR = 48000          # audio sample rate
 
 
+def _build_drawtext(
+    overlay: dict, text_path: Path, seg_len: float
+) -> str:
+    """Build a drawtext filter for a per-segment text overlay (title card).
+
+    overlay keys (all but `text` optional):
+      text     — the overlay copy (wrapped automatically).
+      in       — seconds into the segment to fade in (default 0).
+      out      — seconds into the segment to remove (default = segment length).
+      size     — font size in px (default 64).
+      position — "center" | "upper" | "lower" (default "center").
+      wrap     — max characters per line before wrapping (default 22).
+
+    The text is written to `text_path` and referenced via textfile= so we never
+    have to escape colons/quotes/commas in the copy itself. Times are
+    segment-local (each segment's PTS is reset to 0 before this runs).
+    """
+    import textwrap
+
+    raw = str(overlay.get("text") or "").strip()
+    wrap = int(overlay.get("wrap") or 22)
+    wrapped = "\n".join(textwrap.wrap(raw, width=wrap)) or raw
+    text_path.write_text(wrapped)
+
+    size = int(overlay.get("size") or 64)
+    pos = str(overlay.get("position") or "center").lower()
+    yexpr = {
+        "upper": "h*0.10",
+        "lower": "h*0.72",
+    }.get(pos, "(h-text_h)/2")
+
+    t_in = float(overlay.get("in") or 0.0)
+    t_out = float(overlay["out"]) if overlay.get("out") is not None else seg_len
+    # Commas inside the enable expression must be escaped within filter_complex.
+    enable = f"between(t\\,{t_in:.3f}\\,{t_out:.3f})"
+
+    return (
+        f"drawtext=fontfile={OVERLAY_FONT}:textfile={text_path}:"
+        f"fontcolor=white:fontsize={size}:line_spacing=14:"
+        f"box=1:boxcolor=black@0.5:boxborderw=30:"
+        f"x=(w-text_w)/2:y={yexpr}:enable='{enable}'"
+    )
+
+
 @app.function(image=image, secrets=secrets, timeout=60)
 @modal.fastapi_endpoint(method="POST")
 async def render_story(request: Request) -> JSONResponse:
@@ -1391,15 +1443,27 @@ def _render_worker(story_id: str) -> None:
                 _, input_idx = inputs[r2_key]
                 start = max(0.0, float(rng["start"]) - _RENDER_PAD_S)
                 end = float(rng["end"]) + _RENDER_PAD_S
-                items.append({"input_idx": input_idx, "start": start, "end": end})
+                items.append({
+                    "input_idx": input_idx, "start": start, "end": end,
+                    "overlay": rng.get("overlay"),
+                })
 
             parts = []
             for i, it in enumerate(items):
                 inp = it["input_idx"]
                 a, b = it["start"], it["end"]
+                # Optional title-card overlay drawn over this segment's video.
+                vchain = (
+                    f"[{inp}:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{vnorm}"
+                )
+                overlay = it.get("overlay")
+                if overlay and overlay.get("text"):
+                    draw = _build_drawtext(
+                        overlay, tmp / f"overlay_{i}.txt", seg_len=b - a
+                    )
+                    vchain += f",{draw}"
                 parts.append(
-                    f"[{inp}:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,"
-                    f"{vnorm}[v{i}];"
+                    f"{vchain}[v{i}];"
                     f"[{inp}:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,"
                     f"aresample={SR},aformat=channel_layouts=stereo[a{i}]"
                 )
