@@ -17,6 +17,7 @@ export const runtime = "nodejs";
 
 // Keep in sync with VISUAL_VARIANTS in modal/app.py. "pro" is disabled there.
 const VARIANTS = [
+  "context",
   "flash",
   "flash_lowres",
   "editorial",

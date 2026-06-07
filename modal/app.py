@@ -907,6 +907,17 @@ analyze_image = (
 #   needs_transcript — download the clip's aligned transcript and feed it to the
 #                      prompt as ground-truth speech.
 VISUAL_VARIANTS: dict[str, dict] = {
+    # Cheapest pass: a coarse 1-3 sentence visual note (summary only, low media
+    # resolution) to store on the clip as transcript-side context. store_summary
+    # writes result.summary into clips.visual_description.
+    "context": {
+        "model": "gemini-3.5-flash",
+        "strategy": "context",
+        "media_resolution": "MEDIA_RESOLUTION_LOW",
+        "fps": None,
+        "needs_transcript": False,
+        "store_summary": True,
+    },
     # The chosen default: cheap, fast, descriptions + highlight beats.
     "flash": {
         "model": "gemini-3.5-flash",
@@ -1244,6 +1255,15 @@ def _analyze_worker(analysis_id: str) -> None:
                 debug=debug,
                 error=None,
             )
+
+            # For the coarse "context" pass, store the summary on the clip so
+            # downstream story generation can reference it next to the transcript.
+            if variant.get("store_summary") and visual.get("summary"):
+                sb.table("clips").update(
+                    {"visual_description": visual["summary"]}
+                ).eq("id", clip_id).execute()
+                step("stored clip visual_description")
+
             step("done ✓")
 
     except Exception as exc:  # noqa: BLE001

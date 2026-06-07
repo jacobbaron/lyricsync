@@ -56,6 +56,20 @@ def build_prompt(
         if duration_secs and duration_secs > 0
         else ""
     )
+
+    # "context" is the cheap, coarse pass: just a short visual note to ride
+    # alongside the transcript. No segments/highlights → minimal output tokens.
+    if strategy == "context":
+        return (
+            "You are tagging a short video clip with a brief VISUAL context note "
+            "that will sit alongside its speech transcript. Watch the clip and, "
+            "in 1-3 plain sentences, describe what is happening ON SCREEN: the "
+            "setting/location, who or what is visible, and any notable actions or "
+            f"visual events. Be concrete and concise. {dur}\n\n"
+            "Return ONLY a JSON object (no markdown, no code fences):\n"
+            '{"summary": "1-3 sentence visual description of what is on screen"}\n'
+        )
+
     editorial = strategy == "editorial"
     audio = strategy in ("audio_aware", "transcript")
     with_transcript = strategy == "transcript"
