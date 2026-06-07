@@ -15,7 +15,14 @@ export const runtime = "nodejs";
 // API-key callable (Authorization: Bearer lsk_...) like the render endpoints,
 // so the whole upload → analyze → inspect → crop → render loop is scriptable.
 
-const VARIANTS = ["flash", "flash_lowres", "pro", "editorial"] as const;
+// Keep in sync with VISUAL_VARIANTS in modal/app.py. "pro" is disabled there.
+const VARIANTS = [
+  "flash",
+  "flash_lowres",
+  "editorial",
+  "audio_aware",
+  "with_transcript",
+] as const;
 type Variant = (typeof VARIANTS)[number];
 
 export async function POST(
