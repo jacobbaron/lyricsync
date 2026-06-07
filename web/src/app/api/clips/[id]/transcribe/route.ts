@@ -1,21 +1,21 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { resolveAuth } from "@/lib/auth/resolve";
 
 export const runtime = "nodejs";
 
 export async function POST(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   const { id: clipId } = await context.params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  // Accept either an API key (Authorization: Bearer lsk_...) or a browser
+  // session, like the analyze/render routes — so transcription is scriptable.
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const { supabase } = auth;
 
   // Verify clip exists and belongs to user (RLS enforces ownership via project)
   const { data: clip } = await supabase
