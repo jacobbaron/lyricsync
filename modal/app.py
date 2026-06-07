@@ -1471,49 +1471,48 @@ def _render_worker(story_id: str) -> None:
                 f"setsar=1,fps={FPS}"
             )
 
-            items = []
-            for rng in ranges:
-                r2_key = clip_map[rng["source"]]
-                _, input_idx = inputs[r2_key]
-                start = max(0.0, float(rng["start"]) - _RENDER_PAD_S)
-                end = float(rng["end"]) + _RENDER_PAD_S
-                items.append({
-                    "input_idx": input_idx, "start": start, "end": end,
-                    "overlay": rng.get("overlay"),
-                })
-
+            # One seeked ffmpeg input PER range: `-ss start -t dur -i file`.
+            # Input seeking (accurate_seek is on by default) is both
+            # frame-accurate and fast — ffmpeg jumps to the start instead of
+            # decoding from 0 — and giving each segment its own input avoids the
+            # filter-graph trim/concat mis-timing that occurs when many trims
+            # share one long input.
+            seek_inputs: list[tuple[float, float, Path]] = []
             parts = []
-            for i, it in enumerate(items):
-                inp = it["input_idx"]
-                a, b = it["start"], it["end"]
-                # Optional title-card overlay drawn over this segment's video.
-                vchain = (
-                    f"[{inp}:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{vnorm}"
-                )
-                overlay = it.get("overlay")
+            for i, rng in enumerate(ranges):
+                r2_key = clip_map[rng["source"]]
+                local_path, _ = inputs[r2_key]
+                a = max(0.0, float(rng["start"]) - _RENDER_PAD_S)
+                dur = (float(rng["end"]) + _RENDER_PAD_S) - a
+                seek_inputs.append((a, dur, local_path))
+
+                # Each input is already trimmed to the window; just reset PTS,
+                # normalise, and (optionally) draw the title-card overlay.
+                vchain = f"[{i}:v]setpts=PTS-STARTPTS,{vnorm}"
+                overlay = rng.get("overlay")
                 if overlay and overlay.get("text"):
                     draw = _build_drawtext(
-                        overlay, tmp / f"overlay_{i}.txt", seg_len=b - a
+                        overlay, tmp / f"overlay_{i}.txt", seg_len=dur
                     )
                     vchain += f",{draw}"
                 parts.append(
                     f"{vchain}[v{i}];"
-                    f"[{inp}:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,"
+                    f"[{i}:a]asetpts=PTS-STARTPTS,"
                     f"aresample={SR},aformat=channel_layouts=stereo[a{i}]"
                 )
-            concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(items)))
+            concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(ranges)))
             parts.append(
-                f"{concat_in}concat=n={len(items)}:v=1:a=1[vc][a];"
+                f"{concat_in}concat=n={len(ranges)}:v=1:a=1[vc][a];"
                 "[vc]format=yuv420p[v]"
             )
             filter_complex = ";".join(parts)
 
             output_path = tmp / "output.mp4"
 
-            # Build command: inputs in insertion order = ascending input_idx
+            # Build command: one seeked input per range (order = filter indices).
             cmd = ["ffmpeg", "-y"]
-            for local_path, _ in inputs.values():
-                cmd += ["-i", str(local_path)]
+            for a, dur, local_path in seek_inputs:
+                cmd += ["-ss", f"{a:.3f}", "-t", f"{dur:.3f}", "-i", str(local_path)]
             cmd += [
                 "-filter_complex", filter_complex,
                 "-map", "[v]", "-map", "[a]",
@@ -1530,7 +1529,7 @@ def _render_worker(story_id: str) -> None:
             ]
 
             print(
-                f"[render] ffmpeg: {len(items)} segment(s) from "
+                f"[render] ffmpeg: {len(ranges)} segment(s) from "
                 f"{len(inputs)} source(s)"
             )
             proc = subprocess.run(cmd, capture_output=True, text=True)
