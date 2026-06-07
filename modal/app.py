@@ -77,6 +77,14 @@ OVERLAY_FONT = "/root/overlay_font.ttf"
 
 secrets = [modal.Secret.from_name("lyricsync-secrets")]
 
+# Persistent cache of source clips for the render worker. Clips (often long —
+# tens of minutes) are downloaded from R2 once and kept here, so re-rendering or
+# iterating on the same footage skips the R2 download entirely.
+render_cache = modal.Volume.from_name(
+    "lyricsync-render-cache", create_if_missing=True
+)
+RENDER_CACHE_DIR = "/render_cache"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1361,13 +1369,19 @@ async def render_story(request: Request) -> JSONResponse:
     return JSONResponse({"status": "accepted"})
 
 
-@app.function(image=image, secrets=secrets, timeout=1800)
+@app.function(
+    image=image,
+    secrets=secrets,
+    timeout=1800,
+    volumes={RENDER_CACHE_DIR: render_cache},
+)
 def _render_worker(story_id: str) -> None:
     """Render worker (P1-11).
 
     1. Load story from DB (ranges_json, project_id).
     2. Resolve each range's source filename to a clip r2_key.
-    3. Download only the unique source clips referenced in ranges.
+    3. Reuse cached source clips from the render-cache volume; download any
+       missing ones from R2 once and keep them for future renders.
     4. Run ffmpeg filter_complex splice (mirrors shorten/splice.py):
          - trim + normalize resolution/fps per segment
          - concat all segments
@@ -1413,20 +1427,40 @@ def _render_worker(story_id: str) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
 
-            # 3. Download each unique source clip exactly once.
+            # 3. Resolve each unique source clip to a local file, reusing the
+            # persistent render-cache volume. Only clips not already cached are
+            # downloaded from R2; everything else is reused across renders.
             # inputs: r2_key → (local_path, ffmpeg_input_index)
+            cache_dir = Path(RENDER_CACHE_DIR)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            render_cache.reload()  # see clips cached by earlier render runs
+
             inputs: dict[str, tuple[Path, int]] = {}
+            downloaded_any = False
             for rng in ranges:
                 source: str = rng["source"]
                 r2_key = clip_map.get(source)
                 if not r2_key:
                     raise ValueError(f"source clip not found in project: {source!r}")
                 if r2_key not in inputs:
-                    ext = Path(r2_key).suffix or ".mp4"
-                    local_path = tmp / f"clip_{len(inputs)}{ext}"
-                    print(f"[render] downloading {r2_key}")
-                    r2.download_file(bucket, r2_key, str(local_path))
-                    inputs[r2_key] = (local_path, len(inputs))
+                    # Cache key mirrors the R2 key so it's unique per clip.
+                    cached = cache_dir / r2_key.replace("/", "_")
+                    if cached.exists() and cached.stat().st_size > 0:
+                        print(f"[render] cache hit {r2_key}")
+                    else:
+                        print(f"[render] downloading {r2_key}")
+                        # Download to a temp path first, then move into the cache
+                        # so a failed/partial download never leaves a bad entry.
+                        ext = Path(r2_key).suffix or ".mp4"
+                        staging = tmp / f"dl_{len(inputs)}{ext}"
+                        r2.download_file(bucket, r2_key, str(staging))
+                        staging.replace(cached)
+                        downloaded_any = True
+                    inputs[r2_key] = (cached, len(inputs))
+
+            # Persist any newly downloaded clips so future renders reuse them.
+            if downloaded_any:
+                render_cache.commit()
 
             # 4. Build ffmpeg filter_complex (mirrors shorten/splice.py exactly).
             W, H = _RENDER_W, _RENDER_H
