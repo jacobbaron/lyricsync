@@ -26,16 +26,30 @@ HIGHLIGHT_KINDS = (
 )
 
 
-def build_prompt(duration_secs: float | None, strategy: str = "default") -> str:
+def build_prompt(
+    duration_secs: float | None,
+    strategy: str = "default",
+    transcript_text: str | None = None,
+) -> str:
     """Build the Gemini instruction asking for timestamped visual JSON.
 
     Timestamps must be seconds (numbers) measured from the start of the clip so
     they line up with the render worker's clip-local trim points.
 
     strategy:
-      "default"   — summary + segments + highlights (describe what's on screen).
-      "editorial" — same, plus a `suggested_clips` array of ready-to-render
-                    {start, end, reason} moments the model would cut for a short.
+      "default"     — summary + segments + highlights (describe what's on screen,
+                      ignore the words spoken).
+      "editorial"   — same, plus a `suggested_clips` array of ready-to-render
+                      {start, end, reason} moments the model would cut for a short.
+      "audio_aware" — use BOTH the audio and the video: describe the on-screen
+                      action AND read the speaker's tone/emotion, with a detailed
+                      `expression` field on every highlight.
+      "transcript"  — like audio_aware, but the aligned transcript is supplied as
+                      ground-truth text (`transcript_text`) so the model can relate
+                      what is shown to what is said without mis-hearing words.
+
+    Gemini ingests the audio track of an uploaded video by default, so "default"
+    only *asks* it to ignore speech; "audio_aware"/"transcript" lean into it.
     """
     dur = (
         f"The clip is about {duration_secs:.1f} seconds long. "
@@ -43,6 +57,58 @@ def build_prompt(duration_secs: float | None, strategy: str = "default") -> str:
         else ""
     )
     editorial = strategy == "editorial"
+    audio = strategy in ("audio_aware", "transcript")
+    with_transcript = strategy == "transcript"
+
+    # Intro framing differs by whether we want a pure-visual or audio+visual read.
+    if audio:
+        intro = (
+            "You are a video editor's assistant. Watch this single, unedited "
+            "video clip using BOTH its audio and its visuals. Describe what is "
+            "happening on screen AND how the person sounds and feels — their "
+            f"tone, emotion, and energy. {dur}"
+        )
+    else:
+        intro = (
+            "You are a video editor's assistant. Watch this single, unedited "
+            "video clip and describe what is happening ON SCREEN — not the words "
+            f"spoken. {dur}"
+        )
+
+    # When the transcript is supplied, give it as ground truth so the model
+    # doesn't have to (mis)transcribe the audio itself.
+    transcript_block = ""
+    if with_transcript and transcript_text:
+        transcript_block = (
+            "\n\nHere is the exact, time-aligned transcript of what is said in "
+            "this clip (timestamps are seconds from the clip start). Treat it as "
+            "ground truth for the words; use the audio only for tone/emotion and "
+            "the video for everything visual:\n"
+            f"{transcript_text.strip()}\n"
+        )
+
+    # highlights carry a richer `expression` field in the audio/transcript modes
+    # so we actually capture the speaker's face and delivery, not just "smiles".
+    if audio:
+        highlight_schema = (
+            '  "highlights": [\n'
+            '    {"time": <seconds>, '
+            '"kind": "reaction|gesture|action|pause|expression|movement|other", '
+            '"description": "the visual beat", '
+            '"expression": "detailed read of the face/emotion: brow, eyes, mouth, '
+            'gaze direction, intensity (subtle|moderate|strong)", '
+            '"tone": "how the voice sounds at this moment, if speaking"}\n'
+            "  ]\n"
+        )
+    else:
+        highlight_schema = (
+            '  "highlights": [\n'
+            '    {"time": <seconds>, '
+            '"kind": "reaction|gesture|action|pause|expression|movement|other", '
+            '"description": "the visual beat"}\n'
+            "  ]\n"
+        )
+
     suggested_schema = (
         '  ,"suggested_clips": [\n'
         '    {"start": <seconds>, "end": <seconds>, '
@@ -58,10 +124,23 @@ def build_prompt(duration_secs: float | None, strategy: str = "default") -> str:
         if editorial
         else ""
     )
+
+    if audio:
+        describe_rule = (
+            "- Describe what you SEE (people, framing, motion, setting) and, for "
+            "highlights, give a detailed read of the facial expression and vocal "
+            "tone — capture the actual emotion and its intensity, not just "
+            '"smiles" or "looks up".\n'
+        )
+    else:
+        describe_rule = (
+            "- Describe what you SEE (people, framing, motion, expressions, "
+            "setting), not what is said.\n"
+        )
+
     return (
-        "You are a video editor's assistant. Watch this single, unedited video "
-        "clip and describe what is happening ON SCREEN — not the words spoken. "
-        f"{dur}\n\n"
+        f"{intro}"
+        f"{transcript_block}\n\n"
         "Return ONLY a JSON object (no markdown, no code fences) with this shape:\n"
         "{\n"
         '  "summary": "one or two sentences on what this clip shows",\n'
@@ -69,24 +148,20 @@ def build_prompt(duration_secs: float | None, strategy: str = "default") -> str:
         '    {"start": <seconds>, "end": <seconds>, '
         '"shot": "wide|medium|close|other", "description": "what is visible"}\n'
         "  ],\n"
-        '  "highlights": [\n'
-        '    {"time": <seconds>, '
-        '"kind": "reaction|gesture|action|pause|expression|movement|other", '
-        '"description": "the visual beat"}\n'
-        "  ]\n"
+        f"{highlight_schema}"
         f"{suggested_schema}"
         "}\n\n"
         "Rules:\n"
         "- All timestamps are SECONDS (numbers) from the start of the clip, "
-        "e.g. 12.5 — not MM:SS strings.\n"
+        "e.g. 12.5 — not MM:SS strings. Never collapse the timeline into "
+        "fractions of a second; use the real clip duration above.\n"
         "- segments should tile the clip in order, splitting whenever the "
         "framing, subject, or activity changes.\n"
         "- highlights are the few moments a human would actually cut on: a "
         "genuine reaction, a laugh, a gesture, an action beat, eye contact with "
         "the camera, or a notable pause/stillness.\n"
         f"{suggested_rule}"
-        "- Describe what you SEE (people, framing, motion, expressions, "
-        "setting), not what is said.\n"
+        f"{describe_rule}"
         "- If nothing notable happens, return an empty highlights array."
     )
 
@@ -183,11 +258,18 @@ def parse_visual_response(
             continue
         if cap is not None and t > cap:
             t = cap
-        highlights.append({
+        beat = {
             "time": round(t, 2),
             "kind": str(hl.get("kind") or "other").strip().lower(),
             "description": str(hl.get("description") or "").strip(),
-        })
+        }
+        # Audio-aware strategies add a detailed face/emotion read and vocal tone;
+        # pass them through only when present so default output is unchanged.
+        if hl.get("expression"):
+            beat["expression"] = str(hl["expression"]).strip()
+        if hl.get("tone"):
+            beat["tone"] = str(hl["tone"]).strip()
+        highlights.append(beat)
     highlights.sort(key=lambda h: h["time"])
 
     suggested: list[dict] = []
@@ -234,9 +316,14 @@ def format_visual_track(visual: dict) -> str:
             f"{seg.get('description', '')}"
         )
     for hl in visual.get("highlights", []):
+        extra = ""
+        if hl.get("expression"):
+            extra += f" — face: {hl['expression']}"
+        if hl.get("tone"):
+            extra += f" — tone: {hl['tone']}"
         lines.append(
             f"  * {hl['time']:.1f}s ({hl.get('kind', 'other')}): "
-            f"{hl.get('description', '')}"
+            f"{hl.get('description', '')}{extra}"
         )
     for clip in visual.get("suggested_clips", []):
         lines.append(
