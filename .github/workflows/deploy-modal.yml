@@ -22,38 +22,6 @@ jobs:
       - name: Install dependencies
         run: pip install modal fastapi
 
-      - name: TEMP debug - check lyricsync-secrets keys
-        run: |
-          cat > /tmp/check_secret.py << 'EOF'
-          import os
-          import modal
-
-          app = modal.App("lyricsync-secret-check")
-
-          @app.function(secrets=[modal.Secret.from_name("lyricsync-secrets")])
-          def check():
-              expected = [
-                  "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY",
-                  "CLOUDFLARE_R2_ACCESS_KEY_ID", "CLOUDFLARE_R2_SECRET_ACCESS_KEY",
-                  "R2_BUCKET_NAME", "R2_ENDPOINT", "GEMINI_API_KEY",
-                  "MODAL_WEBHOOK_SECRET", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-              ]
-              for k in expected:
-                  v = os.environ.get(k)
-                  if v is None:
-                      print(f"{k}: MISSING")
-                  else:
-                      print(f"{k}: present (len={len(v)}, repr_edges={v[:3]!r}...{v[-3:]!r})")
-
-          @app.local_entrypoint()
-          def main():
-              check.remote()
-          EOF
-          modal run /tmp/check_secret.py
-        env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-
       - name: Deploy
         run: modal deploy modal/app.py
         env:
