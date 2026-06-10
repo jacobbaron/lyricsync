@@ -60,6 +60,7 @@ The `workflow_dispatch` trigger exists but the GitHub MCP integration currently 
 | Secret | Where | Purpose |
 |---|---|---|
 | `MODAL_WEBHOOK_SECRET` | Vercel env | Authenticates Vercel → Modal calls |
+| `MODAL_EDIT_URL` | Vercel env | Modal `edit_timeline` endpoint (timeline edit ops, see docs/timeline_editing.md) |
 | `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` | GitHub secrets | Modal deploy in GHA |
 | `GEMINI_API_KEY` | Modal secret `lyricsync-secrets` | Gemini visual analysis |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Modal secret `lyricsync-secrets` | DB access from Modal workers |
@@ -72,14 +73,15 @@ modal secret create lyricsync-secrets KEY=value --force
 
 ## Modal image notes
 
-Every Modal image that runs functions from `app.py` must mount **both** `transcript.py` and any other local helpers it imports:
+Every Modal image that runs functions from `app.py` must mount **all** local helper modules it imports:
 
 ```python
 .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+.add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
 .add_local_file(Path(__file__).parent / "visual.py", "/root/visual.py")
 ```
 
-`app.py` imports `transcript` at module level; Modal's cloudpickle captures these globals and the container crash-loops on startup if the file is missing.
+`app.py` imports `transcript` and `timeline` at module level; Modal's cloudpickle captures these globals and the container crash-loops on startup if a file is missing.
 
 ## Supabase project
 

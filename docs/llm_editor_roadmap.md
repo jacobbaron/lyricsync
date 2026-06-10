@@ -103,7 +103,7 @@ Energy, laughter, music, silence — pacing signals the transcript misses.
 
 ## Track 2 — Editing tools (a richer edit vocabulary)
 
-### 2.1 Timeline edit model: from quotes to an EDL
+### 2.1 Timeline edit model: from quotes to an EDL ✅ *(implemented — see docs/timeline_editing.md)*
 
 The pivotal refactor. Replace `ranges_json` quote-lists with a proper edit
 decision list (EDL) the LLM manipulates with explicit operations — the

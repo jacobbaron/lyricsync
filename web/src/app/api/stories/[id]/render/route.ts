@@ -66,12 +66,17 @@ export async function POST(
     return NextResponse.json({ error: "Story not found" }, { status: 404 });
   }
 
-  // Reset to 'rendering', clear any previous error, optionally update ranges
+  // Reset to 'rendering', clear any previous error, optionally update ranges.
+  // Setting ranges discards any edited timeline (EDL-01): the timeline is
+  // re-materialized from the new ranges on the next edit or render.
   const storyUpdate: Record<string, unknown> = {
     status: "rendering",
     error_message: null,
   };
-  if (newRanges) storyUpdate.ranges_json = newRanges;
+  if (newRanges) {
+    storyUpdate.ranges_json = newRanges;
+    storyUpdate.timeline_json = null;
+  }
 
   await supabase.from("stories").update(storyUpdate).eq("id", storyId);
 
