@@ -19,12 +19,38 @@ MATCH_MIN_SCORE = 0.6
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 
 
-def format_transcript(words: list[dict]) -> str:
+def _visual_line(hl: dict) -> str:
+    """Format one visual highlight as a bracketed annotation line.
+
+    Square brackets + the 'visual' prefix mark these as non-speech: the system
+    prompt tells Claude annotations are never quotable.
+    """
+    extra = ""
+    if hl.get("expression"):
+        extra += f" — face: {hl['expression']}"
+    if hl.get("tone"):
+        extra += f" — tone: {hl['tone']}"
+    kind = hl.get("kind") or "moment"
+    desc = (hl.get("description") or "").strip()
+    return f"[visual {float(hl['time']):.0f}s — {kind}: {desc}{extra}]"
+
+
+def format_transcript(
+    words: list[dict], visuals_by_source: dict[str, dict] | None = None
+) -> str:
     """Format the merged word list as plain text for Claude — no timestamps.
 
     Groups each source's words into paragraphs (split on gaps > 1.5 s) under a
     "=== filename ===" header, sources ordered by first appearance. Claude
     quotes verbatim text; resolve_segments maps quotes back to timestamps.
+
+    visuals_by_source optionally maps a source filename to its parsed visual
+    track ({summary, highlights: [{time, kind, description, expression?,
+    tone?}]}, clip-local seconds — see visual.parse_visual_response). When
+    present, the section opens with a "[visual context: …]" summary line and
+    highlight beats are interleaved with the speech paragraphs at their
+    position in time, so Claude can pick moments with strong visual energy.
+    Output is unchanged for sources without visuals.
     """
     GAP_S = 1.5
 
@@ -41,22 +67,57 @@ def format_transcript(words: list[dict]) -> str:
     sections: list[str] = []
     for src, ws in ordered:
         ws = sorted(ws, key=lambda x: x["global_start"])
-        paragraphs: list[str] = []
+
+        # Paragraphs as (local_start, local_end, text) — local times so they
+        # can be merged with the clip-local visual track.
+        paragraphs: list[tuple[float, float, str]] = []
         cur_words: list[str] = []
+        cur_local_start = ws[0]["local_start"]
+        cur_local_end = ws[0]["local_end"]
         cur_end_global = ws[0]["global_end"]
 
         for w in ws:
             gap = w["global_start"] - cur_end_global
             if cur_words and gap > GAP_S:
-                paragraphs.append(" ".join(cur_words))
+                paragraphs.append(
+                    (cur_local_start, cur_local_end, " ".join(cur_words))
+                )
                 cur_words = []
+                cur_local_start = w["local_start"]
             cur_words.append((w.get("text") or "").strip())
+            cur_local_end = w["local_end"]
             cur_end_global = w["global_end"]
 
         if cur_words:
-            paragraphs.append(" ".join(cur_words))
+            paragraphs.append((cur_local_start, cur_local_end, " ".join(cur_words)))
 
-        sections.append(f"=== {src} ===\n" + "\n\n".join(paragraphs))
+        visual = (visuals_by_source or {}).get(src) or {}
+        events = sorted(
+            (h for h in (visual.get("highlights") or []) if h.get("time") is not None),
+            key=lambda h: float(h["time"]),
+        )
+
+        blocks: list[str] = []
+        summary = (visual.get("summary") or "").strip()
+        if summary:
+            blocks.append(f"[visual context: {summary}]")
+
+        ei = 0
+        for local_start, local_end, text in paragraphs:
+            # Beats before the paragraph starts go above it; beats during it go
+            # right after (never inside — paragraphs stay verbatim-quotable).
+            while ei < len(events) and float(events[ei]["time"]) <= local_start:
+                blocks.append(_visual_line(events[ei]))
+                ei += 1
+            blocks.append(text)
+            while ei < len(events) and float(events[ei]["time"]) <= local_end:
+                blocks.append(_visual_line(events[ei]))
+                ei += 1
+        while ei < len(events):
+            blocks.append(_visual_line(events[ei]))
+            ei += 1
+
+        sections.append(f"=== {src} ===\n" + "\n\n".join(blocks))
 
     return "\n\n".join(sections)
 

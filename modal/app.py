@@ -571,6 +571,31 @@ def _align_worker(project_id: str) -> None:
             _set_project(sb, project_id, status="transcribed")
             print(f"[align] project {project_id} → transcribed ✓")
 
+            # 5. Auto-run the canonical visual analysis for each clip so story
+            # generation has visual context by the time it runs (roadmap 1.1).
+            # Best-effort: alignment success must not depend on this.
+            for cr in clip_results:
+                try:
+                    existing = sb.table("visual_analyses").select("id").eq(
+                        "clip_id", cr["clip_id"]
+                    ).eq("variant", CANONICAL_VISUAL_VARIANT).in_(
+                        "status", ["analyzing", "done"]
+                    ).limit(1).execute()
+                    if existing.data:
+                        continue
+                    ins = sb.table("visual_analyses").insert({
+                        "clip_id": cr["clip_id"],
+                        "variant": CANONICAL_VISUAL_VARIANT,
+                        "status": "analyzing",
+                    }).execute()
+                    _analyze_worker.spawn(ins.data[0]["id"])
+                    print(f"[align] spawned visual analysis for {cr['clip_id']}")
+                except Exception as va_exc:  # noqa: BLE001
+                    print(
+                        f"[align] visual analysis spawn failed (non-fatal) "
+                        f"for {cr['clip_id']}: {va_exc}"
+                    )
+
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         print(f"[align] error for project {project_id}: {msg}")
@@ -681,7 +706,18 @@ Guidelines:
 - To skip a boring middle, use two separate segments instead of one long quote
 - Make the 3 options meaningfully distinct: different angles, moments, or arcs
 - You may interleave clips (e.g. cut between cameras mid-conversation)
-- The source must exactly match a filename from the transcript headers\
+- The source must exactly match a filename from the transcript headers
+
+Some sections may include visual annotations from an automated analysis of the
+footage:
+- "[visual context: …]" — a one-line summary of what that clip shows on screen
+- "[visual 12s — reaction: …]" — a timestamped on-screen moment (a laugh, a
+  gesture, an action beat), placed next to the speech said around that time,
+  sometimes with facial-expression and vocal-tone reads
+Use them to favor moments with strong visual energy — a genuine reaction, a
+reveal, an action — not just strong words. They are annotations, NOT speech:
+never include bracketed [visual …] lines in a quote. Quotes must be verbatim
+spoken words only.\
 """
 
 
@@ -703,7 +739,17 @@ def _build_messages(
         "\n\nPropose 3 story options using the propose_stories tool, "
         "quoting verbatim transcript text for each segment."
     )
-    messages.append({"role": "user", "content": first_content})
+    # The transcript block dwarfs everything else in every round's context and
+    # is identical across rounds — mark it cacheable so multi-round iteration
+    # only pays full input cost once per cache window.
+    messages.append({
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": first_content,
+            "cache_control": {"type": "ephemeral"},
+        }],
+    })
 
     # Alternate assistant/user turns for each previous round.
     # Skip rounds with no completed stories (aborted/failed rounds) to avoid
@@ -791,7 +837,46 @@ def _generate_worker(project_id: str, round_id: str) -> None:
         if not words:
             raise ValueError("merged.json is empty — run alignment first")
 
-        transcript_text = format_transcript(words)
+        # 1b. Load per-clip visual tracks (roadmap 1.1) — best-effort: story
+        # generation must never fail because visual analysis is missing, still
+        # running, or errored. Prefer the canonical variant; otherwise use the
+        # newest completed analysis of any variant.
+        visuals_by_source: dict[str, dict] = {}
+        try:
+            clips_res = sb.table("clips").select(
+                "id, filename"
+            ).eq("project_id", project_id).execute()
+            id_to_name = {
+                c["id"]: c["filename"] for c in (clips_res.data or [])
+            }
+            if id_to_name:
+                va = sb.table("visual_analyses").select(
+                    "clip_id, variant, result"
+                ).in_("clip_id", list(id_to_name)).eq(
+                    "status", "done"
+                ).order("created_at", desc=True).execute()
+                chosen: dict[str, dict] = {}
+                for row in va.data or []:  # newest first
+                    cid = row["clip_id"]
+                    have = chosen.get(cid)
+                    if have is not None and (
+                        have["variant"] == CANONICAL_VISUAL_VARIANT
+                        or row["variant"] != CANONICAL_VISUAL_VARIANT
+                    ):
+                        continue
+                    chosen[cid] = row
+                for cid, row in chosen.items():
+                    if row.get("result"):
+                        visuals_by_source[id_to_name[cid]] = row["result"]
+        except Exception as v_exc:  # noqa: BLE001
+            print(f"[generate] visual context unavailable (non-fatal): {v_exc}")
+
+        transcript_text = format_transcript(words, visuals_by_source or None)
+        print(
+            f"[generate] visual context present for "
+            f"{len(visuals_by_source)}/{len(set(w.get('source') for w in words))} "
+            f"source clip(s)"
+        )
 
         # 2. Load current round
         round_result = sb.table("generation_rounds").select(
@@ -880,6 +965,17 @@ def _generate_worker(project_id: str, round_id: str) -> None:
         sb.table("projects").update({
             "status": "stories_ready"
         }).eq("id", project_id).execute()
+
+        # Record the exact perception document this round saw, for later
+        # eval/regression comparison (roadmap 1.1 step 4). Non-fatal.
+        try:
+            sb.table("generation_rounds").update({"debug": {
+                "perception_doc": transcript_text,
+                "visual_sources": sorted(visuals_by_source),
+                "word_count": len(words),
+            }}).eq("id", round_id).execute()
+        except Exception as d_exc:  # noqa: BLE001
+            print(f"[generate] round debug write failed (non-fatal): {d_exc}")
 
         print(f"[generate] project {project_id} → stories_ready ✓")
 
@@ -1004,6 +1100,12 @@ VISUAL_VARIANTS: dict[str, dict] = {
     # },
 }
 DEFAULT_VISUAL_VARIANT = "flash"
+
+# The variant that feeds story generation (roadmap 1.1). Auto-run for every
+# clip after alignment (it needs the aligned transcript as ground truth);
+# _generate_worker prefers this variant's track when building the perception
+# document, falling back to the newest completed analysis of any variant.
+CANONICAL_VISUAL_VARIANT = "with_transcript"
 
 
 def _set_analysis(sb, analysis_id: str, **fields) -> None:
