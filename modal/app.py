@@ -48,6 +48,17 @@ from transcript import (
     stories_as_text,
 )
 
+# Timeline (EDL) model — schema, validation, edit ops, ffmpeg compiler
+# (stdlib only, unit-tested in tests/test_timeline.py).
+from timeline import (
+    TimelineError,
+    apply_ops,
+    compile_timeline,
+    timeline_duration,
+    timeline_from_ranges,
+    validate_timeline,
+)
+
 # ---------------------------------------------------------------------------
 # App + image
 # ---------------------------------------------------------------------------
@@ -65,6 +76,7 @@ image = (
     )
     # Modal 1.x no longer automounts sibling modules — add transcript.py explicitly.
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
     # Title-card font for render-time text overlays (drawtext).
     .add_local_file(
         Path(__file__).parent / "assets" / "Montserrat.ttf",
@@ -273,6 +285,7 @@ align_image = (
         "supabase>=2.10",
     )
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
 )
 
 
@@ -578,6 +591,7 @@ gen_image = (
         "anthropic>=0.34",
     )
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
 )
 
 # Tool definition passed to Claude — forces structured JSON output.
@@ -904,10 +918,11 @@ analyze_image = (
         "supabase>=2.10",
         "google-genai>=0.3",
     )
-    # transcript.py must be present because app.py imports it at the module level;
-    # Modal's cloudpickle serialization captures those globals and the container
-    # crashes on startup if the module can't be imported.
+    # transcript.py + timeline.py must be present because app.py imports them at
+    # the module level; Modal's cloudpickle serialization captures those globals
+    # and the container crashes on startup if a module can't be imported.
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
     .add_local_file(Path(__file__).parent / "visual.py", "/root/visual.py")
 )
 
@@ -1292,62 +1307,126 @@ def _analyze_worker(analysis_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# EDL-01: Edit Timeline (synchronous — Vercel proxies the LLM's edit ops here)
+# ---------------------------------------------------------------------------
+
+@app.function(image=image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def edit_timeline(request: Request) -> JSONResponse:
+    """Apply edit operations to a story's timeline.
+
+    Unlike the other endpoints this runs synchronously — op application is
+    pure compute (milliseconds) and the caller needs the result.
+
+    Body:
+        story_id          (required)
+        ops               list of edit ops (may be empty — an empty list just
+                          materializes the timeline from ranges_json)
+        base_revision     optional optimistic-concurrency check; 409 on mismatch
+        restore_revision  optional — reinstate a prior revision's timeline
+                          (mutually exclusive with ops)
+
+    The story's ranges_json is only ever read as the seed for the first
+    revision; after that the timeline is the single source of truth.
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    story_id = body.get("story_id")
+    if not story_id:
+        raise HTTPException(status_code=400, detail="story_id required")
+    ops = body.get("ops") or []
+    if not isinstance(ops, list):
+        raise HTTPException(status_code=400, detail="ops must be an array")
+    restore_revision = body.get("restore_revision")
+    if restore_revision is not None and ops:
+        raise HTTPException(
+            status_code=400, detail="pass either ops or restore_revision, not both"
+        )
+
+    sb = _supabase()
+    row = sb.table("stories").select(
+        "id, project_id, ranges_json, timeline_json, timeline_revision"
+    ).eq("id", story_id).limit(1).execute()
+    if not row.data:
+        raise HTTPException(status_code=404, detail="story not found")
+    story = row.data[0]
+    current_rev = story.get("timeline_revision") or 0
+
+    base_revision = body.get("base_revision")
+    if base_revision is not None and base_revision != current_rev:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"revision conflict: story is at revision {current_rev}, "
+                f"you based your edit on {base_revision} — refetch the timeline"
+            ),
+        )
+
+    try:
+        if restore_revision is not None:
+            rev_row = sb.table("story_revisions").select("timeline").eq(
+                "story_id", story_id
+            ).eq("revision", restore_revision).limit(1).execute()
+            if not rev_row.data:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"revision {restore_revision} not found",
+                )
+            new_timeline = rev_row.data[0]["timeline"]
+            errors = validate_timeline(new_timeline)
+            if errors:
+                raise TimelineError("; ".join(errors))
+            ops_record: list[dict] = [
+                {"op": "restore", "revision": restore_revision}
+            ]
+        else:
+            base = story.get("timeline_json")
+            if base is None:
+                ranges = story.get("ranges_json") or []
+                if not ranges:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="story has neither a timeline nor ranges",
+                    )
+                base = timeline_from_ranges(ranges)
+            new_timeline = apply_ops(base, ops)
+            ops_record = ops
+    except TimelineError as exc:
+        # The op/validation message is written for the LLM caller — pass it up.
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    new_rev = current_rev + 1
+    sb.table("stories").update({
+        "timeline_json": new_timeline,
+        "timeline_revision": new_rev,
+    }).eq("id", story_id).execute()
+    sb.table("story_revisions").insert({
+        "story_id": story_id,
+        "revision": new_rev,
+        "ops": ops_record,
+        "timeline": new_timeline,
+    }).execute()
+
+    return JSONResponse({
+        "revision": new_rev,
+        "duration_secs": round(timeline_duration(new_timeline), 3),
+        "timeline": new_timeline,
+    })
+
+
+# ---------------------------------------------------------------------------
 # P1-11: Render Story Task
 # ---------------------------------------------------------------------------
 
 # Reuse the base image — ffmpeg, boto3 and supabase are already present.
 # No PyTorch or WhisperX needed for rendering.
-
-# ffmpeg output params — mirrors shorten/splice.py
-_RENDER_PAD_S = 0.08        # seconds of padding around each trim point
-_RENDER_W = 1080
-_RENDER_H = 1920
-_RENDER_FPS = 30
-_RENDER_SR = 48000          # audio sample rate
-
-
-def _build_drawtext(
-    overlay: dict, text_path: Path, seg_len: float
-) -> str:
-    """Build a drawtext filter for a per-segment text overlay (title card).
-
-    overlay keys (all but `text` optional):
-      text     — the overlay copy (wrapped automatically).
-      in       — seconds into the segment to fade in (default 0).
-      out      — seconds into the segment to remove (default = segment length).
-      size     — font size in px (default 64).
-      position — "center" | "upper" | "lower" (default "center").
-      wrap     — max characters per line before wrapping (default 22).
-
-    The text is written to `text_path` and referenced via textfile= so we never
-    have to escape colons/quotes/commas in the copy itself. Times are
-    segment-local (each segment's PTS is reset to 0 before this runs).
-    """
-    import textwrap
-
-    raw = str(overlay.get("text") or "").strip()
-    wrap = int(overlay.get("wrap") or 22)
-    wrapped = "\n".join(textwrap.wrap(raw, width=wrap)) or raw
-    text_path.write_text(wrapped)
-
-    size = int(overlay.get("size") or 64)
-    pos = str(overlay.get("position") or "center").lower()
-    yexpr = {
-        "upper": "h*0.10",
-        "lower": "h*0.72",
-    }.get(pos, "(h-text_h)/2")
-
-    t_in = float(overlay.get("in") or 0.0)
-    t_out = float(overlay["out"]) if overlay.get("out") is not None else seg_len
-    # Commas inside the enable expression must be escaped within filter_complex.
-    enable = f"between(t\\,{t_in:.3f}\\,{t_out:.3f})"
-
-    return (
-        f"drawtext=fontfile={OVERLAY_FONT}:textfile={text_path}:"
-        f"fontcolor=white:fontsize={size}:line_spacing=14:"
-        f"box=1:boxcolor=black@0.5:boxborderw=30:"
-        f"x=(w-text_w)/2:y={yexpr}:enable='{enable}'"
-    )
+#
+# The ffmpeg filtergraph is built by timeline.compile_timeline; this worker
+# only resolves sources, manages the clip cache, and runs the command.
 
 
 @app.function(image=image, secrets=secrets, timeout=60)
@@ -1378,13 +1457,14 @@ async def render_story(request: Request) -> JSONResponse:
 def _render_worker(story_id: str) -> None:
     """Render worker (P1-11).
 
-    1. Load story from DB (ranges_json, project_id).
-    2. Resolve each range's source filename to a clip r2_key.
+    1. Load story from DB. Prefer timeline_json (the editable EDL); fall back
+       to converting legacy ranges_json via timeline_from_ranges.
+    2. Resolve each clip item's source filename to a clip r2_key.
     3. Reuse cached source clips from the render-cache volume; download any
        missing ones from R2 once and keep them for future renders.
-    4. Run ffmpeg filter_complex splice (mirrors shorten/splice.py):
-         - trim + normalize resolution/fps per segment
-         - concat all segments
+    4. Compile the timeline to an ffmpeg filtergraph (timeline.py) and run it:
+         - one seeked input per clip item (frame-accurate + fast)
+         - per-item speed, hard cuts or crossfades, text track via drawtext
          - BT.709 8-bit yuv420p output for iPhone HDR compatibility
     5. Upload output.mp4 to R2 at projects/<pid>/stories/<sid>/output.mp4.
     6. Update story: status='done', render_r2_key set.
@@ -1396,7 +1476,7 @@ def _render_worker(story_id: str) -> None:
 
     # 1. Fetch story
     row = sb.table("stories").select(
-        "id, project_id, ranges_json, status"
+        "id, project_id, ranges_json, timeline_json, status"
     ).eq("id", story_id).limit(1).execute()
     rows = row.data or []
 
@@ -1406,14 +1486,16 @@ def _render_worker(story_id: str) -> None:
 
     story = rows[0]
     project_id: str = story["project_id"]
-    ranges: list[dict] = story["ranges_json"] or []
 
-    if not ranges:
-        msg = "story has no ranges"
-        sb.table("stories").update({
-            "status": "error", "error_message": msg
-        }).eq("id", story_id).execute()
-        return
+    timeline = story.get("timeline_json")
+    if timeline is None:
+        ranges: list[dict] = story["ranges_json"] or []
+        if not ranges:
+            sb.table("stories").update({
+                "status": "error", "error_message": "story has no ranges",
+            }).eq("id", story_id).execute()
+            return
+        timeline = timeline_from_ranges(ranges)
 
     # 2. Fetch all clips for this project to resolve source → r2_key
     clips_row = sb.table("clips").select(
@@ -1424,130 +1506,70 @@ def _render_worker(story_id: str) -> None:
     }
 
     try:
+        errors = validate_timeline(timeline)
+        if errors:
+            raise ValueError("invalid timeline: " + "; ".join(errors))
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
 
             # 3. Resolve each unique source clip to a local file, reusing the
             # persistent render-cache volume. Only clips not already cached are
             # downloaded from R2; everything else is reused across renders.
-            # inputs: r2_key → (local_path, ffmpeg_input_index)
             cache_dir = Path(RENDER_CACHE_DIR)
             cache_dir.mkdir(parents=True, exist_ok=True)
             render_cache.reload()  # see clips cached by earlier render runs
 
-            inputs: dict[str, tuple[Path, int]] = {}
+            sources = {
+                item["source"]
+                for track in timeline.get("tracks", [])
+                if track.get("type") == "video"
+                for item in track.get("items", [])
+                if item.get("kind") == "clip"
+            }
+            local_paths: dict[str, Path] = {}  # source filename → cached file
             downloaded_any = False
-            for rng in ranges:
-                source: str = rng["source"]
-                if source == "blank":
-                    continue
+            for source in sorted(sources):
                 r2_key = clip_map.get(source)
                 if not r2_key:
                     raise ValueError(f"source clip not found in project: {source!r}")
-                if r2_key not in inputs:
-                    # Cache key mirrors the R2 key so it's unique per clip.
-                    cached = cache_dir / r2_key.replace("/", "_")
-                    if cached.exists() and cached.stat().st_size > 0:
-                        print(f"[render] cache hit {r2_key}")
-                    else:
-                        print(f"[render] downloading {r2_key}")
-                        # Stage the download inside the cache dir (same
-                        # filesystem) so the atomic rename works — a temp dir on
-                        # another device would raise EXDEV on replace().
-                        staging = cached.with_name(cached.name + ".part")
-                        r2.download_file(bucket, r2_key, str(staging))
-                        staging.replace(cached)
-                        downloaded_any = True
-                    inputs[r2_key] = (cached, len(inputs))
+                # Cache key mirrors the R2 key so it's unique per clip.
+                cached = cache_dir / r2_key.replace("/", "_")
+                if cached.exists() and cached.stat().st_size > 0:
+                    print(f"[render] cache hit {r2_key}")
+                else:
+                    print(f"[render] downloading {r2_key}")
+                    # Stage the download inside the cache dir (same
+                    # filesystem) so the atomic rename works — a temp dir on
+                    # another device would raise EXDEV on replace().
+                    staging = cached.with_name(cached.name + ".part")
+                    r2.download_file(bucket, r2_key, str(staging))
+                    staging.replace(cached)
+                    downloaded_any = True
+                local_paths[source] = cached
 
             # Persist any newly downloaded clips so future renders reuse them.
             if downloaded_any:
                 render_cache.commit()
 
-            # 4. Build ffmpeg filter_complex (mirrors shorten/splice.py exactly).
-            W, H = _RENDER_W, _RENDER_H
-            FPS, SR = _RENDER_FPS, _RENDER_SR
-            vnorm = (
-                f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                f"setsar=1,fps={FPS}"
+            # 4. Compile the timeline and run ffmpeg.
+            compiled = compile_timeline(
+                timeline,
+                resolve_source=lambda src: str(local_paths[src]),
+                workdir=str(tmp),
+                font_path=OVERLAY_FONT,
             )
-
-            # One seeked ffmpeg input PER range: `-ss start -t dur -i file`.
-            # Input seeking (accurate_seek is on by default) is both
-            # frame-accurate and fast — ffmpeg jumps to the start instead of
-            # decoding from 0 — and giving each segment its own input avoids the
-            # filter-graph trim/concat mis-timing that occurs when many trims
-            # share one long input.
-            # seek_inputs entries: (extra_cmd_args, Path|None) — Path is None for
-            # synthetic "blank" segments, which are sourced via lavfi instead of
-            # a seeked file input.
-            seek_inputs: list[list[str]] = []
-            parts = []
-            in_idx = 0
-            for i, rng in enumerate(ranges):
-                source = rng["source"]
-                if source == "blank":
-                    dur = float(rng["end"]) - float(rng["start"])
-                    seek_inputs.append([
-                        "-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:d={dur:.3f}:r={FPS}",
-                        "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={SR}",
-                    ])
-                    vidx, aidx = in_idx, in_idx + 1
-                    in_idx += 2
-                    vchain = f"[{vidx}:v]setpts=PTS-STARTPTS,{vnorm}"
-                    overlay = rng.get("overlay")
-                    if overlay and overlay.get("text"):
-                        draw = _build_drawtext(
-                            overlay, tmp / f"overlay_{i}.txt", seg_len=dur
-                        )
-                        vchain += f",{draw}"
-                    parts.append(
-                        f"{vchain}[v{i}];"
-                        f"[{aidx}:a]asetpts=PTS-STARTPTS,"
-                        f"aresample={SR},aformat=channel_layouts=stereo,"
-                        f"atrim=duration={dur:.3f}[a{i}]"
-                    )
-                    continue
-
-                r2_key = clip_map[source]
-                local_path, _ = inputs[r2_key]
-                a = max(0.0, float(rng["start"]) - _RENDER_PAD_S)
-                dur = (float(rng["end"]) + _RENDER_PAD_S) - a
-                seek_inputs.append(["-ss", f"{a:.3f}", "-t", f"{dur:.3f}", "-i", str(local_path)])
-                vidx = in_idx
-                in_idx += 1
-
-                # Each input is already trimmed to the window; just reset PTS,
-                # normalise, and (optionally) draw the title-card overlay.
-                vchain = f"[{vidx}:v]setpts=PTS-STARTPTS,{vnorm}"
-                overlay = rng.get("overlay")
-                if overlay and overlay.get("text"):
-                    draw = _build_drawtext(
-                        overlay, tmp / f"overlay_{i}.txt", seg_len=dur
-                    )
-                    vchain += f",{draw}"
-                parts.append(
-                    f"{vchain}[v{i}];"
-                    f"[{vidx}:a]asetpts=PTS-STARTPTS,"
-                    f"aresample={SR},aformat=channel_layouts=stereo[a{i}]"
-                )
-            concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(ranges)))
-            parts.append(
-                f"{concat_in}concat=n={len(ranges)}:v=1:a=1[vc][a];"
-                "[vc]format=yuv420p[v]"
-            )
-            filter_complex = ";".join(parts)
+            for text_path, content in compiled["text_files"]:
+                Path(text_path).write_text(content)
 
             output_path = tmp / "output.mp4"
 
-            # Build command: one seeked input per range (order = filter indices).
             cmd = ["ffmpeg", "-y"]
-            for input_args in seek_inputs:
+            for input_args in compiled["inputs"]:
                 cmd += input_args
             cmd += [
-                "-filter_complex", filter_complex,
-                "-map", "[v]", "-map", "[a]",
+                "-filter_complex", compiled["filter_complex"],
+                "-map", "[vout]", "-map", "[aout]",
                 # Video codec — iPhone-friendly BT.709 8-bit
                 "-c:v", "libx264", "-preset", "fast", "-crf", "20",
                 "-pix_fmt", "yuv420p", "-profile:v", "high",
@@ -1561,8 +1583,9 @@ def _render_worker(story_id: str) -> None:
             ]
 
             print(
-                f"[render] ffmpeg: {len(ranges)} segment(s) from "
-                f"{len(inputs)} source(s)"
+                f"[render] ffmpeg: {len(compiled['inputs'])} input(s) from "
+                f"{len(local_paths)} source clip(s), "
+                f"~{compiled['duration']:.1f}s output"
             )
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:

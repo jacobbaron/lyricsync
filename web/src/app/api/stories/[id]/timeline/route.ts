@@ -3,8 +3,13 @@ import { resolveAuth } from "@/lib/auth/resolve";
 
 export const runtime = "nodejs";
 
-// ── GET /api/stories/[id] ──────────────────────────────────────────────────
-// Returns story status, error_message, and (when done) render_r2_key.
+// ── GET /api/stories/[id]/timeline ─────────────────────────────────────────
+// Returns the story's editable timeline (EDL-01).
+//
+// timeline_json is null until the first edit materializes it (POST .../edit
+// with ops: [] does exactly that); until then the render worker derives the
+// timeline from ranges_json on the fly, so ranges_json is included for
+// context.
 
 export async function GET(
   request: Request,
@@ -20,10 +25,7 @@ export async function GET(
 
   const { data: story, error } = await supabase
     .from("stories")
-    .select(
-      "id, project_id, status, error_message, render_r2_key, " +
-        "timeline_revision, created_at",
-    )
+    .select("id, status, timeline_json, timeline_revision, ranges_json")
     .eq("id", storyId)
     .maybeSingle();
 
@@ -34,5 +36,11 @@ export async function GET(
     return NextResponse.json({ error: "Story not found" }, { status: 404 });
   }
 
-  return NextResponse.json(story);
+  return NextResponse.json({
+    id: story.id,
+    status: story.status,
+    revision: story.timeline_revision ?? 0,
+    timeline: story.timeline_json,
+    ranges: story.ranges_json,
+  });
 }
