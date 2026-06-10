@@ -24,7 +24,7 @@ at the end.
 
 ## Track 1 — Perception (help the LLM see what's in the footage)
 
-### 1.1 Promote visual analysis into the generation context
+### 1.1 Promote visual analysis into the generation context ✅ *(implemented)*
 
 The VIS-01 harness already produces shot segments, highlight beats (expression,
 tone, gesture), and suggested clips — but `generate_stories` only sees the
@@ -259,7 +259,9 @@ and cost. Give the LLM a zoom hierarchy instead of everything at once.
    time range on demand (pairs with 1.3).
 3. Cache-friendly prompt layout: static instructions and per-clip docs ordered
    stably so Anthropic prompt caching hits across rounds of the multi-turn
-   generation conversation.
+   generation conversation. *(Done: the round-1 transcript block carries
+   `cache_control` — multi-round iteration only pays full input cost once per
+   cache window.)*
 
 ### 4.2 Right-size models per task
 

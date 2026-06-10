@@ -4,6 +4,15 @@ A scriptable loop to try Gemini visual analysis on real clips, compare a few
 approaches, and render crops to eyeball — **before** wiring vision into story
 generation. Everything is API-key callable (`Authorization: Bearer lsk_...`).
 
+> **Update (roadmap 1.1):** vision is now wired into story generation. The
+> `with_transcript` variant is the canonical pass (`CANONICAL_VISUAL_VARIANT`
+> in `modal/app.py`): the align worker auto-runs it per clip after alignment,
+> and the generate worker interleaves its summary + highlight beats into the
+> transcript Claude reads (falling back to the newest completed variant, or
+> plain transcript when none exists). The exact perception document each round
+> saw is stored in `generation_rounds.debug`. The harness below still works
+> for A/B-ing variants.
+
 ## What got added
 - **Modal** `analyze_visuals` endpoint + `_analyze_worker` (`modal/app.py`) —
   sends a clip to Gemini, returns a timestamped visual track.

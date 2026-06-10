@@ -236,3 +236,96 @@ def test_stories_as_text_handles_missing_text():
     }]
     out = transcript.stories_as_text(stories)
     assert "(segment)" in out
+
+
+# ── format_transcript with visual tracks (roadmap 1.1) ─────────────────────────
+
+def _visual_track(summary="", highlights=None):
+    return {"summary": summary, "highlights": highlights or []}
+
+
+def test_format_unchanged_when_no_visuals_passed():
+    words = [_word("hello", "a.mov", 0.0), _word("world", "a.mov", 0.5)]
+    assert transcript.format_transcript(words) == transcript.format_transcript(
+        words, visuals_by_source=None
+    )
+
+
+def test_visual_summary_opens_section():
+    words = [_word("hello", "a.mov", 0.0), _word("world", "a.mov", 0.5)]
+    out = transcript.format_transcript(
+        words, {"a.mov": _visual_track(summary="Two people at a workbench.")}
+    )
+    blocks = out.split("\n\n")
+    assert blocks[0] == "=== a.mov ===\n[visual context: Two people at a workbench.]"
+    assert blocks[1] == "hello world"
+
+
+def test_highlight_during_paragraph_lands_after_it():
+    # Paragraph spans 0.0–0.9 local; highlight at 0.5 lands right after it,
+    # never inside it (paragraphs must stay verbatim-quotable).
+    words = [_word("hello", "a.mov", 0.0), _word("world", "a.mov", 0.5)]
+    out = transcript.format_transcript(
+        words,
+        {"a.mov": _visual_track(highlights=[
+            {"time": 0.5, "kind": "reaction", "description": "laughs"},
+        ])},
+    )
+    blocks = out.split("\n\n")
+    assert blocks[0] == "=== a.mov ===\nhello world"
+    assert blocks[1] == "[visual 0s — reaction: laughs]"
+
+
+def test_highlight_between_paragraphs_sits_between_them():
+    # Two paragraphs split by a 5 s gap; highlight at 3 s goes between them.
+    words = [
+        _word("first", "a.mov", 0.0),
+        _word("second", "a.mov", 6.0, ls=6.0, le=6.4),
+    ]
+    out = transcript.format_transcript(
+        words,
+        {"a.mov": _visual_track(highlights=[
+            {"time": 3.0, "kind": "action", "description": "stands up"},
+        ])},
+    )
+    blocks = out.split("\n\n")
+    assert blocks[0] == "=== a.mov ===\nfirst"
+    assert blocks[1] == "[visual 3s — action: stands up]"
+    assert blocks[2] == "second"
+
+
+def test_trailing_highlight_appended_at_end():
+    words = [_word("only", "a.mov", 0.0)]
+    out = transcript.format_transcript(
+        words,
+        {"a.mov": _visual_track(highlights=[
+            {"time": 9.0, "kind": "gesture", "description": "waves goodbye"},
+        ])},
+    )
+    assert out.endswith("[visual 9s — gesture: waves goodbye]")
+
+
+def test_highlight_expression_and_tone_included():
+    words = [_word("hi", "a.mov", 0.0)]
+    out = transcript.format_transcript(
+        words,
+        {"a.mov": _visual_track(highlights=[
+            {"time": 2.0, "kind": "reaction", "description": "big laugh",
+             "expression": "eyes crinkled, strong", "tone": "delighted"},
+        ])},
+    )
+    assert "— face: eyes crinkled, strong" in out
+    assert "— tone: delighted" in out
+
+
+def test_visuals_only_annotate_their_own_source():
+    words = [
+        _word("alpha", "a.mov", 0.0),
+        _word("beta", "b.mov", 1.0),
+    ]
+    out = transcript.format_transcript(
+        words, {"b.mov": _visual_track(summary="A kitchen.")}
+    )
+    a_section = out.split("=== b.mov ===")[0]
+    assert "[visual" not in a_section
+    assert "[visual context: A kitchen.]" in out

@@ -127,6 +127,14 @@ def _story(title: str) -> dict:
 
 # ── _build_messages ───────────────────────────────────────────────────────────
 
+def _msg_text(msg: dict) -> str:
+    """Flatten message content (plain string or content-block list) to text."""
+    content = msg["content"]
+    if isinstance(content, str):
+        return content
+    return "".join(b.get("text", "") for b in content)
+
+
 class TestBuildMessages:
     def test_first_round_no_history(self):
         sb = _make_sb()
@@ -134,13 +142,21 @@ class TestBuildMessages:
         msgs = _build_messages("TRANSCRIPT", current, [], sb)
         assert len(msgs) == 1
         assert msgs[0]["role"] == "user"
-        assert "TRANSCRIPT" in msgs[0]["content"]
+        assert "TRANSCRIPT" in _msg_text(msgs[0])
 
     def test_first_round_with_prompt(self):
         sb = _make_sb()
         current = _round("r1", 1, prompt="Make it punchy")
         msgs = _build_messages("T", current, [], sb)
-        assert "Make it punchy" in msgs[0]["content"]
+        assert "Make it punchy" in _msg_text(msgs[0])
+
+    def test_first_message_transcript_block_is_cached(self):
+        """The big transcript block must carry cache_control for prompt caching."""
+        sb = _make_sb()
+        msgs = _build_messages("T", _round("r1", 1), [], sb)
+        blocks = msgs[0]["content"]
+        assert isinstance(blocks, list)
+        assert blocks[0]["cache_control"] == {"type": "ephemeral"}
 
     def test_always_ends_with_user_turn(self):
         """Messages must end with user for the Claude API to accept them."""
