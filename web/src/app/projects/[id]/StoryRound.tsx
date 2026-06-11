@@ -20,9 +20,16 @@ interface Props {
   round: RoundData;
   clips: ClipMeta[];
   defaultExpanded?: boolean;
+  /** Called when a story in this round is deleted, so the list refetches. */
+  onChanged?: () => void;
 }
 
-export function StoryRound({ round, clips, defaultExpanded = false }: Props) {
+export function StoryRound({
+  round,
+  clips,
+  defaultExpanded = false,
+  onChanged,
+}: Props) {
   const [expanded, setExpanded] = useState(defaultExpanded);
 
   return (
@@ -56,6 +63,7 @@ export function StoryRound({ round, clips, defaultExpanded = false }: Props) {
               story={story}
               clips={clips}
               index={idx + 1}
+              onDeleted={onChanged}
             />
           ))}
         </div>

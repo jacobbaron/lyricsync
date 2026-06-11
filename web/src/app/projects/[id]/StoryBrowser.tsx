@@ -115,6 +115,7 @@ export function StoryBrowser({
                 round={round}
                 clips={clips}
                 defaultExpanded={idx === rounds.length - 1}
+                onChanged={fetchRounds}
               />
             </div>
           ))}

@@ -28,8 +28,9 @@ export async function POST(
     return NextResponse.json({ error: "Clip not found" }, { status: 404 });
   }
 
-  // Only trigger if the clip has completed uploading
-  if (clip.status !== "uploading_complete") {
+  // Trigger for freshly uploaded clips, and allow re-triggering after a
+  // failed transcription (the worker left the clip in 'error').
+  if (clip.status !== "uploading_complete" && clip.status !== "error") {
     return NextResponse.json(
       { error: `Cannot transcribe clip with status '${clip.status}'` },
       { status: 409 },

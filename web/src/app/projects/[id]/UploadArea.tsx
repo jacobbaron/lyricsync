@@ -12,6 +12,11 @@ interface UploadEntry {
   error?: string;
 }
 
+// No bytes sent and no server response for this long → the transfer is dead
+// (iOS suspends background XHRs without firing any terminal event).
+const STALL_TIMEOUT_MS = 90_000;
+const STALL_CHECK_INTERVAL_MS = 10_000;
+
 function ProgressBar({ value }: { value: number }) {
   return (
     <div className="h-1 w-full rounded-full bg-zinc-200 dark:bg-zinc-700 overflow-hidden">
@@ -23,7 +28,15 @@ function ProgressBar({ value }: { value: number }) {
   );
 }
 
-function ClipRow({ entry }: { entry: UploadEntry }) {
+function ClipRow({
+  entry,
+  onRetry,
+  onDismiss,
+}: {
+  entry: UploadEntry;
+  onRetry: (id: string) => void;
+  onDismiss: (id: string) => void;
+}) {
   const isActive = entry.status === "preparing" || entry.status === "uploading";
   const isDone = entry.status === "done";
   const isError = entry.status === "error";
@@ -54,13 +67,26 @@ function ClipRow({ entry }: { entry: UploadEntry }) {
         </span>
       </div>
       {isActive && <ProgressBar value={entry.progress} />}
-      {isError && entry.error && (
-        <p className="text-xs text-red-500">{entry.error}</p>
-      )}
-      {isInterrupted && (
-        <p className="text-xs text-amber-600 dark:text-amber-400">
-          Upload was interrupted. Refresh the page to retry.
-        </p>
+      {(isError || isInterrupted) && (
+        <>
+          <p className={`text-xs ${isError ? "text-red-500" : "text-amber-600 dark:text-amber-400"}`}>
+            {entry.error ?? "Upload was interrupted."}
+          </p>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => onRetry(entry.id)}
+              className="text-xs font-semibold text-blue-600 dark:text-blue-400"
+            >
+              Retry
+            </button>
+            <button
+              onClick={() => onDismiss(entry.id)}
+              className="text-xs text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300"
+            >
+              Dismiss
+            </button>
+          </div>
+        </>
       )}
     </div>
   );
@@ -81,8 +107,15 @@ export function UploadArea({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const router = useRouter();
 
-  // Track in-progress XHRs so we can mark them interrupted on visibility change
+  // Track in-flight transfers so the stall watchdog and visibility handler can
+  // abort/inspect them: the XHR for the R2 PUT, the AbortController for the
+  // prepare fetch, and a last-activity timestamp updated on every progress event.
   const xhrMap = useRef<Map<string, XMLHttpRequest>>(new Map());
+  const prepMap = useRef<Map<string, AbortController>>(new Map());
+  const lastActivity = useRef<Map<string, number>>(new Map());
+  // Entries the watchdog aborted — lets the catch path label them "stalled"
+  // instead of the generic abort error.
+  const stalledIds = useRef<Set<string>>(new Set());
 
   // On visibility change, mark any still-uploading entries as interrupted if
   // XHR already ended (browser may have paused or aborted them in background).
@@ -93,7 +126,8 @@ export function UploadArea({
           prev.map((u) => {
             if (
               (u.status === "uploading" || u.status === "preparing") &&
-              !xhrMap.current.has(u.id)
+              !xhrMap.current.has(u.id) &&
+              !prepMap.current.has(u.id)
             ) {
               return { ...u, status: "interrupted" };
             }
@@ -105,6 +139,22 @@ export function UploadArea({
     document.addEventListener("visibilitychange", handleVisibility);
     return () =>
       document.removeEventListener("visibilitychange", handleVisibility);
+  }, []);
+
+  // Stall watchdog: abort transfers that have made no progress for too long so
+  // they surface as retryable instead of sitting at "Uploading…" forever (and
+  // keeping the Add Videos button disabled).
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      for (const [id, last] of lastActivity.current) {
+        if (now - last < STALL_TIMEOUT_MS) continue;
+        stalledIds.current.add(id);
+        xhrMap.current.get(id)?.abort();
+        prepMap.current.get(id)?.abort();
+      }
+    }, STALL_CHECK_INTERVAL_MS);
+    return () => clearInterval(timer);
   }, []);
 
   const updateEntry = useCallback(
@@ -119,23 +169,38 @@ export function UploadArea({
   const uploadFile = useCallback(
     async (entry: UploadEntry): Promise<boolean> => {
       const { id, file } = entry;
+      lastActivity.current.set(id, Date.now());
 
       try {
         // Step 1: Request presigned URL + create clip row
-        const prepRes = await fetch(`/api/projects/${projectId}/clips`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            filename: file.name,
-            contentType: file.type || "video/mp4",
-          }),
-        });
+        const prepAc = new AbortController();
+        prepMap.current.set(id, prepAc);
+        let prepRes: Response;
+        try {
+          prepRes = await fetch(`/api/projects/${projectId}/clips`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              filename: file.name,
+              contentType: file.type || "video/mp4",
+            }),
+            signal: prepAc.signal,
+          });
+        } finally {
+          prepMap.current.delete(id);
+        }
         if (!prepRes.ok) {
           const body = await prepRes.json().catch(() => ({}));
           throw new Error(body.error ?? `Server error ${prepRes.status}`);
         }
-        const { clipId, uploadUrl } = await prepRes.json();
+        const { clipId, uploadUrl } = await prepRes
+          .json()
+          .catch(() => ({} as { clipId?: string; uploadUrl?: string }));
+        if (!clipId || !uploadUrl) {
+          throw new Error("Server returned an unexpected response");
+        }
         updateEntry(id, { clipId, status: "uploading", progress: 0 });
+        lastActivity.current.set(id, Date.now());
 
         // Step 2: PUT directly to R2 using XHR for progress events
         await new Promise<void>((resolve, reject) => {
@@ -143,6 +208,7 @@ export function UploadArea({
           xhrMap.current.set(id, xhr);
 
           xhr.upload.addEventListener("progress", (e) => {
+            lastActivity.current.set(id, Date.now());
             if (e.lengthComputable) {
               updateEntry(id, {
                 progress: Math.round((e.loaded / e.total) * 100),
@@ -181,25 +247,45 @@ export function UploadArea({
           throw new Error("Failed to confirm upload — server error");
         }
 
-        // Step 4: Trigger transcription (no-op until P1-06 is deployed)
+        // Step 4: Trigger transcription. Failure is recoverable — the clip
+        // list shows "Queued" with a retry button — but log it loudly.
         fetch(`/api/clips/${clipId}/transcribe`, { method: "POST" }).catch(
-          () => {
-            // Silently ignore — endpoint doesn't exist yet (P1-06)
-          },
+          (err) => console.error("[upload] transcribe trigger failed:", err),
         );
 
+        lastActivity.current.delete(id);
         updateEntry(id, { status: "done", progress: 100 });
         return true;
       } catch (err) {
         xhrMap.current.delete(id);
-        updateEntry(id, {
-          status: "error",
-          error: err instanceof Error ? err.message : "Upload failed",
-        });
+        prepMap.current.delete(id);
+        lastActivity.current.delete(id);
+        if (stalledIds.current.delete(id)) {
+          updateEntry(id, {
+            status: "interrupted",
+            error: "Upload stalled — no progress for 90 seconds.",
+          });
+        } else {
+          updateEntry(id, {
+            status: "error",
+            error: err instanceof Error ? err.message : "Upload failed",
+          });
+        }
         return false;
       }
     },
     [projectId, updateEntry],
+  );
+
+  // Shared completion: refresh the server component, drop finished entries
+  // (they graduate to the Clips list), resume parent polling if anything landed.
+  const finalize = useCallback(
+    (results: boolean[]) => {
+      router.refresh();
+      setUploads((prev) => prev.filter((u) => u.status !== "done"));
+      if (results.some((ok) => ok)) onUploaded?.();
+    },
+    [router, onUploaded],
   );
 
   const handleFiles = useCallback(
@@ -212,19 +298,47 @@ export function UploadArea({
       }));
 
       setUploads((prev) => [...prev, ...newEntries]);
+      Promise.all(newEntries.map(uploadFile)).then(finalize);
+    },
+    [uploadFile, finalize],
+  );
 
-      // Start all uploads in parallel; once all settle, refresh the server
-      // component and drop completed entries (they graduate to the Clips list).
-      Promise.all(newEntries.map(uploadFile)).then((results) => {
-        router.refresh();
-        setUploads((prev) => prev.filter((u) => u.status !== "done"));
-        // If at least one upload succeeded, let the parent resume polling — the
-        // transcribe endpoint has flipped the project back to "transcribing".
-        if (results.some((ok) => ok)) onUploaded?.();
+  const handleRetry = useCallback(
+    (id: string) => {
+      setUploads((prev) => {
+        const entry = prev.find((u) => u.id === id);
+        if (!entry) return prev;
+        // Drop the clip row from the failed attempt (best-effort) — the retry
+        // creates a fresh row with a fresh presigned URL.
+        if (entry.clipId) {
+          fetch(`/api/clips/${entry.clipId}`, { method: "DELETE" }).catch(
+            () => {},
+          );
+        }
+        const fresh: UploadEntry = {
+          id: entry.id,
+          file: entry.file,
+          progress: 0,
+          status: "preparing",
+        };
+        uploadFile(fresh).then((ok) => finalize([ok]));
+        return prev.map((u) => (u.id === id ? fresh : u));
       });
     },
-    [uploadFile, router, onUploaded],
+    [uploadFile, finalize],
   );
+
+  const handleDismiss = useCallback((id: string) => {
+    setUploads((prev) => {
+      const entry = prev.find((u) => u.id === id);
+      if (entry?.clipId) {
+        fetch(`/api/clips/${entry.clipId}`, { method: "DELETE" }).catch(
+          () => {},
+        );
+      }
+      return prev.filter((u) => u.id !== id);
+    });
+  }, []);
 
   const anyActive = uploads.some(
     (u) => u.status === "preparing" || u.status === "uploading",
@@ -260,7 +374,11 @@ export function UploadArea({
         <ul className="flex flex-col gap-2">
           {uploads.map((entry) => (
             <li key={entry.id}>
-              <ClipRow entry={entry} />
+              <ClipRow
+                entry={entry}
+                onRetry={handleRetry}
+                onDismiss={handleDismiss}
+              />
             </li>
           ))}
         </ul>

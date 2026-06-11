@@ -260,6 +260,44 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
     setProject((prev) => ({ ...prev, status: "transcribing" }));
   }, []);
 
+  // Re-fire transcription for a clip stuck in "Queued" (the original trigger
+  // was lost) or "Error" (the worker failed). Optimistically flips clip and
+  // project so polling resumes; the server does the same transitions.
+  const handleClipRetry = useCallback(async (clipId: string) => {
+    setClips((prev) =>
+      prev.map((c) =>
+        c.id === clipId ? { ...c, status: "transcribing", error_message: null } : c,
+      ),
+    );
+    setProject((prev) => ({ ...prev, status: "transcribing" }));
+    try {
+      const res = await fetch(`/api/clips/${clipId}/transcribe`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        console.error("[clips] retry transcribe failed:", res.status);
+      }
+    } catch (err) {
+      console.error("[clips] retry transcribe failed:", err);
+    }
+  }, []);
+
+  // Remove a clip row that never made it through the pipeline (the server
+  // only allows deleting uploading / uploading_complete / error clips).
+  const handleClipRemove = useCallback(async (clipId: string) => {
+    try {
+      const res = await fetch(`/api/clips/${clipId}`, { method: "DELETE" });
+      if (res.ok || res.status === 404) {
+        setClips((prev) => prev.filter((c) => c.id !== clipId));
+      } else {
+        const body = await res.json().catch(() => ({}));
+        console.error("[clips] remove failed:", body.error ?? res.status);
+      }
+    } catch (err) {
+      console.error("[clips] remove failed:", err);
+    }
+  }, []);
+
   const banner = bannerText(project.status, clips, project.error_message);
 
   // Derived clip list for story components
@@ -322,6 +360,32 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
                     <p className="text-xs text-red-500 truncate">
                       {clip.error_message}
                     </p>
+                  )}
+                  {/* Recovery: clips stranded in Queued (lost transcribe
+                      trigger) or Error are retryable/removable in place —
+                      previously these were dead ends requiring DB surgery. */}
+                  {(clip.status === "uploading_complete" ||
+                    clip.status === "error" ||
+                    clip.status === "uploading") && (
+                    <div className="flex items-center gap-3 pt-0.5">
+                      {(clip.status === "uploading_complete" ||
+                        clip.status === "error") && (
+                        <button
+                          onClick={() => handleClipRetry(clip.id)}
+                          className="text-xs font-semibold text-blue-600 dark:text-blue-400"
+                        >
+                          {clip.status === "error"
+                            ? "Retry transcription"
+                            : "Start transcription"}
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleClipRemove(clip.id)}
+                        className="text-xs text-zinc-400 hover:text-red-500"
+                      >
+                        Remove
+                      </button>
+                    </div>
                   )}
                 </li>
               ))}
