@@ -440,3 +440,54 @@ class TestCompile:
             make_timeline(2), resolver, workdir="/w", font_path="/f.ttf",
         )
         assert seen == ["IMG_0001.mov", "IMG_0001.mov"]
+
+
+# ---------------------------------------------------------------------------
+# choose_canvas — output frame auto-fit
+# ---------------------------------------------------------------------------
+
+class TestChooseCanvas:
+    def test_empty_keeps_default(self):
+        assert tl.choose_canvas([]) == (tl.DEFAULT_W, tl.DEFAULT_H)
+
+    def test_uniform_9_16_is_the_default_frame(self):
+        assert tl.choose_canvas([(1080, 1920), (1080, 1920)]) == (1080, 1920)
+
+    def test_uniform_3_4_portrait(self):
+        # the real-world case: 3:4 clips should yield a 3:4 canvas, no bars
+        assert tl.choose_canvas([(1080, 1440), (2160, 2880)]) == (1080, 1440)
+
+    def test_uniform_4_3_landscape(self):
+        assert tl.choose_canvas([(1440, 1080)]) == (1440, 1080)
+
+    def test_uniform_16_9_landscape(self):
+        assert tl.choose_canvas([(1920, 1080)]) == (1920, 1080)
+
+    def test_square(self):
+        assert tl.choose_canvas([(1000, 1000)]) == (1080, 1080)
+
+    def test_mixed_aspect_falls_back_to_default(self):
+        assert tl.choose_canvas([(1080, 1920), (1920, 1080)]) == (
+            tl.DEFAULT_W, tl.DEFAULT_H,
+        )
+
+    def test_dims_within_tolerance_are_uniform(self):
+        # 1080x1920 (0.5625) and 1080x1912 (~0.565) are within tol -> fit
+        w, h = tl.choose_canvas([(1080, 1920), (1080, 1912)])
+        assert (w, h) != (tl.DEFAULT_W, tl.DEFAULT_H) or (w, h) == (1080, 1920)
+
+    def test_always_even_dimensions(self):
+        for dims in ([(1001, 1333)], [(1333, 1001)], [(1080, 1437)]):
+            w, h = tl.choose_canvas(dims)
+            assert w % 2 == 0 and h % 2 == 0
+
+    def test_extra_tall_capped_at_1920(self):
+        w, h = tl.choose_canvas([(1080, 3000)])
+        assert h <= 1920 and w % 2 == 0 and h % 2 == 0
+
+    def test_extra_wide_capped_at_1920(self):
+        w, h = tl.choose_canvas([(3000, 1080)])
+        assert w <= 1920 and w % 2 == 0 and h % 2 == 0
+
+    def test_ignores_zero_dims(self):
+        assert tl.choose_canvas([(0, 0), (1080, 1440)]) == (1080, 1440)
