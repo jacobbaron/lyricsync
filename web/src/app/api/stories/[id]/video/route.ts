@@ -1,4 +1,4 @@
-import { createClient } from "@/lib/supabase/server";
+import { resolveAuth } from "@/lib/auth/resolve";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 
 export const runtime = "nodejs";
@@ -19,18 +19,17 @@ function r2Client() {
 // Lets the browser fetch() the video as a blob without hitting R2 CORS restrictions
 // (R2 presigned URLs work for <video src> but not fetch() — no CORS headers).
 export async function GET(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   const { id: storyId } = await context.params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  // API key (Bearer lsk_...) or browser session — agents can fetch renders too.
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return new Response("Unauthorized", { status: 401 });
   }
+  const { supabase } = auth;
 
   const { data: story } = await supabase
     .from("stories")

@@ -97,11 +97,14 @@ interface Props {
   story: StoryData;
   clips: ClipMeta[];
   index: number; // 1-based option number within the round
+  /** Called after this story is deleted so the parent list refetches. */
+  onDeleted?: () => void;
 }
 
-export function StoryCard({ story, clips, index }: Props) {
+export function StoryCard({ story, clips, index, onDeleted }: Props) {
   const router = useRouter();
   const uid = useId();
+  const [deleting, setDeleting] = useState(false);
   const durationMap = Object.fromEntries(
     clips.map((c) => [c.filename, c.duration_secs ?? Infinity]),
   );
@@ -186,6 +189,25 @@ export function StoryCard({ story, clips, index }: Props) {
       setSubmitError(err instanceof Error ? err.message : "Network error");
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function handleDelete() {
+    setDeleting(true);
+    setSubmitError(null);
+    try {
+      const res = await fetch(`/api/stories/${story.id}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) {
+        const data = await res.json().catch(() => ({}));
+        setSubmitError(data.error ?? "Failed to delete story");
+        return;
+      }
+      onDeleted?.();
+      router.refresh();
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Network error");
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -339,13 +361,30 @@ export function StoryCard({ story, clips, index }: Props) {
           View result →
         </a>
       ) : (
-        <button
-          onClick={handleRender}
-          disabled={submitting || !allFilled || hasErrors}
-          className="w-full rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2.5 text-sm font-semibold text-white transition-colors"
-        >
-          {submitting ? "Starting render…" : "Render this cut"}
-        </button>
+        <>
+          {story.status === "error" && (
+            <p className="text-xs text-red-500">
+              Last render failed — adjust the ranges and try again, or delete
+              this option.
+            </p>
+          )}
+          <button
+            onClick={handleRender}
+            disabled={submitting || deleting || !allFilled || hasErrors}
+            className="w-full rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2.5 text-sm font-semibold text-white transition-colors"
+          >
+            {submitting ? "Starting render…" : "Render this cut"}
+          </button>
+          {story.status === "error" && (
+            <button
+              onClick={handleDelete}
+              disabled={deleting || submitting}
+              className="w-full rounded-xl border border-red-200 dark:border-red-900 px-4 py-2 text-xs font-semibold text-red-500 disabled:opacity-40 transition-colors hover:bg-red-50 dark:hover:bg-red-950"
+            >
+              {deleting ? "Deleting…" : "Delete this option"}
+            </button>
+          )}
+        </>
       )}
     </div>
   );

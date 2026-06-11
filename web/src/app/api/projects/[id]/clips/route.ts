@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { createClient } from "@/lib/supabase/server";
+import { resolveAuth } from "@/lib/auth/resolve";
 import {
   clipObjectKey,
   presignClipUpload,
@@ -35,13 +35,12 @@ export async function POST(
     );
   }
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  // API key (Bearer lsk_...) or browser session — agents can add footage too.
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const { supabase } = auth;
 
   // RLS scopes this query to projects owned by the user, so a missing row
   // here means either the project doesn't exist or doesn't belong to them.

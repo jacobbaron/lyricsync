@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { resolveAuth } from "@/lib/auth/resolve";
 
 export const runtime = "nodejs";
 
@@ -14,13 +14,12 @@ export async function POST(
 ) {
   const { id: projectId } = await context.params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  // API key (Bearer lsk_...) or browser session — agents can generate too.
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const { supabase } = auth;
 
   // Parse optional prompt from body
   let prompt: string | null = null;
