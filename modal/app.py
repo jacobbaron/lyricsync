@@ -51,8 +51,11 @@ from transcript import (
 # Timeline (EDL) model — schema, validation, edit ops, ffmpeg compiler
 # (stdlib only, unit-tested in tests/test_timeline.py).
 from timeline import (
+    DEFAULT_H,
+    DEFAULT_W,
     TimelineError,
     apply_ops,
+    choose_canvas,
     compile_timeline,
     timeline_duration,
     timeline_from_ranges,
@@ -1160,6 +1163,50 @@ def _probe_duration(video_path: Path) -> float | None:
         return None
 
 
+def _probe_display_dims(video_path: Path) -> tuple[int, int] | None:
+    """Rotation-corrected (display) width/height of a video via ffprobe.
+
+    iPhone clips are often stored as a landscape frame plus a 90/270° display
+    matrix; ffmpeg auto-applies that rotation when decoding into the
+    filtergraph, so we swap w/h here to match what the scale filter sees. This
+    feeds choose_canvas so the render frame matches the footage instead of
+    letterboxing it into the default portrait canvas.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries",
+            "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+            "-of", "json", str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        stream = (json.loads(result.stdout).get("streams") or [{}])[0]
+        w, h = int(stream["width"]), int(stream["height"])
+    except (ValueError, KeyError, IndexError, json.JSONDecodeError):
+        return None
+    rotation = 0
+    tag = (stream.get("tags") or {}).get("rotate")
+    if tag is not None:
+        try:
+            rotation = int(tag)
+        except (ValueError, TypeError):
+            pass
+    for sd in stream.get("side_data_list") or []:
+        if sd.get("rotation") is not None:
+            try:
+                rotation = int(sd["rotation"])
+            except (ValueError, TypeError):
+                pass
+    if abs(rotation) % 180 == 90:
+        w, h = h, w
+    return (w, h)
+
+
 @app.function(image=analyze_image, secrets=secrets, timeout=60)
 @modal.fastapi_endpoint(method="POST")
 async def analyze_visuals(request: Request) -> JSONResponse:
@@ -1653,6 +1700,25 @@ def _render_worker(story_id: str) -> None:
             # Persist any newly downloaded clips so future renders reuse them.
             if downloaded_any:
                 render_cache.commit()
+
+            # 3b. Auto-fit the output canvas to the source footage. The default
+            # timeline frame is portrait 1080x1920; clips that are 3:4 / 4:3 /
+            # landscape would otherwise be letterboxed with black bars. When the
+            # timeline still uses the default frame and every source clip shares
+            # an aspect ratio, size the canvas to match so nothing is padded. A
+            # non-default canvas (set deliberately in the editor) is respected.
+            cur_w = int(timeline.get("width") or DEFAULT_W)
+            cur_h = int(timeline.get("height") or DEFAULT_H)
+            if (cur_w, cur_h) == (DEFAULT_W, DEFAULT_H):
+                dims = [
+                    d for d in (
+                        _probe_display_dims(p) for p in local_paths.values()
+                    ) if d
+                ]
+                fit_w, fit_h = choose_canvas(dims)
+                if (fit_w, fit_h) != (cur_w, cur_h):
+                    timeline = {**timeline, "width": fit_w, "height": fit_h}
+                    print(f"[render] auto-fit canvas {cur_w}x{cur_h} -> {fit_w}x{fit_h}")
 
             # 4. Compile the timeline and run ffmpeg.
             compiled = compile_timeline(

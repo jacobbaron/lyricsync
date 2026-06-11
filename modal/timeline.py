@@ -62,6 +62,52 @@ TEXT_POSITIONS = ("center", "upper", "lower")
 _ID_RE = re.compile(r"^([a-z]+)(\d+)$")
 
 
+def choose_canvas(
+    dims: list[tuple[int, int]],
+    default_w: int = DEFAULT_W,
+    default_h: int = DEFAULT_H,
+    tol: float = 0.02,
+) -> tuple[int, int]:
+    """Pick an output canvas (w, h) for a set of source-clip display sizes.
+
+    `dims` are the rotation-corrected (display) width/height of each non-blank
+    source clip in a timeline. The aim is to avoid letterboxing: when every
+    clip shares an aspect ratio we size the canvas to match it so the render's
+    scale+pad normalize step pads nothing.
+
+    Rules:
+      - No dims (e.g. a blank-only timeline) -> keep the default frame.
+      - Mixed aspect ratios (spread > tol) -> keep the default; one canvas
+        can't fit them all without padding something, so fall back rather than
+        guess and crop.
+      - Uniform aspect -> short side = 1080, long side scaled to match and
+        capped so it never exceeds 1920. Both dims are rounded to even numbers
+        (h.264 requires even width/height).
+    """
+    usable = [(w, h) for (w, h) in dims if w > 0 and h > 0]
+    if not usable:
+        return (default_w, default_h)
+
+    ars = [w / h for (w, h) in usable]
+    if max(ars) - min(ars) > tol:
+        return (default_w, default_h)
+    ar = sum(ars) / len(ars)
+
+    short, long_cap = 1080, 1920
+    if ar <= 1.0:  # portrait or square -> width is the short side
+        w = short
+        h = round(w / ar)
+        if h > long_cap:
+            h, w = long_cap, round(long_cap * ar)
+    else:  # landscape -> height is the short side
+        h = short
+        w = round(h * ar)
+        if w > long_cap:
+            w, h = long_cap, round(long_cap / ar)
+
+    return (w - w % 2, h - h % 2)
+
+
 class TimelineError(ValueError):
     """Raised for invalid timelines or edit operations. The message is meant
     to be returned verbatim to the API caller (an LLM), so be specific."""
