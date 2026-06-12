@@ -59,6 +59,20 @@ MIN_SPEED, MAX_SPEED = 0.25, 4.0
 MAX_CROSSFADE_S = 3.0
 TEXT_POSITIONS = ("center", "upper", "lower")
 
+# Optional per-clip audio effects, applied after the speed/resample stage.
+# Each value is an ffmpeg audio-filter chain (aecho gives an echo/reverb wash) —
+# handy for exaggerated "bad room" sounds in before/after gags. aecho preserves
+# clip length, so timeline timing is unaffected. Pick via a clip item's
+# `audio_fx` field (e.g. {"kind":"clip", ..., "audio_fx":"cavern"}).
+AUDIO_FX = {
+    "echo": "aecho=0.8:0.88:120:0.5",
+    "reverb": "aecho=0.8:0.9:60|110|190|300:0.5|0.4|0.3|0.2",
+    "cavern": (
+        "aecho=0.9:0.92:90|180|320|520:0.65|0.5|0.4|0.3,"
+        "aecho=0.7:0.85:700:0.35"
+    ),
+}
+
 _ID_RE = re.compile(r"^([a-z]+)(\d+)$")
 
 
@@ -316,6 +330,14 @@ def validate_timeline(timeline: dict) -> list[str]:
             ):
                 errors.append(
                     f"{label}: speed must be between {MIN_SPEED} and {MAX_SPEED}"
+                )
+                durations.append(max(0.0, e - s))
+                continue
+            fx = item.get("audio_fx")
+            if fx is not None and fx not in AUDIO_FX:
+                errors.append(
+                    f"{label}: audio_fx must be one of {sorted(AUDIO_FX)} "
+                    f"(got {fx!r})"
                 )
                 durations.append(max(0.0, e - s))
                 continue
@@ -746,10 +768,12 @@ def compile_timeline(
         else:
             vsetpts = "setpts=PTS-STARTPTS"
             aspeed = ""
+        afx = item.get("audio_fx")
+        afx_chain = "," + AUDIO_FX[afx] if afx in AUDIO_FX else ""
         parts.append(f"[{vidx}:v]{vsetpts},{vnorm}[v{i}]")
         parts.append(
             f"[{vidx}:a]asetpts=PTS-STARTPTS,{aspeed}"
-            f"aresample={sr},aformat=channel_layouts=stereo[a{i}]"
+            f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}[a{i}]"
         )
 
     # Join the per-item streams.

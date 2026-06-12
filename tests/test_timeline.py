@@ -491,3 +491,48 @@ class TestChooseCanvas:
 
     def test_ignores_zero_dims(self):
         assert tl.choose_canvas([(0, 0), (1080, 1440)]) == (1080, 1440)
+
+
+# ---------------------------------------------------------------------------
+# audio_fx — per-clip echo/reverb
+# ---------------------------------------------------------------------------
+
+class TestAudioFx:
+    def test_valid_preset_passes_validation(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["audio_fx"] = "cavern"
+        assert tl.validate_timeline(t) == []
+
+    def test_invalid_preset_rejected(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["audio_fx"] = "nope"
+        assert any("audio_fx" in e for e in tl.validate_timeline(t))
+
+    def test_fx_injected_into_filtergraph(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["audio_fx"] = "reverb"
+        assert "aecho=" in compile_simple(t)["filter_complex"]
+
+    def test_no_fx_means_no_aecho(self):
+        assert "aecho" not in compile_simple(make_timeline(1))["filter_complex"]
+
+    def test_fx_does_not_change_duration(self):
+        t = make_timeline(1)
+        base = tl.timeline_duration(t)
+        tl.video_items(t)[0]["audio_fx"] = "cavern"
+        assert tl.timeline_duration(t) == base
+
+    def test_fx_composes_with_speed(self):
+        t = make_timeline(1)
+        it = tl.video_items(t)[0]
+        it["speed"], it["audio_fx"] = 0.5, "cavern"
+        assert tl.validate_timeline(t) == []
+        fc = compile_simple(t)["filter_complex"]
+        assert "atempo" in fc and "aecho=" in fc
+
+    def test_set_speed_keeps_fx(self):
+        # all presets are individually valid
+        for name in tl.AUDIO_FX:
+            t = make_timeline(1)
+            tl.video_items(t)[0]["audio_fx"] = name
+            assert tl.validate_timeline(t) == [], name
