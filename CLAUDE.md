@@ -155,7 +155,9 @@ through untouched.
 `timeline_json` (EDL v1) — `{version, width, height, fps, tracks:[video, text]}`.
 Setting `timeline_json` on a story overrides `ranges_json` at render time. This
 is how you control the **output frame**: e.g. set `width/height` to `1080x1440`
-for 3:4 footage.
+for 3:4 footage. Per-clip video-item knobs: `speed` (0.25–4×, slow-mo/fast)
+and `audio_fx` (`echo` | `reverb` | `cavern` — `aecho`-based echo/reverb wash,
+e.g. for exaggerated "bad room" gags).
 
 ⚠️ **Vocabulary:** "crop" here means **trimming the time range** (`start`/`end`),
 **not** reframing the picture.
