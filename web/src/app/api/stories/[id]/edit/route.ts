@@ -62,11 +62,17 @@ export async function POST(
     return NextResponse.json({ error: "Story not found" }, { status: 404 });
   }
 
-  const editUrl = process.env.MODAL_EDIT_URL;
+  // MODAL_EDIT_URL points at the Modal `edit_timeline` endpoint. It lives on the
+  // same Modal app as `render_story`, so if the env var is missing we derive it
+  // from MODAL_RENDER_URL (…-render-story → …-edit-timeline) instead of 503ing —
+  // this keeps timeline edits working even when only MODAL_RENDER_URL is set.
+  const editUrl =
+    process.env.MODAL_EDIT_URL ||
+    process.env.MODAL_RENDER_URL?.replace("render-story", "edit-timeline");
   const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
   if (!editUrl || !webhookSecret) {
     return NextResponse.json(
-      { error: "MODAL_EDIT_URL not configured" },
+      { error: "MODAL_EDIT_URL not configured (and could not derive it from MODAL_RENDER_URL)" },
       { status: 503 },
     );
   }
