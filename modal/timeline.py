@@ -341,6 +341,11 @@ def validate_timeline(timeline: dict) -> list[str]:
                 )
                 durations.append(max(0.0, e - s))
                 continue
+            mute = item.get("mute")
+            if mute is not None and not isinstance(mute, bool):
+                errors.append(f"{label}: mute must be true or false (got {mute!r})")
+                durations.append(max(0.0, e - s))
+                continue
         elif kind == "blank":
             dur = item.get("duration")
             if not isinstance(dur, (int, float)) or float(dur) <= 0:
@@ -517,6 +522,20 @@ def _op_set_speed(timeline: dict, op: dict) -> None:
     item["speed"] = float(speed)
 
 
+def _op_set_mute(timeline: dict, op: dict) -> None:
+    _, item = _find_video(timeline, op.get("id", ""))
+    _require_clip(item, "set_mute")
+    mute = op.get("mute")
+    if not isinstance(mute, bool):
+        raise TimelineError(
+            f"set_mute: mute must be true or false (got {mute!r})"
+        )
+    if mute:
+        item["mute"] = True
+    else:
+        item.pop("mute", None)
+
+
 def _op_set_transition(timeline: dict, op: dict) -> None:
     idx, item = _find_video(timeline, op.get("id", ""))
     tr = op.get("transition")
@@ -608,6 +627,7 @@ _OPS = {
     "move": _op_move,
     "delete": _op_delete,
     "set_speed": _op_set_speed,
+    "set_mute": _op_set_mute,
     "set_transition": _op_set_transition,
     "insert_clip": _op_insert_clip,
     "insert_blank": _op_insert_blank,
@@ -770,10 +790,13 @@ def compile_timeline(
             aspeed = ""
         afx = item.get("audio_fx")
         afx_chain = "," + AUDIO_FX[afx] if afx in AUDIO_FX else ""
+        # `mute` silences the clip's audio (kept length-matched via volume=0) —
+        # e.g. a silent time-lapse. Applied last so it overrides any audio_fx.
+        mute_chain = ",volume=0" if item.get("mute") else ""
         parts.append(f"[{vidx}:v]{vsetpts},{vnorm}[v{i}]")
         parts.append(
             f"[{vidx}:a]asetpts=PTS-STARTPTS,{aspeed}"
-            f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}[a{i}]"
+            f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}{mute_chain}[a{i}]"
         )
 
     # Join the per-item streams.

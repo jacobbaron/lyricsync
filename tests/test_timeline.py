@@ -541,3 +541,59 @@ class TestAudioFx:
             t = make_timeline(1)
             tl.video_items(t)[0]["audio_fx"] = name
             assert tl.validate_timeline(t) == [], name
+
+
+# ---------------------------------------------------------------------------
+# mute — silent clips (e.g. time-lapse)
+# ---------------------------------------------------------------------------
+
+class TestMute:
+    def test_mute_true_valid(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["mute"] = True
+        assert tl.validate_timeline(t) == []
+
+    def test_mute_non_bool_rejected(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["mute"] = "yes"
+        assert any("mute" in e for e in tl.validate_timeline(t))
+
+    def test_mute_injects_volume0(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["mute"] = True
+        assert "volume=0" in compile_simple(t)["filter_complex"]
+
+    def test_no_mute_no_volume0(self):
+        assert "volume=0" not in compile_simple(make_timeline(1))["filter_complex"]
+
+    def test_mute_does_not_change_duration(self):
+        t = make_timeline(1)
+        base = tl.timeline_duration(t)
+        tl.video_items(t)[0]["mute"] = True
+        assert tl.timeline_duration(t) == base
+
+    def test_set_mute_op(self):
+        out = tl.apply_ops(make_timeline(1), [
+            {"op": "set_mute", "id": "v1", "mute": True},
+        ])
+        assert tl.video_items(out)[0].get("mute") is True
+
+    def test_set_mute_false_clears(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["mute"] = True
+        out = tl.apply_ops(t, [{"op": "set_mute", "id": "v1", "mute": False}])
+        assert "mute" not in tl.video_items(out)[0]
+
+    def test_set_mute_non_bool_raises(self):
+        with pytest.raises(tl.TimelineError, match="true or false"):
+            tl.apply_ops(make_timeline(1), [
+                {"op": "set_mute", "id": "v1", "mute": 1},
+            ])
+
+    def test_mute_composes_with_speed_and_fx(self):
+        t = make_timeline(1)
+        it = tl.video_items(t)[0]
+        it["speed"], it["audio_fx"], it["mute"] = 10.0, "cavern", True
+        assert tl.validate_timeline(t) == []
+        fc = compile_simple(t)["filter_complex"]
+        assert "atempo" in fc and "aecho=" in fc and "volume=0" in fc
