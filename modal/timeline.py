@@ -55,7 +55,7 @@ AUDIO_SR = 48000
 # ±0.08 s the legacy render applied around each trim point.
 RANGE_PAD_S = 0.08
 
-MIN_SPEED, MAX_SPEED = 0.25, 4.0
+MIN_SPEED, MAX_SPEED = 0.25, 20.0  # up to 20x for time-lapse speed-ups
 MAX_CROSSFADE_S = 3.0
 TEXT_POSITIONS = ("center", "upper", "lower")
 
