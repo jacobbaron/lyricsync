@@ -148,8 +148,13 @@ class TestValidate:
 
     def test_speed_bounds(self):
         timeline = make_timeline()
-        tl.video_items(timeline)[0]["speed"] = 10.0
+        tl.video_items(timeline)[0]["speed"] = 25.0  # above MAX_SPEED
         assert any("speed" in e for e in tl.validate_timeline(timeline))
+
+    def test_speed_10x_allowed(self):
+        timeline = make_timeline()
+        tl.video_items(timeline)[0]["speed"] = 10.0  # time-lapse speed
+        assert tl.validate_timeline(timeline) == []
 
     def test_transition_on_first_item(self):
         timeline = make_timeline()
@@ -276,7 +281,7 @@ class TestOps:
     def test_set_speed_bounds(self):
         with pytest.raises(tl.TimelineError, match="between"):
             tl.apply_ops(make_timeline(), [
-                {"op": "set_speed", "id": "v1", "speed": 8.0},
+                {"op": "set_speed", "id": "v1", "speed": 25.0},
             ])
 
     def test_set_transition(self):
