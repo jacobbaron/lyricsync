@@ -76,7 +76,8 @@ invalid, nothing is saved and the error message says which op failed and why.
 | `split` | `id`, `at` | `at` = seconds into the item's source span; second half gets a new id |
 | `move` | `id`, `to_index` | Reorder within the video track |
 | `delete` | `id` | Remove a video item |
-| `set_speed` | `id`, `speed` | 0.25–4.0; clips only |
+| `set_speed` | `id`, `speed` | 0.25–20.0; clips only |
+| `set_mute` | `id`, `mute` | `true` silences the clip (e.g. silent time-lapse); clips only |
 | `set_transition` | `id`, `transition` | `null` or `{"type": "crossfade", "duration": s}` (joins to previous item) |
 | `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`? | Appends when `index` omitted |
 | `insert_blank` | `duration`, `index`? | Black + silence spacer |
