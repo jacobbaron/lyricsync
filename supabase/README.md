@@ -31,28 +31,33 @@ table, so each file runs exactly once.
 
 Project ref `ywfdqggvqrapwvxdzrfi` is hard-coded in the workflow.
 
-## One-time baseline (before the first CI run)
+Once the secrets are set, **no manual steps are needed** — see baselining below.
 
-The production database **already has every historical migration applied**, so
-the migration-history table must be told they're applied — otherwise the first
-`db push` would try to replay them (and the non-idempotent `create table`s would
-fail). Run once, locally, after installing the CLI and adding the secrets:
+## Baselining (automatic, in CI)
+
+The production database **already has every historical migration applied**, but
+the migration-history table doesn't know it. If CI just ran `db push`, it would
+try to replay all of history and the non-idempotent `create table`s would fail.
+
+The workflow handles this itself: a **Baseline** step runs
+`supabase migration repair --status applied …` for the pre-existing migrations
+before `db push`, marking them applied without re-running them. It's idempotent,
+so it's safe on every run. The one migration deliberately left off that list —
+`20260620000000_add_stories_updated_at` — is therefore the only pending one, and
+the apply step applies it on the first run.
+
+Net effect: add the two secrets, merge to `main`, and the pipeline baselines
+prod and applies `updated_at` automatically. Every future migration then flows
+through CI with no manual action.
+
+If you ever need to baseline by hand instead (e.g. running the CLI locally):
 
 ```bash
 export SUPABASE_ACCESS_TOKEN=...        # same token as the secret
 supabase link --project-ref ywfdqggvqrapwvxdzrfi   # prompts for DB password
-
-# Mark every migration that is ALREADY in prod as applied, without running it.
-# (Everything EXCEPT 20260620_add_stories_updated_at, which is not yet applied.)
 supabase migration repair --status applied \
   20260101000000 20260102000000 20260103000000 \
   20260524000000 20260526000000 20260604000000 \
   20260607000000 20260610000000 20260610010000
-
-supabase migration list   # confirm: all the above show as applied (remote),
-                          # 20260620000000 shows as pending (local only)
+supabase migration list   # historical = applied; 20260620000000 = pending
 ```
-
-After that, the next push to `main` (or a manual `supabase db push`) applies the
-pending `20260620000000_add_stories_updated_at` migration — and every future
-migration flows through CI automatically.
