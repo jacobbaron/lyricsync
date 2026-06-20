@@ -31,33 +31,30 @@ table, so each file runs exactly once.
 
 Project ref `ywfdqggvqrapwvxdzrfi` is hard-coded in the workflow.
 
-Once the secrets are set, **no manual steps are needed** — see baselining below.
+Once the secrets are set, **no manual steps are needed**.
 
-## Baselining (automatic, in CI)
+## History alignment (already done — context)
 
-The production database **already has every historical migration applied**, but
-the migration-history table doesn't know it. If CI just ran `db push`, it would
-try to replay all of history and the non-idempotent `create table`s would fail.
+The historical migrations were applied over time via the Supabase MCP, which
+recorded each one in `supabase_migrations.schema_migrations` with an
+auto-generated timestamp version. The repo's migration **filenames carry those
+exact recorded version numbers**, so the CLI already sees them as applied — no
+baseline/repair step is needed. `db push` therefore pushes only genuinely-new
+migrations (the first such being `20260620000000_add_stories_updated_at`).
 
-The workflow handles this itself: a **Baseline** step runs
-`supabase migration repair --status applied …` for the pre-existing migrations
-before `db push`, marking them applied without re-running them. It's idempotent,
-so it's safe on every run. The one migration deliberately left off that list —
-`20260620000000_add_stories_updated_at` — is therefore the only pending one, and
-the apply step applies it on the first run.
+The version ↔ migration mapping (for reference):
 
-Net effect: add the two secrets, merge to `main`, and the pipeline baselines
-prod and applies `updated_at` automatically. Every future migration then flows
-through CI with no manual action.
+| Version | Migration |
+|---|---|
+| `20260524023159` | initial_schema |
+| `20260524201440` | add_error_message |
+| `20260525022013` | generation_rounds |
+| `20260526205334` | api_keys |
+| `20260526211735` | add_clip_timestamps |
+| `20260606122313` | add_visual_analyses |
+| `20260607165445` | add_clip_visual_description |
+| `20260610131740` | add_story_timeline |
+| `20260610132954` | add_round_debug |
 
-If you ever need to baseline by hand instead (e.g. running the CLI locally):
-
-```bash
-export SUPABASE_ACCESS_TOKEN=...        # same token as the secret
-supabase link --project-ref ywfdqggvqrapwvxdzrfi   # prompts for DB password
-supabase migration repair --status applied \
-  20260101000000 20260102000000 20260103000000 \
-  20260524000000 20260526000000 20260604000000 \
-  20260607000000 20260610000000 20260610010000
-supabase migration list   # historical = applied; 20260620000000 = pending
-```
+When adding a **new** migration, just use a current UTC timestamp
+(`supabase migration new <name>`); it will sort after these and push cleanly.

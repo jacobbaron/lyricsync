@@ -158,7 +158,7 @@ create policy feedback_owner_all on feedback
 
 -- ---------------------------------------------------------------------------
 -- VIS-01: Visual analysis (development / experimentation harness)
--- See supabase/migrations/20260604000000_add_visual_analyses.sql for rationale.
+-- See supabase/migrations/20260606122313_add_visual_analyses.sql for rationale.
 -- One row per (clip, variant) Gemini analysis run.
 -- ---------------------------------------------------------------------------
 

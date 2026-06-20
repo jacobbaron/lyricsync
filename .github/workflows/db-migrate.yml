@@ -11,9 +11,10 @@ name: DB migrate
 #   SUPABASE_ACCESS_TOKEN  — a personal access token (supabase.com/dashboard/account/tokens)
 #   SUPABASE_DB_PASSWORD   — the project's database password
 #
-# No manual baseline needed: the "Baseline" step below tells the remote
-# migration history that the pre-existing migrations are already applied, so the
-# first `db push` doesn't try to replay them. See supabase/README.md.
+# No baseline needed: the repo's migration filenames already carry the same
+# version numbers recorded in the remote migration history (the migrations were
+# applied via the Supabase MCP over time), so `db push` sees them as applied and
+# only pushes genuinely-new migrations. See supabase/README.md.
 
 on:
   push:
@@ -63,32 +64,6 @@ jobs:
 
       - name: Link project
         run: supabase link --project-ref "$PROJECT_REF"
-
-      # TEMPORARY diagnostic: dump the recorded migration history (version, name
-      # and statements) via the CLI's own connection, so the repo's migrations
-      # can be aligned to what's really on the DB. Removed once they match.
-      - name: Inspect remote migration history (diagnostic)
-        continue-on-error: true
-        run: |
-          supabase db dump --linked --data-only --schema supabase_migrations -f /tmp/mig.sql
-          echo "================ supabase_migrations dump ================"
-          cat /tmp/mig.sql
-
-      # Adopt an existing database: mark every migration that already exists in
-      # production as applied so the first `db push` applies only genuinely-new
-      # migrations instead of replaying history (the non-idempotent create-table
-      # migrations would fail on replay). Idempotent — re-marking an already
-      # applied migration is a no-op — so it's safe to leave in for every run.
-      # Note: 20260620000000_add_stories_updated_at is intentionally NOT listed;
-      # it is the one pre-existing migration not yet applied, so the apply step
-      # below applies it.
-      - name: Baseline migration history (one-time-safe)
-        if: github.event_name == 'push'
-        run: |
-          supabase migration repair --status applied \
-            20260101000000 20260102000000 20260103000000 \
-            20260524000000 20260526000000 20260604000000 \
-            20260607000000 20260610000000 20260610010000
 
       - name: Dry run (PR)
         if: github.event_name == 'pull_request'
