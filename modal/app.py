@@ -1778,12 +1778,16 @@ def _render_worker(story_id: str) -> None:
                 )
             print(f"[render] uploaded {output_key}")
 
-            # 6. Mark story done.
+            # 6. Mark story done. Write the ACTUAL compiled duration back to
+            # estimated_duration_secs so the web list shows the real length
+            # (it would otherwise keep the stale create-time estimate, e.g.
+            # after a speed/time-lapse edit).
             # Note: project status intentionally NOT changed — it stays at
             # 'transcribed' so users can create additional cuts at any time.
             sb.table("stories").update({
                 "status": "done",
                 "render_r2_key": output_key,
+                "estimated_duration_secs": round(float(compiled["duration"]), 2),
             }).eq("id", story_id).execute()
 
             print(f"[render] story {story_id} done ✓")
