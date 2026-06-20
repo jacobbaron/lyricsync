@@ -414,14 +414,15 @@ def _load_diarizer(hf_token: str | None, device: str = "cpu") -> tuple[object, d
 
         # PyTorch 2.6 flipped torch.load's default to weights_only=True, which
         # rejects pyannote 3.x's pickled checkpoints (non-tensor globals like
-        # torch.to) with an UnpicklingError. We only load official pyannote
-        # models pinned by name (DIARIZE_MODEL), so loading the full pickle is
-        # safe — restore the pre-2.6 behavior for this process.
+        # torch.to / TorchVersion) with an UnpicklingError. pytorch-lightning
+        # passes weights_only=True *explicitly*, so we must force it back off
+        # (not setdefault). We only load official pyannote models pinned by name
+        # (DIARIZE_MODEL), so loading the full pickle is safe in this process.
         if not getattr(torch.load, "_lyricsync_full_load", False):
             _orig_torch_load = torch.load
 
             def _full_torch_load(*args, **kwargs):
-                kwargs.setdefault("weights_only", False)
+                kwargs["weights_only"] = False
                 return _orig_torch_load(*args, **kwargs)
 
             _full_torch_load._lyricsync_full_load = True
