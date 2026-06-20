@@ -91,6 +91,8 @@ interface Range {
 
 // ── POST /api/projects/[id]/stories ────────────────────────────────────────
 // Creates a new story row with the given ranges and fires the render task.
+// Body: { ranges: [{ source, start, end }], title?: string, description?: string }
+// title/description are optional; when omitted the cut shows as "Untitled cut".
 
 export async function POST(
   request: Request,
@@ -106,6 +108,11 @@ export async function POST(
 
   // Parse body
   let ranges: Range[];
+  // Optional human-readable label for the cut. Without it, API-created cuts
+  // show as "Untitled cut" in the web UI — generation-flow stories get a title
+  // from Claude, but direct API creates have no other write path for it.
+  let title: string | null = null;
+  let description: string | null = null;
   try {
     const body = await request.json();
     ranges = body.ranges;
@@ -127,6 +134,26 @@ export async function POST(
           { status: 400 },
         );
       }
+    }
+    // Optional title / description — must be strings when present. Empty/
+    // whitespace-only values are treated as omitted (stored as null).
+    if (body.title != null) {
+      if (typeof body.title !== "string") {
+        return NextResponse.json(
+          { error: "title must be a string" },
+          { status: 400 },
+        );
+      }
+      title = body.title.trim() || null;
+    }
+    if (body.description != null) {
+      if (typeof body.description !== "string") {
+        return NextResponse.json(
+          { error: "description must be a string" },
+          { status: 400 },
+        );
+      }
+      description = body.description.trim() || null;
     }
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
@@ -150,6 +177,8 @@ export async function POST(
       project_id: projectId,
       ranges_json: ranges,
       status: "rendering",
+      title,
+      description,
     })
     .select("id")
     .single();
