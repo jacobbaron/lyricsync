@@ -61,6 +61,18 @@ jobs:
             exit 1
           fi
 
+      # TEMPORARY diagnostic: print the migration history actually recorded on
+      # the remote DB so local filenames can be aligned to it. Removed once the
+      # repo's migrations match. Uses the IPv4 session pooler (GitHub runners
+      # are IPv4; the direct db host is often IPv6-only).
+      - name: Inspect remote migration history (diagnostic)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+          PGPASSWORD="$SUPABASE_DB_PASSWORD" psql \
+            "host=aws-0-us-east-1.pooler.supabase.com port=5432 user=postgres.${PROJECT_REF} dbname=postgres sslmode=require" \
+            -c "select version, name from supabase_migrations.schema_migrations order by version;"
+
       - name: Link project
         run: supabase link --project-ref "$PROJECT_REF"
 
