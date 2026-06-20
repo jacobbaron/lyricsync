@@ -281,6 +281,12 @@ align_image = (
         "pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu",
         # WhisperX pulls in faster-whisper, speechbrain, wav2vec2 alignment.
         "pip install whisperx",
+        # Pin pyannote.audio to 3.x for diarization. whisperx pulls 4.x, whose
+        # speaker-diarization-3.1 pipeline now requires a *new* gated model
+        # (speaker-diarization-community-1). The 3.x pipeline instead uses
+        # segmentation-3.0 (gated, already accepted) + an ungated embedding, so
+        # it works with the HF access we already have.
+        "pip install 'pyannote.audio>=3.1,<4'",
     )
     .pip_install(
         "fastapi[standard]>=0.115",
