@@ -5,6 +5,7 @@ import { UploadArea } from "./UploadArea";
 import { TranscriptViewer } from "./TranscriptViewer";
 import { StoryGenerator } from "./StoryGenerator";
 import { StoryBrowser } from "./StoryBrowser";
+import { DirectRenders } from "./DirectRenders";
 import type { ClipMeta } from "./RangePicker";
 
 // ── types ──────────────────────────────────────────────────────────────────
@@ -434,6 +435,18 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
           onGenerated={handleGenerationStarted}
         />
       )}
+
+      {/* Rendered cuts — direct renders not tied to a generation round (e.g.
+          cuts created through the REST API). Self-hides when there are none,
+          so it's safe to mount in any post-transcription state. */}
+      {(
+        project.status === "transcribed" ||
+        project.status === "generating_stories" ||
+        project.status === "stories_ready" ||
+        project.status === "rendering" ||
+        project.status === "done" ||
+        project.status === "error"
+      ) && <DirectRenders projectId={project.id} />}
 
       {/* Upload area — visible while uploading and in any settled post-transcription
           state, so users can add more videos to an already-transcribed project.
