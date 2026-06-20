@@ -1,8 +1,9 @@
 -- Core schema for lyricsync web app.
 --
--- This file is the source of truth for the database structure.
--- To apply to a fresh Supabase project, run this file in the SQL editor,
--- then run db/migrations/p2-01-generation-rounds.sql for Phase 2 additions.
+-- This is the baseline (first) migration. A fresh database is built by running
+-- the entire supabase/migrations/ sequence in order via `supabase db push`;
+-- the later timestamped migrations layer the phase-2/phase-3 tables and column
+-- additions on top of this baseline.
 --
 -- All tables enable Row Level Security. Policies scope every row to the
 -- authenticated user's email via the JWT, so the anon/browser session can
@@ -157,7 +158,7 @@ create policy feedback_owner_all on feedback
 
 -- ---------------------------------------------------------------------------
 -- VIS-01: Visual analysis (development / experimentation harness)
--- See db/migrations/20260604_add_visual_analyses.sql for rationale.
+-- See supabase/migrations/20260604000000_add_visual_analyses.sql for rationale.
 -- One row per (clip, variant) Gemini analysis run.
 -- ---------------------------------------------------------------------------
 

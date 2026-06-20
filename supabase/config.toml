@@ -1,0 +1,6 @@
+# Minimal Supabase CLI config. Only project_id is needed for the remote
+# migration workflow (`supabase link` + `supabase db push`) used in CI; the
+# local-dev sections that `supabase init` normally generates are omitted on
+# purpose. Regenerate a full config with `supabase init` if you start running
+# the local stack.
+project_id = "lyricsync"

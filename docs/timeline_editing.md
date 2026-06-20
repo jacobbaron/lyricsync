@@ -12,7 +12,7 @@ Implementation map:
 - `modal/app.py` → `edit_timeline` — synchronous Modal endpoint that applies
   ops and bumps the revision; `_render_worker` renders from the timeline
 - `web/src/app/api/stories/[id]/{edit,timeline,revisions}` — authenticated API
-- `db/migrations/20260610_add_story_timeline.sql` — `stories.timeline_json`,
+- `supabase/migrations/20260610010000_add_story_timeline.sql` — `stories.timeline_json`,
   `stories.timeline_revision`, `story_revisions`
 
 ## Lifecycle
@@ -132,8 +132,8 @@ plus a single `filter_complex`:
 
 ## One-time setup
 
-1. Apply `db/migrations/20260610_add_story_timeline.sql` (Supabase SQL editor
-   or MCP `apply_migration`).
+1. Apply `supabase/migrations/20260610010000_add_story_timeline.sql` — ships via
+   the **DB migrate** CI workflow on merge (see `supabase/README.md`).
 2. Deploy Modal (push to `main` touching `modal/**`); note the new
    `edit_timeline` endpoint URL it prints.
 3. Set `MODAL_EDIT_URL` to that URL in the Vercel environment.

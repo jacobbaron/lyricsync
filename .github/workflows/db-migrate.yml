@@ -1,0 +1,61 @@
+name: DB migrate
+
+# Applies SQL migrations to Supabase via the Supabase CLI, so schema changes
+# ship through reviewed PRs + CI instead of someone running them by hand.
+#
+#   - On a PR: dry-run only (prints the migrations that *would* be applied) so
+#     review can catch breakage without touching the database.
+#   - On merge to main: `supabase db push` applies any pending migrations.
+#
+# Required GitHub secrets (Settings → Secrets and variables → Actions):
+#   SUPABASE_ACCESS_TOKEN  — a personal access token (supabase.com/dashboard/account/tokens)
+#   SUPABASE_DB_PASSWORD   — the project's database password
+#
+# One-time baseline before the first run — see supabase/README.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "supabase/migrations/**"
+      - "supabase/config.toml"
+      - ".github/workflows/db-migrate.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "supabase/migrations/**"
+      - "supabase/config.toml"
+      - ".github/workflows/db-migrate.yml"
+
+# Never run two migration jobs against the same DB at once.
+concurrency:
+  group: db-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Apply migrations
+    runs-on: ubuntu-latest
+
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      PROJECT_REF: ywfdqggvqrapwvxdzrfi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Link project
+        run: supabase link --project-ref "$PROJECT_REF"
+
+      - name: Dry run (PR)
+        if: github.event_name == 'pull_request'
+        run: supabase db push --dry-run
+
+      - name: Apply migrations (main)
+        if: github.event_name == 'push'
+        run: supabase db push

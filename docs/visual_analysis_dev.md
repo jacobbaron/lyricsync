@@ -18,7 +18,7 @@ generation. Everything is API-key callable (`Authorization: Bearer lsk_...`).
   sends a clip to Gemini, returns a timestamped visual track.
 - **`modal/visual.py`** — pure prompt-builder + response parser (unit-tested in
   `tests/test_visual_parse.py`).
-- **DB** `visual_analyses` table (`db/migrations/20260604_add_visual_analyses.sql`)
+- **DB** `visual_analyses` table (`supabase/migrations/20260604000000_add_visual_analyses.sql`)
   — one row per (clip, variant) run, with a verbose `debug` blob.
 - **API** `POST /api/clips/[id]/analyze` and `GET /api/clips/[id]/visual`.
 
@@ -36,7 +36,7 @@ so you can fire several on the same clip and diff them.
 Add more in `VISUAL_VARIANTS` in `modal/app.py`.
 
 ## One-time setup
-1. **DB:** apply `db/migrations/20260604_add_visual_analyses.sql` (Supabase SQL editor or MCP).
+1. **DB:** apply `supabase/migrations/20260604000000_add_visual_analyses.sql` — ships via the **DB migrate** CI workflow on merge (see `supabase/README.md`).
 2. **Secret:** add `GEMINI_API_KEY` to the Modal secret `lyricsync-secrets`.
 3. **Deploy:** `modal deploy modal/app.py`, copy the `analyze_visuals` URL it prints, set it as `MODAL_ANALYZE_URL` in Vercel.
 
