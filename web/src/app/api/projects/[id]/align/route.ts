@@ -1,21 +1,21 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { resolveAuth } from "@/lib/auth/resolve";
 
 export const runtime = "nodejs";
 
 export async function POST(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   const { id: projectId } = await context.params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user?.email) {
+  // API key (Bearer lsk_...) or browser session — agents/ops drive this too,
+  // e.g. to re-run alignment (and speaker diarization) on a finished project.
+  const auth = await resolveAuth(request);
+  if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const { supabase } = auth;
 
   // Verify project exists and belongs to user (RLS enforces ownership)
   const { data: project } = await supabase
@@ -28,7 +28,10 @@ export async function POST(
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
 
-  // Fetch all clips and verify every one has finished raw transcription
+  // Fetch all clips. The align worker re-reads each clip's raw transcript, so a
+  // clip is eligible once it has finished raw transcription — either freshly
+  // (transcribed_raw) or on a re-align of an already-processed project
+  // (aligned). Anything still uploading/transcribing blocks.
   const { data: clips } = await supabase
     .from("clips")
     .select("id, status")
@@ -38,7 +41,8 @@ export async function POST(
     return NextResponse.json({ error: "No clips found" }, { status: 400 });
   }
 
-  const notReady = clips.filter((c) => c.status !== "transcribed_raw");
+  const READY = new Set(["transcribed_raw", "aligned"]);
+  const notReady = clips.filter((c) => !READY.has(c.status));
   if (notReady.length > 0) {
     return NextResponse.json(
       {
