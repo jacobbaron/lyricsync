@@ -365,31 +365,64 @@ def _words_from(data: dict) -> list[dict]:
     return out
 
 
-def _load_diarizer(hf_token: str | None, device: str = "cpu"):
-    """Load the WhisperX/pyannote speaker-diarization pipeline once, or None.
+# Pin the diarization model explicitly. Some whisperx versions default
+# DiarizationPipeline to an older gated repo (pyannote/speaker-diarization@2.1),
+# a *different* model than the 3.1 most users accept — so without pinning, a
+# valid token + accepted 3.1 models can still fail to load.
+DIARIZE_MODEL = "pyannote/speaker-diarization-3.1"
 
-    Diarization is an optional enrichment on top of alignment: it tells us "who
-    spoke when" by clustering voice embeddings into turns. It needs a Hugging
-    Face token (HF_TOKEN in lyricsync-secrets) with the gated
-    pyannote/speaker-diarization-3.1 + segmentation-3.0 models accepted.
 
-    Returns None — and the worker proceeds without speaker labels — whenever the
-    token is missing or the pipeline can't load. Alignment is the critical path
-    and must never break because diarization is unavailable.
+def _load_diarizer(hf_token: str | None, device: str = "cpu") -> tuple[object, dict]:
+    """Load the WhisperX/pyannote speaker-diarization pipeline once.
+
+    Returns (pipeline_or_None, info) where info is a JSON-serializable diagnostic
+    dict (token presence, whisperx version, import path, model, load error). The
+    pipeline is None — and the worker proceeds without speaker labels — whenever
+    the token is missing or the pipeline can't load. Alignment is the critical
+    path and must never break because diarization is unavailable.
+
+    Diarization tells us "who spoke when" by clustering voice embeddings into
+    turns. It needs a Hugging Face token (HF_TOKEN in lyricsync-secrets) with the
+    gated pyannote/speaker-diarization-3.1 + segmentation-3.0 models accepted.
     """
+    info: dict = {
+        "token_present": bool(hf_token),
+        "model": DIARIZE_MODEL,
+        "whisperx_version": None,
+        "import_path": None,
+        "loaded": False,
+        "error": None,
+    }
+    try:
+        import whisperx
+        info["whisperx_version"] = getattr(whisperx, "__version__", "?")
+    except Exception:  # noqa: BLE001
+        pass
+
     if not hf_token:
+        info["error"] = "no HF_TOKEN in env"
         print("[align] diarization disabled — no HF_TOKEN in lyricsync-secrets")
-        return None
+        return None, info
     try:
         try:
             from whisperx.diarize import DiarizationPipeline
+            info["import_path"] = "whisperx.diarize"
         except ImportError:  # whisperx has moved this symbol between versions
             from whisperx import DiarizationPipeline  # type: ignore[attr-defined]
-        print("[align] loading pyannote speaker-diarization pipeline…")
-        return DiarizationPipeline(use_auth_token=hf_token, device=device)
+            info["import_path"] = "whisperx"
+        print(f"[align] loading pyannote diarization pipeline ({DIARIZE_MODEL})…")
+        try:
+            pipe = DiarizationPipeline(
+                model_name=DIARIZE_MODEL, use_auth_token=hf_token, device=device
+            )
+        except TypeError:  # older signature without model_name
+            pipe = DiarizationPipeline(use_auth_token=hf_token, device=device)
+        info["loaded"] = True
+        return pipe, info
     except Exception as exc:  # noqa: BLE001
+        info["error"] = f"{type(exc).__name__}: {exc}"
         print(f"[align] diarizer load failed (non-fatal): {exc}")
-        return None
+        return None, info
 
 
 def _assign_speakers(words: list[dict], diarize_df) -> set[str]:
@@ -495,10 +528,12 @@ def _align_worker(project_id: str) -> None:
 
     # Optional speaker diarization ("who spoke when"). Loaded once; None when
     # HF_TOKEN is absent, in which case words simply carry no speaker label.
-    diarizer = _load_diarizer(
+    # diar_info captures why, surfaced in merged.json for debugging.
+    diarizer, diar_info = _load_diarizer(
         os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN"),
         device="cpu",
     )
+    diar_info["per_clip"] = []
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -560,17 +595,25 @@ def _align_worker(project_id: str) -> None:
                 # aligned word in place. Best-effort — failures must not abort
                 # the clip (alignment is the deliverable, speakers are a bonus).
                 if diarizer is not None:
+                    clip_diag: dict = {"source": filename}
                     try:
                         diarize_df = diarizer(str(audio_path))
+                        try:
+                            clip_diag["turns"] = int(len(diarize_df))
+                        except Exception:  # noqa: BLE001
+                            clip_diag["turns"] = None
                         labels = _assign_speakers(
                             aligned.get("word_segments", []), diarize_df
                         )
+                        clip_diag["speakers"] = sorted(labels)
                         print(
                             f"[align]    diarized → {len(labels)} speaker(s): "
                             f"{sorted(labels)}"
                         )
                     except Exception as dia_exc:  # noqa: BLE001
+                        clip_diag["error"] = f"{type(dia_exc).__name__}: {dia_exc}"
                         print(f"[align]    diarization failed (non-fatal): {dia_exc}")
+                    diar_info["per_clip"].append(clip_diag)
 
                 aligned_data: dict = {
                     "language": transcript.get("language", "en"),
@@ -653,10 +696,15 @@ def _align_worker(project_id: str) -> None:
             r2.put_object(
                 Bucket=bucket,
                 Key=merged_key,
-                Body=json.dumps({"words": all_words}).encode(),
+                Body=json.dumps(
+                    {"words": all_words, "diarization": diar_info}
+                ).encode(),
                 ContentType="application/json",
             )
-            print(f"[align] wrote {merged_key} with {len(all_words)} words")
+            print(
+                f"[align] wrote {merged_key} with {len(all_words)} words; "
+                f"diarization={json.dumps(diar_info)[:500]}"
+            )
 
             # 4. Update DB
             for cr in clip_results:
