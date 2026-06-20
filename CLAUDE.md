@@ -200,6 +200,75 @@ local_start/end, source, …}]}`. Filter by `source` (filename); `local_*` are
 times within that clip — use them directly for range `start`/`end` and overlay
 `in`/`out`.
 
+## Making cuts — editorial workflow (don't edit blind)
+
+**#1 rule: a cut is audio + picture, but you only get the audio (transcript)
+for free.** Ground every cut in what's actually *on screen*, not just what's
+said. The recurring failure mode is picking great lines and trusting the
+visuals to follow — they don't (a cat blocks the shot, the camera is on the DAW
+screen instead of the face, it's a blurry pan, it's sideways/letterboxed).
+
+### Visual info sources (cheap → ground truth)
+1. **Transcript** — `GET /api/projects/[id]/transcript`: per-word
+   `local_start/end` + `source`. *What's said and when.* Use for line
+   boundaries — never cut mid-sentence; include the comeback/payoff of a joke.
+2. **Per-clip summary** — `clips.visual_description` / the `context` analysis:
+   1–3 sentence "what's in this clip." Coarse.
+3. **Timestamped beats** — the `with_transcript` analysis `result.highlights`:
+   `{time, kind, description, expression, tone}` per moment (e.g. *"195s — soft
+   affectionate smile as he's called perfect"*). This is how you *find* the
+   face-zoom / reaction / gag by time.
+4. **Actual frames** — the ground truth. Render a short **contact-sheet** of the
+   candidate moments, download it, extract stills
+   (`ffmpeg -ss <t> -i out.mp4 -frames:v 1 f.jpg` via `imageio-ffmpeg`), and
+   **look at them** (Read the .jpg). Do this *before* finalizing.
+
+### Workflow
+1. **Broad:** clip list + durations + visual summaries + transcripts → get the
+   story/arc.
+2. **Detailed:** highlights + exact line timings → list candidate beats w/ times.
+3. **Look:** one contact-sheet render of the candidates → extract + view frames
+   → keep beats whose *picture* works, fix/replace the rest.
+4. **Build → render → spot-check** the changed regions by frame → refine.
+5. **Deliver** the signed `download_url` as a clickable Markdown link.
+
+### Editorial principles (learned the hard way)
+- **Audio and picture must agree.** A great line over the wrong frame is
+  nonsense; quick-cutting between unrelated moments multiplies it. Simple +
+  coherent > clever + scattered.
+- **Complete the beat.** Include the payoff (*"…for the gram?"* needs *"…it
+  looks passable / oh I hate that"*). Don't start or end mid-phrase.
+- **Mind aspect.** Mixed 3:4 + 9:16 sources letterbox each other in one frame.
+  The render auto-fits a *uniform* aspect; for mixed projects group by aspect or
+  accept bars. Verify with `cropdetect`.
+- **Structure:** hook (name the thing) → problem → comedy → payoff → outro/CTA.
+- Match overlay copy to the transcript; keep overlays sparse on quick cuts.
+
+### Capabilities to reach for
+- Edit formats: `ranges_json` (simple trims + overlays) or `timeline_json` via
+  the **edit API** — `POST /api/stories/[id]/edit` ops (`set_speed`, `set_mute`,
+  `set_transition`, `trim`, `insert_blank`, `add_text`, …). See
+  `docs/timeline_editing.md`.
+- Per-clip knobs: `speed` 0.25–20× (slow-mo / fast / **time-lapse**), `mute`
+  (silent time-lapse), `audio_fx` (echo/reverb), `overlay` drawtext cards,
+  `blank` black cards.
+- **Time-lapse:** high `speed` + `mute` = clean silent fast-motion. Or a
+  "jump-cut" time-lapse: string many ~0.5 s snippets across the action (works
+  with `ranges_json` alone — no speed needed).
+
+### Verify, don't trust the plan
+- `cropdetect` → no unwanted letterbox. `volumedetect` → `mute` is really
+  silent. Frame extraction → the picture is what you think. Sanity-check the
+  rendered output every time.
+
+### Tools / interfaces
+- **Data:** the app REST API (Bearer `lsk_…`) covers reads
+  (projects/clips/visual/transcript) *and* writes (create story, render, edit
+  ops) — prefer it; it's resilient when the Supabase MCP connector is flaky.
+- **Frames:** render → `signed-url` → download mp4 → `imageio-ffmpeg` extract →
+  Read the image.
+- **Deliver:** the signed `download_url` as a one-click Markdown link.
+
 ## Gotchas
 
 - **Cloudflare R2 MCP** `r2_buckets_list` → 403 (token lacks R2 perms); read
