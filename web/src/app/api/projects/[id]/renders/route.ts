@@ -36,15 +36,24 @@ export async function GET(
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
 
-  const { data: stories, error } = await supabase
-    .from("stories")
-    .select(
-      "id, title, status, error_message, estimated_duration_secs, " +
-        "ranges_json, created_at",
-    )
-    .eq("project_id", projectId)
-    .is("generation_round_id", null)
-    .order("created_at", { ascending: false });
+  // timeline_revision is the edit version (bumps on every edit op). updated_at
+  // is added by a later migration; select it but fall back gracefully until the
+  // column lands so this route keeps working before/after the migration.
+  const BASE_COLS =
+    "id, title, status, error_message, estimated_duration_secs, " +
+    "ranges_json, created_at, timeline_revision";
+  const q = (cols: string) =>
+    supabase
+      .from("stories")
+      .select(cols)
+      .eq("project_id", projectId)
+      .is("generation_round_id", null)
+      .order("created_at", { ascending: false });
+
+  let { data: stories, error } = await q(`${BASE_COLS}, updated_at`);
+  if (error && /updated_at/i.test(error.message)) {
+    ({ data: stories, error } = await q(BASE_COLS)); // pre-migration fallback
+  }
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
@@ -58,6 +67,8 @@ export async function GET(
     estimated_duration_secs: number | null;
     ranges_json: unknown;
     created_at: string;
+    timeline_revision: number | null;
+    updated_at?: string | null;
   };
 
   const renders = ((stories ?? []) as unknown as StoryRow[]).map((s) => {
@@ -81,6 +92,11 @@ export async function GET(
       duration_secs: s.estimated_duration_secs ?? (durationFromRanges || null),
       source_count: ranges.length,
       created_at: s.created_at,
+      // edit version; bumps on every edit op
+      revision: s.timeline_revision ?? 0,
+      // last change (edit or re-render); falls back to created_at until the
+      // updated_at column exists
+      updated_at: s.updated_at ?? s.created_at,
     };
   });
 
