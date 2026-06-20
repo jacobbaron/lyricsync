@@ -404,7 +404,21 @@ def _load_diarizer(hf_token: str | None, device: str = "cpu") -> tuple[object, d
 
         info["pyannote_version"] = getattr(pyannote.audio, "__version__", "?")
         print(f"[align] loading pyannote diarization pipeline ({DIARIZE_MODEL})…")
-        pipe = Pipeline.from_pretrained(DIARIZE_MODEL, use_auth_token=hf_token)
+        # The auth kwarg was renamed `use_auth_token` → `token` in pyannote.audio
+        # 4.x. Try the current name first, then the legacy one, then no kwarg
+        # (pyannote also reads the HF_TOKEN env var, which is set in-container).
+        pipe = None
+        for kw in ("token", "use_auth_token", None):
+            try:
+                pipe = (
+                    Pipeline.from_pretrained(DIARIZE_MODEL)
+                    if kw is None
+                    else Pipeline.from_pretrained(DIARIZE_MODEL, **{kw: hf_token})
+                )
+                info["auth_kwarg"] = kw or "env"
+                break
+            except TypeError:
+                continue  # wrong kwarg name for this version — try the next
         if pipe is None:
             # pyannote returns None (not raises) when the token can't access the
             # gated repo — usually un-accepted model terms or a token lacking
