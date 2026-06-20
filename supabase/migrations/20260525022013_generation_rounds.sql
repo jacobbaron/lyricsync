@@ -1,9 +1,7 @@
 -- P2-01: Generation rounds + story Phase 2 columns
 --
--- Apply this migration to an existing lyricsync Supabase project that was
--- set up with the original db/schema.sql (Phase 1).
---
--- Run in Supabase SQL Editor: Dashboard → SQL Editor → New query → paste → Run
+-- Layers the Phase 2 tables/columns on top of the baseline (initial_schema)
+-- migration.
 
 -- 1. Add story_prompt to projects
 alter table projects
