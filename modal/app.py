@@ -358,8 +358,76 @@ def _words_from(data: dict) -> list[dict]:
             "word": (w.get("word") or w.get("text") or "").strip(),
             "start": float(w["start"]),
             "end": float(w["end"]),
+            # Per-clip speaker label (e.g. "SPEAKER_00"); None if diarization
+            # was disabled or failed. See _load_diarizer / _assign_speakers.
+            "speaker": w.get("speaker"),
         })
     return out
+
+
+def _load_diarizer(hf_token: str | None, device: str = "cpu"):
+    """Load the WhisperX/pyannote speaker-diarization pipeline once, or None.
+
+    Diarization is an optional enrichment on top of alignment: it tells us "who
+    spoke when" by clustering voice embeddings into turns. It needs a Hugging
+    Face token (HF_TOKEN in lyricsync-secrets) with the gated
+    pyannote/speaker-diarization-3.1 + segmentation-3.0 models accepted.
+
+    Returns None — and the worker proceeds without speaker labels — whenever the
+    token is missing or the pipeline can't load. Alignment is the critical path
+    and must never break because diarization is unavailable.
+    """
+    if not hf_token:
+        print("[align] diarization disabled — no HF_TOKEN in lyricsync-secrets")
+        return None
+    try:
+        try:
+            from whisperx.diarize import DiarizationPipeline
+        except ImportError:  # whisperx has moved this symbol between versions
+            from whisperx import DiarizationPipeline  # type: ignore[attr-defined]
+        print("[align] loading pyannote speaker-diarization pipeline…")
+        return DiarizationPipeline(use_auth_token=hf_token, device=device)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[align] diarizer load failed (non-fatal): {exc}")
+        return None
+
+
+def _assign_speakers(words: list[dict], diarize_df) -> set[str]:
+    """Attach a per-clip 'speaker' label to each word in place; return the labels.
+
+    Matches each word's midpoint to the diarization turn that covers it, falling
+    back to the nearest turn when a word lands in a gap. Labels (SPEAKER_00,
+    SPEAKER_01, …) are only consistent *within this clip* — making them stable
+    across clips (one project-wide voiceprint set) is a later step.
+    """
+    turns: list[tuple[float, float, str]] = []
+    # diarize_df is a pandas DataFrame ([start, end, speaker, …]); fall back to
+    # any row-iterable so we don't hard-depend on its exact type.
+    rows = diarize_df.itertuples(index=False) if hasattr(diarize_df, "itertuples") else diarize_df
+    for row in rows:
+        try:
+            start = float(getattr(row, "start", row[0]))
+            end = float(getattr(row, "end", row[1]))
+            speaker = str(getattr(row, "speaker", row[2]))
+        except (TypeError, IndexError, ValueError):
+            continue
+        turns.append((start, end, speaker))
+    if not turns:
+        return set()
+
+    labels: set[str] = set()
+    for w in words:
+        if "start" not in w or "end" not in w:
+            continue
+        mid = (float(w["start"]) + float(w["end"])) / 2.0
+        speaker = next((t[2] for t in turns if t[0] <= mid <= t[1]), None)
+        if speaker is None:
+            speaker = min(
+                turns, key=lambda t: min(abs(mid - t[0]), abs(mid - t[1]))
+            )[2]
+        w["speaker"] = speaker
+        labels.add(speaker)
+    return labels
 
 
 @app.function(image=align_image, secrets=secrets, timeout=60)
@@ -425,6 +493,13 @@ def _align_worker(project_id: str) -> None:
         language_code="en", device="cpu"
     )
 
+    # Optional speaker diarization ("who spoke when"). Loaded once; None when
+    # HF_TOKEN is absent, in which case words simply carry no speaker label.
+    diarizer = _load_diarizer(
+        os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN"),
+        device="cpu",
+    )
+
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -480,6 +555,23 @@ def _align_worker(project_id: str) -> None:
                     segments, model_a, metadata, wav, "cpu",
                     return_char_alignments=False,
                 )
+
+                # Speaker diarization: assign a per-clip speaker label to each
+                # aligned word in place. Best-effort — failures must not abort
+                # the clip (alignment is the deliverable, speakers are a bonus).
+                if diarizer is not None:
+                    try:
+                        diarize_df = diarizer(str(audio_path))
+                        labels = _assign_speakers(
+                            aligned.get("word_segments", []), diarize_df
+                        )
+                        print(
+                            f"[align]    diarized → {len(labels)} speaker(s): "
+                            f"{sorted(labels)}"
+                        )
+                    except Exception as dia_exc:  # noqa: BLE001
+                        print(f"[align]    diarization failed (non-fatal): {dia_exc}")
+
                 aligned_data: dict = {
                     "language": transcript.get("language", "en"),
                     "duration": transcript.get("duration"),
@@ -550,6 +642,10 @@ def _align_worker(project_id: str) -> None:
                         "local_end": w["end"],
                         "source": cr["filename"],
                         "source_path": cr["r2_key"],
+                        # Per-clip speaker label; (source, speaker) together
+                        # identify a speaker turn — labels are NOT yet shared
+                        # across clips.
+                        "speaker": w.get("speaker"),
                     })
             all_words.sort(key=lambda w: w["global_start"])
 
