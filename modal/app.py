@@ -406,9 +406,27 @@ def _load_diarizer(hf_token: str | None, device: str = "cpu") -> tuple[object, d
         return None, info
     try:
         import pyannote.audio
+        import torch
         from pyannote.audio import Pipeline
 
         info["pyannote_version"] = getattr(pyannote.audio, "__version__", "?")
+        info["torch_version"] = getattr(torch, "__version__", "?")
+
+        # PyTorch 2.6 flipped torch.load's default to weights_only=True, which
+        # rejects pyannote 3.x's pickled checkpoints (non-tensor globals like
+        # torch.to) with an UnpicklingError. We only load official pyannote
+        # models pinned by name (DIARIZE_MODEL), so loading the full pickle is
+        # safe — restore the pre-2.6 behavior for this process.
+        if not getattr(torch.load, "_lyricsync_full_load", False):
+            _orig_torch_load = torch.load
+
+            def _full_torch_load(*args, **kwargs):
+                kwargs.setdefault("weights_only", False)
+                return _orig_torch_load(*args, **kwargs)
+
+            _full_torch_load._lyricsync_full_load = True
+            torch.load = _full_torch_load
+
         print(f"[align] loading pyannote diarization pipeline ({DIARIZE_MODEL})…")
         # The auth kwarg was renamed `use_auth_token` → `token` in pyannote.audio
         # 4.x. Try the current name first, then the legacy one, then no kwarg
