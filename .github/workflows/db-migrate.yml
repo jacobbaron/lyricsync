@@ -51,6 +51,16 @@ jobs:
         with:
           version: latest
 
+      - name: Check required secrets
+        run: |
+          missing=
+          [ -z "$SUPABASE_ACCESS_TOKEN" ] && missing="$missing SUPABASE_ACCESS_TOKEN"
+          [ -z "$SUPABASE_DB_PASSWORD" ] && missing="$missing SUPABASE_DB_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required Actions secret(s):$missing — add them under Settings → Secrets and variables → Actions (repository secrets)."
+            exit 1
+          fi
+
       - name: Link project
         run: supabase link --project-ref "$PROJECT_REF"
 
