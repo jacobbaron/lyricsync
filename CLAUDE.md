@@ -4,7 +4,7 @@
 
 - **Frontend/API**: Next.js 15 (App Router) on Vercel — `web/`
 - **Background compute**: Modal — `modal/app.py`
-- **Database**: Supabase Postgres — migrations in `db/migrations/`
+- **Database**: Supabase Postgres — migrations in `supabase/migrations/`, applied via CI (`.github/workflows/db-migrate.yml`; see `supabase/README.md`)
 - **Storage**: Cloudflare R2
 
 ## Available tools in Claude Code on the web
