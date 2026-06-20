@@ -12,6 +12,8 @@ interface RenderItem {
   duration_secs: number | null;
   source_count: number;
   created_at: string;
+  revision: number;
+  updated_at: string;
 }
 
 // ── constants ──────────────────────────────────────────────────────────────
@@ -127,11 +129,16 @@ export function DirectRenders({ projectId }: Props) {
                     {title}
                   </span>
                   <span className="text-xs text-zinc-400 dark:text-zinc-500 flex items-center gap-2 flex-wrap">
-                    <span>{fmtDate(r.created_at)}</span>
+                    <span title={`Last modified ${fmtDate(r.updated_at)}`}>
+                      edited {fmtDate(r.updated_at)}
+                    </span>
                     {dur && <span className="font-mono">· {dur}</span>}
                     <span>
                       · {r.source_count} {r.source_count === 1 ? "cut" : "cuts"}
                     </span>
+                    {r.revision > 0 && (
+                      <span className="font-mono">· rev {r.revision}</span>
+                    )}
                   </span>
                   {r.status === "error" && r.error_message && (
                     <span className="text-xs text-red-500 truncate">
