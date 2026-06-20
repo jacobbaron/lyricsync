@@ -365,21 +365,22 @@ def _words_from(data: dict) -> list[dict]:
     return out
 
 
-# Pin the diarization model explicitly. Some whisperx versions default
-# DiarizationPipeline to an older gated repo (pyannote/speaker-diarization@2.1),
-# a *different* model than the 3.1 most users accept — so without pinning, a
-# valid token + accepted 3.1 models can still fail to load.
 DIARIZE_MODEL = "pyannote/speaker-diarization-3.1"
 
 
 def _load_diarizer(hf_token: str | None, device: str = "cpu") -> tuple[object, dict]:
-    """Load the WhisperX/pyannote speaker-diarization pipeline once.
+    """Load the pyannote.audio speaker-diarization pipeline once.
 
     Returns (pipeline_or_None, info) where info is a JSON-serializable diagnostic
-    dict (token presence, whisperx version, import path, model, load error). The
-    pipeline is None — and the worker proceeds without speaker labels — whenever
-    the token is missing or the pipeline can't load. Alignment is the critical
-    path and must never break because diarization is unavailable.
+    dict (token presence, pyannote version, model, load error). The pipeline is
+    None — and the worker proceeds without speaker labels — whenever the token is
+    missing or the pipeline can't load. Alignment is the critical path and must
+    never break because diarization is unavailable.
+
+    We call pyannote.audio's Pipeline.from_pretrained directly rather than
+    whisperx's DiarizationPipeline wrapper: the wrapper's constructor signature
+    drifts between whisperx versions (e.g. it dropped the use_auth_token kwarg),
+    whereas the pyannote API is stable. pyannote is installed as a whisperx dep.
 
     Diarization tells us "who spoke when" by clustering voice embeddings into
     turns. It needs a Hugging Face token (HF_TOKEN in lyricsync-secrets) with the
@@ -388,41 +389,60 @@ def _load_diarizer(hf_token: str | None, device: str = "cpu") -> tuple[object, d
     info: dict = {
         "token_present": bool(hf_token),
         "model": DIARIZE_MODEL,
-        "whisperx_version": None,
-        "import_path": None,
+        "backend": "pyannote.audio",
+        "pyannote_version": None,
         "loaded": False,
         "error": None,
     }
-    try:
-        import whisperx
-        info["whisperx_version"] = getattr(whisperx, "__version__", "?")
-    except Exception:  # noqa: BLE001
-        pass
-
     if not hf_token:
         info["error"] = "no HF_TOKEN in env"
         print("[align] diarization disabled — no HF_TOKEN in lyricsync-secrets")
         return None, info
     try:
-        try:
-            from whisperx.diarize import DiarizationPipeline
-            info["import_path"] = "whisperx.diarize"
-        except ImportError:  # whisperx has moved this symbol between versions
-            from whisperx import DiarizationPipeline  # type: ignore[attr-defined]
-            info["import_path"] = "whisperx"
+        import pyannote.audio
+        from pyannote.audio import Pipeline
+
+        info["pyannote_version"] = getattr(pyannote.audio, "__version__", "?")
         print(f"[align] loading pyannote diarization pipeline ({DIARIZE_MODEL})…")
-        try:
-            pipe = DiarizationPipeline(
-                model_name=DIARIZE_MODEL, use_auth_token=hf_token, device=device
+        pipe = Pipeline.from_pretrained(DIARIZE_MODEL, use_auth_token=hf_token)
+        if pipe is None:
+            # pyannote returns None (not raises) when the token can't access the
+            # gated repo — usually un-accepted model terms or a token lacking
+            # gated-repo read scope.
+            info["error"] = (
+                "Pipeline.from_pretrained returned None — token cannot access the "
+                "gated repo (accept the model terms / grant gated-repo read scope)"
             )
-        except TypeError:  # older signature without model_name
-            pipe = DiarizationPipeline(use_auth_token=hf_token, device=device)
+            print(f"[align] diarizer load failed (non-fatal): {info['error']}")
+            return None, info
+        try:
+            import torch
+
+            pipe.to(torch.device(device))
+        except Exception:  # noqa: BLE001 — stay on default device if .to fails
+            pass
         info["loaded"] = True
         return pipe, info
     except Exception as exc:  # noqa: BLE001
         info["error"] = f"{type(exc).__name__}: {exc}"
         print(f"[align] diarizer load failed (non-fatal): {exc}")
         return None, info
+
+
+def _diarize_turns(pipeline: object, wav, sample_rate: int = 16000) -> list:
+    """Run the pyannote pipeline on a mono waveform → list of (start, end, label).
+
+    Takes the already-loaded 16 kHz mono waveform (numpy array from
+    whisperx.load_audio) to avoid re-decoding audio and any file-format issues.
+    """
+    import torch
+
+    waveform = torch.from_numpy(wav).unsqueeze(0)  # (1, num_samples)
+    annotation = pipeline({"waveform": waveform, "sample_rate": sample_rate})
+    return [
+        (float(turn.start), float(turn.end), str(speaker))
+        for turn, _, speaker in annotation.itertracks(yield_label=True)
+    ]
 
 
 def _assign_speakers(words: list[dict], diarize_df) -> set[str]:
@@ -597,13 +617,10 @@ def _align_worker(project_id: str) -> None:
                 if diarizer is not None:
                     clip_diag: dict = {"source": filename}
                     try:
-                        diarize_df = diarizer(str(audio_path))
-                        try:
-                            clip_diag["turns"] = int(len(diarize_df))
-                        except Exception:  # noqa: BLE001
-                            clip_diag["turns"] = None
+                        turns = _diarize_turns(diarizer, wav)
+                        clip_diag["turns"] = len(turns)
                         labels = _assign_speakers(
-                            aligned.get("word_segments", []), diarize_df
+                            aligned.get("word_segments", []), turns
                         )
                         clip_diag["speakers"] = sorted(labels)
                         print(
