@@ -4,6 +4,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { StatusPoller, type ProjectStatus, type ClipStatus } from "./StatusPoller";
+import { StoragePanel } from "./StoragePanel";
 
 export default async function ProjectPage({
   params,
@@ -63,6 +64,8 @@ export default async function ProjectPage({
             duration_secs: c.duration_secs,
           }))}
         />
+
+        <StoragePanel projectId={projectId} />
       </div>
     </main>
   );
