@@ -468,16 +468,41 @@ def _load_diarizer(hf_token: str | None, device: str = "cpu") -> tuple[object, d
         return None, info
 
 
-def _diarize_turns(pipeline: object, wav, sample_rate: int = 16000) -> list:
+def _diarize_turns(
+    pipeline: object,
+    wav,
+    sample_rate: int = 16000,
+    num_speakers: int | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> list:
     """Run the pyannote pipeline on a mono waveform → list of (start, end, label).
 
     Takes the already-loaded 16 kHz mono waveform (numpy array from
     whisperx.load_audio) to avoid re-decoding audio and any file-format issues.
+
+    Optional speaker-count constraints are passed straight to pyannote, which
+    clusters the speaker embeddings under them: `num_speakers` forces exactly
+    that many (cuts the agglomerative dendrogram at k, k-means-style),
+    `min_speakers`/`max_speakers` bound the range instead of pyannote's default
+    distance threshold (which tends to over-split). Pass None to let pyannote
+    decide.
     """
     import torch
 
     waveform = torch.from_numpy(wav).unsqueeze(0)  # (1, num_samples)
-    annotation = pipeline({"waveform": waveform, "sample_rate": sample_rate})
+    constraints = {
+        k: v
+        for k, v in (
+            ("num_speakers", num_speakers),
+            ("min_speakers", min_speakers),
+            ("max_speakers", max_speakers),
+        )
+        if v is not None
+    }
+    annotation = pipeline(
+        {"waveform": waveform, "sample_rate": sample_rate}, **constraints
+    )
     return [
         (float(turn.start), float(turn.end), str(speaker))
         for turn, _, speaker in annotation.itertracks(yield_label=True)
@@ -537,13 +562,36 @@ async def align_and_merge(request: Request) -> JSONResponse:
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id required")
 
-    _align_worker.spawn(project_id)
+    # Optional diarization speaker-count constraints (forwarded to pyannote).
+    def _opt_int(key: str) -> int | None:
+        val = body.get(key)
+        if val is None:
+            return None
+        try:
+            return max(1, int(val))
+        except (TypeError, ValueError):
+            return None
+
+    _align_worker.spawn(
+        project_id,
+        num_speakers=_opt_int("num_speakers"),
+        min_speakers=_opt_int("min_speakers"),
+        max_speakers=_opt_int("max_speakers"),
+    )
     return JSONResponse({"status": "accepted"})
 
 
 @app.function(image=align_image, secrets=secrets, timeout=1800)
-def _align_worker(project_id: str) -> None:
+def _align_worker(
+    project_id: str,
+    num_speakers: int | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> None:
     """Alignment + merge worker (P1-07).
+
+    num_speakers / min_speakers / max_speakers, when set, constrain pyannote's
+    speaker clustering for every clip in this run (see _diarize_turns).
 
     For every clip in the project:
       1. Download original video + raw Whisper transcript from R2.
@@ -593,6 +641,11 @@ def _align_worker(project_id: str) -> None:
         device="cpu",
     )
     diar_info["per_clip"] = []
+    diar_info["constraints"] = {
+        "num_speakers": num_speakers,
+        "min_speakers": min_speakers,
+        "max_speakers": max_speakers,
+    }
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -656,7 +709,12 @@ def _align_worker(project_id: str) -> None:
                 if diarizer is not None:
                     clip_diag: dict = {"source": filename}
                     try:
-                        turns = _diarize_turns(diarizer, wav)
+                        turns = _diarize_turns(
+                            diarizer, wav,
+                            num_speakers=num_speakers,
+                            min_speakers=min_speakers,
+                            max_speakers=max_speakers,
+                        )
                         clip_diag["turns"] = len(turns)
                         labels = _assign_speakers(
                             aligned.get("word_segments", []), turns

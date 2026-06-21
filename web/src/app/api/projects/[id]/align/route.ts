@@ -53,6 +53,24 @@ export async function POST(
     );
   }
 
+  // Optional diarization speaker-count constraints, forwarded to pyannote.
+  // Body is optional; a malformed/empty body just means "no constraints".
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    body = {};
+  }
+  const asPosInt = (v: unknown): number | undefined => {
+    const n = Math.trunc(Number(v));
+    return Number.isFinite(n) && n >= 1 ? n : undefined;
+  };
+  const speakerArgs: Record<string, number> = {};
+  for (const key of ["num_speakers", "min_speakers", "max_speakers"]) {
+    const n = asPosInt(body[key]);
+    if (n !== undefined) speakerArgs[key] = n;
+  }
+
   // Invoke Modal asynchronously — fire and don't await the response body.
   const modalUrl = process.env.MODAL_ALIGN_URL;
   const modalSecret = process.env.MODAL_WEBHOOK_SECRET;
@@ -76,7 +94,7 @@ export async function POST(
         "Content-Type": "application/json",
         "x-webhook-secret": modalSecret,
       },
-      body: JSON.stringify({ project_id: projectId }),
+      body: JSON.stringify({ project_id: projectId, ...speakerArgs }),
     });
 
     if (!res.ok) {
