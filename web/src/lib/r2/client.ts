@@ -1,4 +1,10 @@
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  DeleteObjectsCommand,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 export const UPLOAD_URL_TTL_SECONDS = 3600;
@@ -99,6 +105,59 @@ export async function putObjectJson(key: string, data: unknown): Promise<void> {
     ContentType: "application/json",
   });
   await getClient().send(cmd);
+}
+
+/** Return the size in bytes of an R2 object, or null if it no longer exists.
+ *
+ * Used by the storage dashboard to total usage without persisting sizes in the
+ * DB. A missing object (deleted out-of-band, or a row whose upload never
+ * completed) returns null rather than throwing, so one stale key doesn't break
+ * the whole rollup. */
+export async function headObjectSize(key: string): Promise<number | null> {
+  const bucket = process.env.R2_BUCKET_NAME;
+  if (!bucket) {
+    throw new Error("R2 client misconfigured: R2_BUCKET_NAME not set.");
+  }
+  try {
+    const res = await getClient().send(
+      new HeadObjectCommand({ Bucket: bucket, Key: key }),
+    );
+    return res.ContentLength ?? null;
+  } catch (err) {
+    const status = (err as { $metadata?: { httpStatusCode?: number } })
+      ?.$metadata?.httpStatusCode;
+    const name = (err as { name?: string })?.name;
+    if (status === 404 || name === "NotFound" || name === "NoSuchKey") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/** Delete one or more objects from R2. No-op on an empty list.
+ *
+ * S3's DeleteObjects caps each request at 1000 keys, so larger lists are
+ * chunked. Deleting a non-existent key is not an error. */
+export async function deleteObjects(
+  keys: (string | null | undefined)[],
+): Promise<void> {
+  const present = keys.filter((k): k is string => Boolean(k));
+  if (present.length === 0) return;
+
+  const bucket = process.env.R2_BUCKET_NAME;
+  if (!bucket) {
+    throw new Error("R2 client misconfigured: R2_BUCKET_NAME not set.");
+  }
+  const client = getClient();
+  for (let i = 0; i < present.length; i += 1000) {
+    const chunk = present.slice(i, i + 1000);
+    await client.send(
+      new DeleteObjectsCommand({
+        Bucket: bucket,
+        Delete: { Objects: chunk.map((Key) => ({ Key })), Quiet: true },
+      }),
+    );
+  }
 }
 
 /** Fetch an object from R2 and return its body as a string. */

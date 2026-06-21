@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { deleteObjects } from "@/lib/r2/client";
 
 export const runtime = "nodejs";
 
@@ -105,4 +106,54 @@ export async function POST(
   }
 
   return NextResponse.json({ status: "accepted" });
+}
+
+// ── DELETE /api/stories/[id]/render ───────────────────────────────────────
+// Frees storage by deleting a cut's rendered output (the MP4 in R2) while
+// keeping the story row, its ranges, and its timeline. The cut becomes
+// re-renderable: POST to this route (or the StoryCard render button)
+// regenerates the output from the persisted edit.
+//
+// Only 'done' stories have an output to delete; anything else is a 409.
+
+export async function DELETE(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  const { id: storyId } = await context.params;
+
+  const auth = await resolveAuth(request);
+  if (!auth) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const { supabase } = auth;
+
+  const { data: story } = await supabase
+    .from("stories")
+    .select("id, status, render_r2_key")
+    .eq("id", storyId)
+    .maybeSingle();
+
+  if (!story) {
+    return NextResponse.json({ error: "Story not found" }, { status: 404 });
+  }
+  if (story.status !== "done" || !story.render_r2_key) {
+    return NextResponse.json(
+      { error: "No rendered output to delete for this cut" },
+      { status: 409 },
+    );
+  }
+
+  await deleteObjects([story.render_r2_key]);
+
+  // Drop the output and mark the cut re-renderable; the edit is preserved.
+  const { error } = await supabase
+    .from("stories")
+    .update({ render_r2_key: null, status: "ready" })
+    .eq("id", storyId);
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  return NextResponse.json({ status: "deleted" });
 }

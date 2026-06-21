@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { deleteObjects } from "@/lib/r2/client";
 
 export const runtime = "nodejs";
 
@@ -66,7 +67,7 @@ export async function DELETE(
   // Fetch first to check status (RLS ensures ownership via projects join)
   const { data: clip } = await supabase
     .from("clips")
-    .select("id, status")
+    .select("id, status, r2_key, transcript_r2_key")
     .eq("id", clipId)
     .maybeSingle();
 
@@ -79,6 +80,9 @@ export async function DELETE(
       { status: 409 },
     );
   }
+
+  // Purge the R2 objects before the row so deleting never orphans storage.
+  await deleteObjects([clip.r2_key, clip.transcript_r2_key]);
 
   const { error } = await supabase.from("clips").delete().eq("id", clipId);
   if (error) {

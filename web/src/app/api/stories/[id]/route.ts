@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { deleteObjects } from "@/lib/r2/client";
 
 export const runtime = "nodejs";
 
@@ -116,7 +117,7 @@ export async function DELETE(
 
   const { data: story } = await supabase
     .from("stories")
-    .select("id, status")
+    .select("id, status, render_r2_key")
     .eq("id", storyId)
     .maybeSingle();
 
@@ -129,6 +130,9 @@ export async function DELETE(
       { status: 409 },
     );
   }
+
+  // Purge any rendered output before the row so deleting never orphans storage.
+  await deleteObjects([story.render_r2_key]);
 
   const { error } = await supabase.from("stories").delete().eq("id", storyId);
   if (error) {
