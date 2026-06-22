@@ -668,6 +668,261 @@ def apply_ops(timeline: dict, ops: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Speech cleanup planning
+# ---------------------------------------------------------------------------
+#
+# Given the aligned words that fall inside one clip's source span, decide which
+# sub-spans to KEEP so the span plays tight: collapse over-long pauses, drop
+# filler words, and trim dead air at the head/tail — while leaving genuine
+# non-speech untouched. This is pure analysis over word timings; turning the
+# resulting keep-list into timeline items (jump cuts) is a separate edit op.
+#
+# Vocabulary note: a "gap" here is silence *between two kept words*. We never
+# invent speech boundaries — every keep edge is anchored to a real word's
+# aligned start/end (optionally padded), so the picture stays WYSIWYG.
+
+# Conservative default filler set: non-lexical disfluencies only. Words like
+# "like" / "so" / "you know" are deliberately excluded because they are usually
+# content; callers opt into those explicitly via `filler_lexicon`.
+DEFAULT_FILLERS: tuple[str, ...] = (
+    "um", "umm", "uh", "uhh", "uhm", "er", "err", "erm",
+    "ah", "ahh", "eh", "hmm", "hm", "mm", "mhm", "uh-huh",
+)
+
+SPEECH_CLEANUP_DEFAULTS: dict = {
+    # Silence between kept words longer than this (seconds) gets collapsed…
+    "max_gap": 0.35,
+    # …down to this much retained "breath" (never to 0, which sounds clipped).
+    "collapse_to": 0.15,
+    # Pauses longer than this are treated as intentional and left intact, so a
+    # deliberate beat survives. None disables the guard (collapse everything).
+    "protect_gap_over": 2.0,
+    # Drop filler words entirely.
+    "remove_fillers": True,
+    "filler_lexicon": DEFAULT_FILLERS,
+    # Padding (seconds) added around every kept word so tight cuts don't clip
+    # consonants — forced alignment tends to truncate word edges slightly.
+    "pad_start": 0.04,
+    "pad_end": 0.06,
+    # Confidence handling: words whose alignment score is below `min_score`
+    # get `low_score_pad` extra seconds of padding on each side (be cautious
+    # where the boundary is uncertain). None => ignore scores entirely.
+    "min_score": None,
+    "low_score_pad": 0.06,
+    # Tighten leading/trailing silence inside the span down to the word pad.
+    "trim_lead": True,
+    "trim_tail": True,
+    # Don't bother emitting a cut that would reclaim less than this (avoids
+    # pointless micro jump-cuts that only add visual jitter).
+    "min_removed": 0.08,
+}
+
+
+def _norm_word(text: str) -> str:
+    """Lowercase, keep only alnum + apostrophe + hyphen — for filler matching."""
+    return "".join(
+        ch for ch in (text or "").lower() if ch.isalnum() or ch in "'-"
+    )
+
+
+def _word_bounds(w: dict) -> tuple[float, float]:
+    """Read a word's (start, end) accepting either local_* or plain keys."""
+    start = w.get("start", w.get("local_start"))
+    end = w.get("end", w.get("local_end"))
+    return float(start), float(end)
+
+
+def _filler_flags(words: list[dict], lexicon) -> list[bool]:
+    """Mark which words are fillers, supporting multi-word phrases (e.g.
+    "you know"). Longest phrases match first; matched words can't re-match."""
+    phrases = set()
+    for entry in lexicon or ():
+        toks = tuple(_norm_word(t) for t in str(entry).split())
+        toks = tuple(t for t in toks if t)
+        if toks:
+            phrases.add(toks)
+    by_len = sorted(phrases, key=len, reverse=True)
+
+    norm = [_norm_word(w.get("text", "")) for w in words]
+    flags = [False] * len(words)
+    i = 0
+    while i < len(words):
+        for ph in by_len:
+            L = len(ph)
+            if tuple(norm[i:i + L]) == ph:
+                for j in range(i, i + L):
+                    flags[j] = True
+                i += L
+                break
+        else:
+            i += 1
+    return flags
+
+
+def plan_speech_cleanup(
+    words: list[dict],
+    span_start: float,
+    span_end: float,
+    params: dict | None = None,
+) -> dict:
+    """Plan how to tighten the [span_start, span_end] source span.
+
+    `words` are the aligned words overlapping the span, each
+    `{text, start|local_start, end|local_end, score?}` in source-clip seconds.
+
+    Returns:
+        {
+          "keep":    [{"start", "end"}, ...]  # spans to retain, in order
+          "removed": [{"reason", "start", "end", "text"?}, ...]
+          "duration_before", "duration_after", "saved",
+          "kept_words": int, "filler_words": int,
+        }
+
+    `reason` is one of "filler", "silence", "lead_silence", "tail_silence".
+    If the span contains no speech (no words, or none after filler removal) the
+    whole span is kept untouched — deliberate non-speech is never compressed.
+    """
+    p = {**SPEECH_CLEANUP_DEFAULTS, **(params or {})}
+    span_start, span_end = float(span_start), float(span_end)
+
+    def _clamp(x: float) -> float:
+        return max(span_start, min(span_end, x))
+
+    # Words actually inside the span, in time order.
+    inside: list[dict] = []
+    for w in words:
+        s, e = _word_bounds(w)
+        if e > span_start and s < span_end:
+            inside.append(w)
+    inside.sort(key=lambda w: _word_bounds(w)[0])
+
+    untouched = {
+        "keep": [{"start": round(span_start, 3), "end": round(span_end, 3)}],
+        "removed": [],
+        "duration_before": round(span_end - span_start, 3),
+        "duration_after": round(span_end - span_start, 3),
+        "saved": 0.0,
+        "kept_words": 0,
+        "filler_words": 0,
+    }
+    if not inside:
+        return untouched
+
+    flags = (
+        _filler_flags(inside, p.get("filler_lexicon"))
+        if p.get("remove_fillers")
+        else [False] * len(inside)
+    )
+    filler_words = [w for w, f in zip(inside, flags) if f]
+    speech = [w for w, f in zip(inside, flags) if not f]
+    if not speech:
+        # Nothing but fillers (or nothing): treat as non-speech, leave alone.
+        return untouched
+
+    min_score = p.get("min_score")
+    low_pad = float(p.get("low_score_pad") or 0.0)
+
+    def _padded(w: dict) -> tuple[float, float]:
+        s, e = _word_bounds(w)
+        ps, pe = float(p["pad_start"]), float(p["pad_end"])
+        if min_score is not None and w.get("score") is not None and (
+            float(w["score"]) < float(min_score)
+        ):
+            ps += low_pad
+            pe += low_pad
+        return _clamp(s - ps), _clamp(e + pe)
+
+    max_gap = float(p["max_gap"])
+    collapse_to = max(0.0, float(p["collapse_to"]))
+    protect = p.get("protect_gap_over")
+    protect = float(protect) if protect is not None else None
+    min_removed = max(0.0, float(p["min_removed"]))
+
+    # Build keep intervals word by word, collapsing the gaps between them.
+    keep: list[list[float]] = []
+    for w in speech:
+        s, e = _padded(w)
+        if not keep:
+            keep.append([s, e])
+            continue
+        gap = s - keep[-1][1]
+        if gap <= max_gap or (protect is not None and gap > protect):
+            # Short pause, or an intentional long beat: keep it continuous.
+            keep[-1][1] = max(keep[-1][1], e)
+        else:
+            # Collapse: retain `collapse_to` of breath, cut the rest — but only
+            # if the cut actually reclaims enough to be worth a jump.
+            new_end = min(keep[-1][1] + collapse_to, s)
+            if (s - new_end) >= min_removed:
+                keep[-1][1] = new_end
+                keep.append([s, e])
+            else:
+                keep[-1][1] = max(keep[-1][1], e)
+
+    # Head / tail dead air.
+    if not p.get("trim_lead"):
+        keep[0][0] = span_start
+    if not p.get("trim_tail"):
+        keep[-1][1] = span_end
+
+    keep_rounded = [
+        {"start": round(s, 3), "end": round(e, 3)} for s, e in keep if e > s
+    ]
+
+    # Removed = the span minus what we kept, each piece labelled by cause.
+    removed: list[dict] = []
+    cursor = span_start
+    for seg in keep:
+        if seg[0] > cursor + 1e-6:
+            removed.append(_label_removed(
+                cursor, seg[0], span_start, span_end, filler_words
+            ))
+        cursor = max(cursor, seg[1])
+    if span_end > cursor + 1e-6:
+        removed.append(_label_removed(
+            cursor, span_end, span_start, span_end, filler_words
+        ))
+
+    after = sum(seg["end"] - seg["start"] for seg in keep_rounded)
+    before = span_end - span_start
+    return {
+        "keep": keep_rounded,
+        "removed": removed,
+        "duration_before": round(before, 3),
+        "duration_after": round(after, 3),
+        "saved": round(before - after, 3),
+        "kept_words": len(speech),
+        "filler_words": len(filler_words),
+    }
+
+
+def _label_removed(
+    start: float,
+    end: float,
+    span_start: float,
+    span_end: float,
+    filler_words: list[dict],
+) -> dict:
+    """Classify one removed region by what it overlaps."""
+    hits = []
+    for w in filler_words:
+        ws, we = _word_bounds(w)
+        if we > start and ws < end:
+            hits.append((w.get("text") or "").strip())
+    out = {"start": round(start, 3), "end": round(end, 3)}
+    if hits:
+        out["reason"] = "filler"
+        out["text"] = " ".join(t for t in hits if t)
+    elif abs(start - span_start) < 1e-6:
+        out["reason"] = "lead_silence"
+    elif abs(end - span_end) < 1e-6:
+        out["reason"] = "tail_silence"
+    else:
+        out["reason"] = "silence"
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Compiler: timeline → ffmpeg inputs + filter_complex
 # ---------------------------------------------------------------------------
 
