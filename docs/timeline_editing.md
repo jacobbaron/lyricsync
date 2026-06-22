@@ -84,6 +84,40 @@ invalid, nothing is saved and the error message says which op failed and why.
 | `add_text` | `text`, `start`, `end`, `size`?, `position`?, `wrap`? | Output-time window |
 | `update_text` | `id`, any text fields | Partial update |
 | `remove_text` | `id` | |
+| `clean_speech` | `id`, `params`? | Tighten a speech clip: split it into jump-cut sub-items, dropping filler words + over-long silences. Needs the project transcript. See below |
+
+### `clean_speech` — remove filler / dead air within one clip
+
+Replaces a single clip item with N tight clip items, cutting filler words and
+collapsing over-long pauses **between the words inside that item's source
+span**. Genuine non-speech is never touched: a clip with no words (or only
+fillers) is left as one item. Every cut edge is anchored to a real aligned
+word boundary, so the result stays WYSIWYG.
+
+The first sub-item keeps the original id and `transition_in`; the rest are hard
+cuts (or crossfades if `params.join` is set). `speed` / `mute` / `audio_fx` /
+`note` carry over.
+
+`params` (all optional — defaults in `timeline.SPEECH_CLEANUP_DEFAULTS`):
+
+| Param | Default | Meaning |
+|---|---|---|
+| `max_gap` | 0.35 | Silence between kept words longer than this is collapsed |
+| `collapse_to` | 0.15 | Retained "breath" a collapsed gap shrinks to (never 0) |
+| `protect_gap_over` | 2.0 | Pauses longer than this are treated as intentional and kept (`null` = collapse everything) |
+| `remove_fillers` | true | Drop filler words |
+| `filler_lexicon` | `um, uh, er, …` | Non-lexical fillers by default; add `like` / `you know` etc. explicitly |
+| `pad_start` / `pad_end` | 0.04 / 0.06 | Padding around each kept word so cuts don't clip consonants |
+| `min_score` / `low_score_pad` | null / 0.06 | Words below this alignment confidence get extra padding |
+| `trim_lead` / `trim_tail` | true | Tighten silence before the first / after the last word |
+| `min_removed` | 0.08 | Skip cuts that would reclaim less than this (avoids jitter) |
+| `join` | null | `{"type":"crossfade","duration":s}` to soften the seams instead of hard cuts |
+
+**Preview first.** `POST /api/stories/{id}/clean-speech {id, params?}` dry-runs
+the cleanup without saving — it returns `{plan: {keep, removed, saved,
+kept_words, filler_words}, duration_secs, timeline}` so you can see exactly
+what would be removed and tune `params` before applying. `removed` entries are
+labelled `filler | silence | lead_silence | tail_silence`.
 
 Example — tighten a cut, speed up the middle, crossfade into the ending, and
 add a title:
@@ -111,6 +145,7 @@ Response: `{"revision": 4, "duration_secs": 41.3, "timeline": {...}}`.
 | `GET /api/stories/{id}/timeline` | Current timeline + revision (`timeline` is null until first edit) |
 | `POST /api/stories/{id}/edit` | Apply ops (or `{"restore_revision": n}` to undo); optional `base_revision` for optimistic concurrency (409 on mismatch) |
 | `GET /api/stories/{id}/revisions` | Revision history (ops + timestamps, newest first) |
+| `POST /api/stories/{id}/clean-speech` | Dry-run a `clean_speech` cleanup on one item (no save); returns the plan + would-be timeline |
 | `POST /api/stories/{id}/render` | Render (timeline-aware; unchanged URL) |
 
 Errors come back as `{"detail": "..."}` with messages written to be actionable
@@ -136,4 +171,7 @@ plus a single `filter_complex`:
    the **DB migrate** CI workflow on merge (see `supabase/README.md`).
 2. Deploy Modal (push to `main` touching `modal/**`); note the new
    `edit_timeline` endpoint URL it prints.
-3. Set `MODAL_EDIT_URL` to that URL in the Vercel environment.
+3. Set `MODAL_EDIT_URL` to that URL in the Vercel environment. The
+   `preview_clean_speech` endpoint is on the same app, so its URL is derived
+   from `MODAL_EDIT_URL` automatically (override with `MODAL_PREVIEW_CLEAN_URL`
+   if needed).

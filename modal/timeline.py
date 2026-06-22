@@ -637,19 +637,42 @@ _OPS = {
 }
 
 
-def apply_ops(timeline: dict, ops: list[dict]) -> dict:
+def apply_ops(
+    timeline: dict, ops: list[dict], words: list[dict] | None = None
+) -> dict:
     """Apply edit operations to a copy of the timeline and validate the result.
 
     Raises TimelineError with an LLM-readable message naming the failing op.
     The input timeline is never mutated.
+
+    `words` are the project's aligned words; required only when an op needs
+    transcript timing (currently just `clean_speech`). Passing them is cheap
+    and harmless when no such op is present.
     """
     result = copy.deepcopy(timeline)
+    valid = sorted(list(_OPS) + ["clean_speech"])
     for i, op in enumerate(ops or []):
         name = (op or {}).get("op")
+        if name == "clean_speech":
+            if words is None:
+                raise TimelineError(
+                    f"op {i} (clean_speech): no transcript is loaded for this "
+                    "story, so word timings are unavailable"
+                )
+            try:
+                result, _ = expand_clean_speech(
+                    result, (op or {}).get("id", ""), words, (op or {}).get("params")
+                )
+            except TimelineError as exc:
+                raise TimelineError(f"op {i} ({name}): {exc}") from exc
+            vitems = video_items(result)
+            if vitems and vitems[0].get("transition_in"):
+                vitems[0]["transition_in"] = None
+            continue
         fn = _OPS.get(name)
         if fn is None:
             raise TimelineError(
-                f"op {i}: unknown op {name!r} (valid: {', '.join(sorted(_OPS))})"
+                f"op {i}: unknown op {name!r} (valid: {', '.join(valid)})"
             )
         try:
             fn(result, op)
@@ -920,6 +943,65 @@ def _label_removed(
     else:
         out["reason"] = "silence"
     return out
+
+
+def expand_clean_speech(
+    timeline: dict,
+    item_id: str,
+    words: list[dict],
+    params: dict | None = None,
+) -> tuple[dict, dict]:
+    """Replace one clip item with tight jump-cut sub-items per the cleanup plan.
+
+    Pure: returns a NEW timeline (the input is not mutated) plus the
+    `plan_speech_cleanup` result so callers can report what was removed.
+
+    `words` are aligned words (with `source` + local times); only those whose
+    `source` matches the item are used. The first sub-item inherits the
+    original item's `transition_in`; subsequent ones are hard cuts unless
+    `params["join"]` supplies a crossfade transition to soften the seams. All
+    other per-clip fields (speed, mute, audio_fx, note) carry over unchanged.
+    """
+    result = copy.deepcopy(timeline)
+    idx, item = _find_video(result, item_id)
+    _require_clip(item, "clean_speech")
+
+    span_start = float(item["src_start"])
+    span_end = float(item["src_end"])
+    src = item.get("source")
+    relevant = [w for w in (words or []) if w.get("source") in (None, src)]
+
+    try:
+        plan = plan_speech_cleanup(relevant, span_start, span_end, params)
+    except (ValueError, TypeError) as exc:
+        raise TimelineError(f"clean_speech on {item_id}: bad params ({exc})")
+
+    keep = plan["keep"]
+    if not keep:
+        raise TimelineError(f"clean_speech on {item_id}: nothing left to keep")
+
+    join = (params or {}).get("join")
+
+    items = video_items(result)
+    new_items: list[dict] = []
+    for k, seg in enumerate(keep):
+        sub = copy.deepcopy(item)
+        sub["src_start"] = seg["start"]
+        sub["src_end"] = seg["end"]
+        if k == 0:
+            sub["id"] = item["id"]  # keep the original id on the first piece
+            sub["transition_in"] = item.get("transition_in")
+        else:
+            sub["transition_in"] = join if isinstance(join, dict) else None
+        new_items.append(sub)
+
+    # Fresh ids for the 2nd..Nth pieces. The original id is still present, so
+    # _new_id picks numbers strictly above it — no collisions.
+    items[idx:idx + 1] = new_items
+    for sub in new_items[1:]:
+        sub["id"] = _new_id(result, "v")
+
+    return result, plan
 
 
 # ---------------------------------------------------------------------------

@@ -240,3 +240,155 @@ class TestBookkeeping:
             words, 0.0, 3.0, {"pad_start": 0.0, "pad_end": 0.0},
         )
         assert plan["keep"] == [{"start": 1.0, "end": 1.4}]
+
+
+# ---------------------------------------------------------------------------
+# expand_clean_speech — turning a plan into jump-cut timeline items
+# ---------------------------------------------------------------------------
+
+def one_clip_timeline(src_start=0.0, src_end=5.0, source="IMG_0001.mov"):
+    return {
+        "version": 1, "width": 1080, "height": 1920, "fps": 30,
+        "tracks": [{"type": "video", "items": [
+            {"id": "v1", "kind": "clip", "source": source,
+             "src_start": src_start, "src_end": src_end, "speed": 1.0,
+             "transition_in": None, "note": "hello world"},
+        ]}],
+    }
+
+
+def sword(text, source, start, end, score=None):
+    d = {"text": text, "source": source, "local_start": start, "local_end": end}
+    if score is not None:
+        d["score"] = score
+    return d
+
+
+class TestExpandCleanSpeech:
+    def test_splits_into_jump_cuts(self):
+        t = one_clip_timeline(0.0, 5.0)
+        words = [
+            sword("a", "IMG_0001.mov", 0.5, 0.9),
+            sword("b", "IMG_0001.mov", 3.6, 4.0),
+        ]
+        out, plan = tl.expand_clean_speech(
+            t, "v1", words,
+            {"pad_start": 0.0, "pad_end": 0.0, "collapse_to": 0.15,
+             "protect_gap_over": None, "trim_lead": True, "trim_tail": True},
+        )
+        items = tl.video_items(out)
+        assert len(items) == 2
+        assert items[0]["id"] == "v1"  # first piece keeps the original id
+        assert items[1]["id"] == "v2"
+        # input timeline untouched (pure)
+        assert len(tl.video_items(t)) == 1
+        assert plan["saved"] > 0
+        # carries over note + source
+        assert all(it["source"] == "IMG_0001.mov" for it in items)
+        assert all(it["note"] == "hello world" for it in items)
+
+    def test_only_matching_source_words_used(self):
+        t = one_clip_timeline(0.0, 5.0, source="IMG_0001.mov")
+        words = [
+            sword("a", "IMG_0001.mov", 0.5, 0.9),
+            sword("loud", "OTHER.mov", 2.0, 2.4),  # different clip — ignored
+            sword("b", "IMG_0001.mov", 3.6, 4.0),
+        ]
+        out, plan = tl.expand_clean_speech(
+            t, "v1", words,
+            {"pad_start": 0.0, "pad_end": 0.0, "protect_gap_over": None},
+        )
+        assert plan["kept_words"] == 2
+        assert len(tl.video_items(out)) == 2
+
+    def test_preserves_transition_and_speed_on_first(self):
+        t = one_clip_timeline(0.0, 5.0)
+        it = tl.video_items(t)[0]
+        it["speed"] = 1.5
+        words = [
+            sword("a", "IMG_0001.mov", 0.5, 0.9),
+            sword("b", "IMG_0001.mov", 3.6, 4.0),
+        ]
+        out, _ = tl.expand_clean_speech(
+            t, "v1", words,
+            {"pad_start": 0.0, "pad_end": 0.0, "protect_gap_over": None},
+        )
+        items = tl.video_items(out)
+        assert all(it["speed"] == 1.5 for it in items)
+        assert items[1]["transition_in"] is None  # hard cut by default
+
+    def test_join_crossfade_applied_between_pieces(self):
+        t = one_clip_timeline(0.0, 5.0)
+        words = [
+            sword("a", "IMG_0001.mov", 0.5, 1.5),
+            sword("b", "IMG_0001.mov", 3.6, 4.6),
+        ]
+        out, _ = tl.expand_clean_speech(
+            t, "v1", words,
+            {"pad_start": 0.0, "pad_end": 0.0, "protect_gap_over": None,
+             "join": {"type": "crossfade", "duration": 0.2}},
+        )
+        items = tl.video_items(out)
+        assert items[1]["transition_in"] == {"type": "crossfade", "duration": 0.2}
+
+    def test_non_speech_span_yields_single_item(self):
+        t = one_clip_timeline(0.0, 5.0)
+        out, plan = tl.expand_clean_speech(t, "v1", [], None)
+        items = tl.video_items(out)
+        assert len(items) == 1
+        assert items[0]["src_start"] == 0.0 and items[0]["src_end"] == 5.0
+        assert plan["saved"] == 0.0
+
+    def test_non_clip_item_rejected(self):
+        t = one_clip_timeline(0.0, 5.0)
+        tl.video_items(t)[0].update({"kind": "blank", "duration": 5.0})
+        with pytest.raises(tl.TimelineError, match="only applies to clip"):
+            tl.expand_clean_speech(t, "v1", [], None)
+
+
+class TestApplyOpsCleanSpeech:
+    def test_clean_speech_via_apply_ops(self):
+        t = one_clip_timeline(0.0, 5.0)
+        words = [
+            sword("a", "IMG_0001.mov", 0.5, 0.9),
+            sword("b", "IMG_0001.mov", 3.6, 4.0),
+        ]
+        out = tl.apply_ops(
+            t,
+            [{"op": "clean_speech", "id": "v1",
+              "params": {"pad_start": 0.0, "pad_end": 0.0,
+                         "protect_gap_over": None}}],
+            words=words,
+        )
+        assert len(tl.video_items(out)) == 2
+        assert tl.validate_timeline(out) == []
+
+    def test_clean_speech_without_words_errors(self):
+        t = one_clip_timeline(0.0, 5.0)
+        with pytest.raises(tl.TimelineError, match="no transcript"):
+            tl.apply_ops(t, [{"op": "clean_speech", "id": "v1"}])
+
+    def test_clean_speech_unknown_item_errors(self):
+        t = one_clip_timeline(0.0, 5.0)
+        with pytest.raises(tl.TimelineError, match="no video item"):
+            tl.apply_ops(
+                t, [{"op": "clean_speech", "id": "vX"}], words=[],
+            )
+
+    def test_result_revalidates(self):
+        # A crossfade join longer than a tiny breath piece must be caught by
+        # validation (crossfade must be shorter than both adjacent items).
+        t = one_clip_timeline(0.0, 5.0)
+        words = [
+            sword("a", "IMG_0001.mov", 0.5, 0.7),
+            sword("b", "IMG_0001.mov", 3.6, 3.8),
+        ]
+        with pytest.raises(tl.TimelineError, match="invalid|crossfade"):
+            tl.apply_ops(
+                t,
+                [{"op": "clean_speech", "id": "v1",
+                  "params": {"pad_start": 0.0, "pad_end": 0.0,
+                             "protect_gap_over": None,
+                             "join": {"type": "crossfade", "duration": 2.5}}}],
+                words=words,
+            )
