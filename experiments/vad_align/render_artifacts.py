@@ -65,7 +65,7 @@ def main():
         # A/B over the first ~30s, but never truncate a kept span mid-word:
         # include whole keep spans that START before the cap, and make the
         # "original" cover the exact same time range.
-        cap = min(dur, 30.0)
+        cap = min(dur, 60.0)
         seg = [(s, e) for s, e in keep if s < cap]
         end = seg[-1][1] if seg else cap
         orig = wav[: int(end * SR)]
