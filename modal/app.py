@@ -2152,3 +2152,188 @@ def _render_worker(story_id: str) -> None:
         }).eq("id", story_id).execute()
 
 
+
+# ---------------------------------------------------------------------------
+# Clip audio analysis (waveform + Silero VAD curve) for the clip viz UI
+# ---------------------------------------------------------------------------
+#
+# Produces, per clip: a compressed audio proxy for browser playback, an RMS
+# waveform envelope, and a Silero VAD speech-probability curve + intervals.
+# All the data shaping lives in audio_analysis.py (pure, unit-tested); this
+# worker owns only the fragile parts — ffmpeg decode and ONNX inference — and
+# degrades gracefully (prob=None, energy-gated intervals) if VAD can't run.
+#
+# Silero VAD is permissionless (no HF token / gated repo, unlike diarization);
+# the package bundles its own ONNX model. We touch only the stable per-window
+# model() primitive and derive intervals with our own tested gate.
+
+audio_viz_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    .pip_install(
+        "fastapi[standard]>=0.115",
+        "boto3>=1.34",
+        "supabase>=2.10",
+        "numpy>=1.26",
+        "onnxruntime>=1.17",
+        "silero-vad>=5.1",
+    )
+    # app.py imports transcript + timeline at module level (cloudpickled), so
+    # every image that runs an app.py function must mount them.
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
+    # Imported lazily inside the worker — only this image needs it.
+    .add_local_file(
+        Path(__file__).parent / "audio_analysis.py", "/root/audio_analysis.py"
+    )
+)
+
+
+def _silero_prob_curve(audio, sr: int) -> list[float]:
+    """Per-window Silero VAD speech probabilities for 16 kHz mono float32 audio.
+
+    Uses only the stable per-window model() call (512-sample windows = 32 ms),
+    so we don't depend on higher-level helpers whose signatures drift between
+    releases. Raises on any failure; the caller treats that as "no curve".
+    """
+    import numpy as np
+    import torch
+    from silero_vad import load_silero_vad
+
+    model = load_silero_vad(onnx=True)
+    model.reset_states()
+    win = 512  # Silero's required window size at 16 kHz
+    probs: list[float] = []
+    for i in range(0, len(audio) - win + 1, win):
+        chunk = torch.from_numpy(np.ascontiguousarray(audio[i:i + win])).unsqueeze(0)
+        with torch.no_grad():
+            probs.append(float(model(chunk, sr).item()))
+    return probs
+
+
+@app.function(image=audio_viz_image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def analyze_clip_audio(request: Request) -> JSONResponse:
+    """Vercel calls this to (re)build a clip's audio proxy + VAD analysis.
+
+    Spawns the worker and returns immediately. Body: {clip_id}.
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    clip_id = body.get("clip_id")
+    if not clip_id:
+        raise HTTPException(status_code=400, detail="clip_id required")
+
+    _analyze_clip_audio_worker.spawn(clip_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(image=audio_viz_image, secrets=secrets, timeout=600)
+def _analyze_clip_audio_worker(clip_id: str) -> None:
+    """Extract audio proxy + waveform + VAD curve for one clip; store in R2.
+
+    Outputs (R2):
+      projects/<pid>/clips/<cid>/audio.m4a            playback proxy
+      projects/<pid>/clips/<cid>/audio_analysis.json  see audio_analysis.py
+    """
+    import subprocess
+    import wave
+
+    import numpy as np
+    from audio_analysis import build_analysis, intervals_from_curve, words_in_clip
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    row = sb.table("clips").select(
+        "id, project_id, r2_key, filename, duration_secs"
+    ).eq("id", clip_id).limit(1).execute()
+    if not row.data:
+        print(f"[audio] clip {clip_id} not found — skipping")
+        return
+    clip = row.data[0]
+    pid = clip["project_id"]
+    filename = clip["filename"]
+
+    words = words_in_clip(_load_words(pid), filename)
+
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        src = tdp / "source"
+        wav = tdp / "audio16k.wav"
+        m4a = tdp / "audio.m4a"
+        r2.download_file(bucket, clip["r2_key"], str(src))
+
+        # 16 kHz mono PCM for VAD; AAC mono proxy for browser playback.
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+             str(wav)], check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-b:a", "64k",
+             str(m4a)], check=True, capture_output=True,
+        )
+
+        with wave.open(str(wav), "rb") as wf:
+            sr = wf.getframerate()
+            audio = (
+                np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                .astype(np.float32) / 32768.0
+            )
+        duration = (len(audio) / sr) if sr else float(clip.get("duration_secs") or 0.0)
+
+        # Waveform: peak amplitude per 20 ms hop, normalized to [0, 1].
+        wf_hop = 0.02
+        hop_n = max(1, int(sr * wf_hop))
+        peaks = [
+            float(np.max(np.abs(audio[i:i + hop_n]))) if i < len(audio) else 0.0
+            for i in range(0, len(audio), hop_n)
+        ]
+        mx = max(peaks) if peaks else 0.0
+        peaks = [round(p / mx, 4) for p in peaks] if mx > 0 else peaks
+
+        # VAD curve (best effort) → intervals via our tested gate.
+        vad_hop = 512 / 16000  # 0.032 s
+        try:
+            prob = _silero_prob_curve(audio, sr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[audio] silero VAD unavailable, falling back to energy gate: {exc}")
+            prob = None
+
+        if prob:
+            intervals = intervals_from_curve(
+                prob, vad_hop, threshold=0.5, min_speech=0.1,
+                min_silence=0.1, pad=0.0, total=duration,
+            )
+        else:
+            # Last-resort: gate the waveform energy so the UI still shows speech
+            # regions (coarser, but no model needed).
+            gate = [1.0 if p > 0.08 else 0.0 for p in peaks]
+            intervals = intervals_from_curve(
+                gate, wf_hop, threshold=0.5, min_speech=0.15,
+                min_silence=0.2, pad=0.0, total=duration,
+            )
+
+        audio_key = f"projects/{pid}/clips/{clip_id}/audio.m4a"
+        analysis_key = f"projects/{pid}/clips/{clip_id}/audio_analysis.json"
+        r2.upload_file(
+            str(m4a), bucket, audio_key,
+            ExtraArgs={"ContentType": "audio/mp4"},
+        )
+        doc = build_analysis(
+            duration, audio_key, wf_hop, peaks, vad_hop, prob, intervals, words,
+        )
+        r2.put_object(
+            Bucket=bucket, Key=analysis_key,
+            Body=json.dumps(doc).encode(), ContentType="application/json",
+        )
+        print(
+            f"[audio] clip {clip_id} ✓ {len(peaks)} peaks, "
+            f"prob={'yes' if prob else 'energy-gate'}, "
+            f"{len(intervals)} speech intervals, {len(words)} words"
+        )
