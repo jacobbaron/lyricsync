@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { UploadArea } from "./UploadArea";
 import { TranscriptViewer } from "./TranscriptViewer";
@@ -361,6 +362,14 @@ export function StatusPoller({ projectId, initialProject, initialClips }: Props)
                     <p className="text-xs text-red-500 truncate">
                       {clip.error_message}
                     </p>
+                  )}
+                  {clip.duration_secs != null && (
+                    <Link
+                      href={`/projects/${projectId}/clips/${clip.id}`}
+                      className="mt-0.5 inline-flex w-fit items-center gap-1 rounded-md bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-600 dark:bg-blue-950 dark:text-blue-400"
+                    >
+                      📊 Inspect waveform &amp; speech ▸
+                    </Link>
                   )}
                   {/* Recovery: clips stranded in Queued (lost transcribe
                       trigger) or Error are retryable/removable in place —
