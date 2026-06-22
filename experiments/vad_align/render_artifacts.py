@@ -62,14 +62,17 @@ def main():
         dur = a["duration"]
         keep = keep_asym(a, dur)
 
-        # A/B over the first 30s of OUTPUT-equivalent material (cap for size).
+        # A/B over the first ~30s, but never truncate a kept span mid-word:
+        # include whole keep spans that START before the cap, and make the
+        # "original" cover the exact same time range.
         cap = min(dur, 30.0)
-        seg = [(s, min(e, cap)) for s, e in keep if s < cap]
-        orig = wav[: int(cap * SR)]
+        seg = [(s, e) for s, e in keep if s < cap]
+        end = seg[-1][1] if seg else cap
+        orig = wav[: int(end * SR)]
         cropped = np.concatenate([wav[int(s * SR): int(e * SR)] for s, e in seg]) if seg else orig
         write_m4a(orig, OUT / f"{n}_A_original.m4a")
         write_m4a(cropped, OUT / f"{n}_B_silencecrop.m4a")
-        print(f"{n}: original {cap:.0f}s -> cropped {len(cropped)/SR:.1f}s "
+        print(f"{n}: original {end:.1f}s -> cropped {len(cropped)/SR:.1f}s "
               f"({len(seg)} kept spans)")
 
         # Onset demo: 3 edge words with the largest lead, transcript-start vs VAD-onset.
