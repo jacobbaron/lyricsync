@@ -47,20 +47,14 @@ def write_m4a(samples: np.ndarray, path: Path):
     tmp.unlink()
 
 
-def keep_asym(a, dur):
-    """Speech intervals with asymmetric padding (tight onset, padded offset)."""
-    sp = H.to_pairs(H.intervals_from_curve(
-        a["vad"]["prob"], a["vad"]["hop"], threshold=TAU, neg_threshold=TAU_OFF,
-        min_speech=0.10, min_silence=MIN_SIL, pad=0.0, total=dur))
-    padded = [(max(0.0, s - PAD_ON), min(dur, e + PAD_OFF)) for s, e in sp]
-    return H.merge(padded)
-
-
 def main():
     for n in sorted(p.stem for p in DATA.glob("*.json")):
         a, wav = load(n)
         dur = a["duration"]
-        keep = keep_asym(a, dur)
+        wavf = wav.astype(np.float32) / 32768.0
+        keep = H.fused_keep(a["vad"]["prob"], a["vad"]["hop"], a["words"],
+                            wavf, SR, dur, tau=TAU, tau_off=TAU_OFF,
+                            min_silence=MIN_SIL)
 
         # A/B over the first ~30s, but never truncate a kept span mid-word:
         # include whole keep spans that START before the cap, and make the

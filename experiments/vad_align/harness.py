@@ -131,6 +131,41 @@ def vad_keep(prob, hop, dur, tau=0.5, tau_off=None, min_speech=0.10,
     return keep
 
 
+def _overlaps_word(s: float, e: float, words, slack: float = 0.15) -> bool:
+    for w in words:
+        if float(w["end"]) + slack >= s and float(w["start"]) - slack <= e:
+            return True
+    return False
+
+
+def fused_keep(prob, hop, words, wav: np.ndarray, sr: int, dur: float,
+               tau: float = 0.5, tau_off: float = 0.35, eng_db: float = 12.0,
+               pad: float = 0.05, min_silence: float = 0.25) -> list[Interval]:
+    """Three-signal silence crop (the chosen strategy).
+
+    A region is KEPT if Silero VAD calls it speech, OR an RMS-energy burst
+    coincides with a transcript word (recovers fricative onsets/offsets and
+    low/unvoiced speech that VAD misses, e.g. a leading /s/, while ignoring
+    wordless room tone). Everything else — where all three say "nothing" — is
+    cut. Spans are padded and gaps shorter than `min_silence` are re-closed so
+    natural micro-pauses survive.
+    """
+    vad = to_pairs(intervals_from_curve(
+        prob, hop, threshold=tau, neg_threshold=tau_off,
+        min_speech=0.10, min_silence=min_silence, pad=0.0, total=dur))
+    eng = energy_speech(wav, sr, margin_db=eng_db, min_speech=0.05,
+                        min_silence=min_silence)
+    eng = [(s, e) for s, e in eng if _overlaps_word(s, e, words)]
+    keep = merge([(max(0.0, s - pad), min(dur, e + pad)) for s, e in (vad + eng)])
+    closed: list[Interval] = []
+    for s, e in keep:
+        if closed and s - closed[-1][1] < min_silence:
+            closed[-1] = (closed[-1][0], e)
+        else:
+            closed.append((s, e))
+    return closed
+
+
 # --------------------------------------------------------------------------
 # Word boundary reconciliation (Experiment B)
 # --------------------------------------------------------------------------
