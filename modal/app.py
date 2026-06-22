@@ -57,6 +57,7 @@ from timeline import (
     apply_ops,
     choose_canvas,
     compile_timeline,
+    expand_clean_speech,
     timeline_duration,
     timeline_from_ranges,
     validate_timeline,
@@ -126,6 +127,23 @@ def _supabase():
         os.environ["SUPABASE_URL"],
         os.environ["SUPABASE_SERVICE_ROLE_KEY"],
     )
+
+
+def _load_words(project_id: str) -> list[dict]:
+    """Read the project's aligned word list from merged.json in R2.
+
+    Returns [] when the transcript is missing — callers that need word timings
+    (clean_speech) should surface a clear error in that case.
+    """
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+    key = f"projects/{project_id}/merged.json"
+    try:
+        obj = r2.get_object(Bucket=bucket, Key=key)
+    except Exception:
+        return []
+    merged = json.loads(obj["Body"].read())
+    return merged.get("words", []) or []
 
 
 def _set_clip(sb, clip_id: str, **fields) -> None:
@@ -1808,7 +1826,12 @@ async def edit_timeline(request: Request) -> JSONResponse:
                         detail="story has neither a timeline nor ranges",
                     )
                 base = timeline_from_ranges(ranges)
-            new_timeline = apply_ops(base, ops)
+            # clean_speech needs the aligned transcript; load it only when used.
+            needs_words = any(
+                (o or {}).get("op") == "clean_speech" for o in ops
+            )
+            words = _load_words(story["project_id"]) if needs_words else None
+            new_timeline = apply_ops(base, ops, words=words)
             ops_record = ops
     except TimelineError as exc:
         # The op/validation message is written for the LLM caller — pass it up.
@@ -1828,6 +1851,68 @@ async def edit_timeline(request: Request) -> JSONResponse:
 
     return JSONResponse({
         "revision": new_rev,
+        "duration_secs": round(timeline_duration(new_timeline), 3),
+        "timeline": new_timeline,
+    })
+
+
+@app.function(image=image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def preview_clean_speech(request: Request) -> JSONResponse:
+    """Dry-run a `clean_speech` cleanup on one clip item — nothing is saved.
+
+    Lets a caller (human or LLM) see exactly what filler/silence would be cut,
+    how much time is saved, and the resulting timeline, then tune the params
+    before committing the change via POST /edit {op: clean_speech}.
+
+    Body:
+        story_id  (required)
+        id        (required) the video item to clean
+        params    optional cleanup params (see timeline.SPEECH_CLEANUP_DEFAULTS)
+
+    Returns:
+        { item_id, revision, plan: {keep, removed, duration_before,
+          duration_after, saved, kept_words, filler_words}, timeline }
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    story_id = body.get("story_id")
+    item_id = body.get("id")
+    if not story_id or not item_id:
+        raise HTTPException(status_code=400, detail="story_id and id required")
+    params = body.get("params") or {}
+
+    sb = _supabase()
+    row = sb.table("stories").select(
+        "id, project_id, ranges_json, timeline_json, timeline_revision"
+    ).eq("id", story_id).limit(1).execute()
+    if not row.data:
+        raise HTTPException(status_code=404, detail="story not found")
+    story = row.data[0]
+
+    base = story.get("timeline_json")
+    if base is None:
+        ranges = story.get("ranges_json") or []
+        if not ranges:
+            raise HTTPException(
+                status_code=400, detail="story has neither a timeline nor ranges"
+            )
+        base = timeline_from_ranges(ranges)
+
+    words = _load_words(story["project_id"])
+    try:
+        new_timeline, plan = expand_clean_speech(base, item_id, words, params)
+    except TimelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return JSONResponse({
+        "item_id": item_id,
+        "revision": story.get("timeline_revision") or 0,
+        "plan": plan,
         "duration_secs": round(timeline_duration(new_timeline), 3),
         "timeline": new_timeline,
     })
