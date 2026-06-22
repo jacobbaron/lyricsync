@@ -392,3 +392,83 @@ class TestApplyOpsCleanSpeech:
                              "join": {"type": "crossfade", "duration": 2.5}}}],
                 words=words,
             )
+
+
+# ---------------------------------------------------------------------------
+# VAD-fused silence crop (plan_speech_cleanup_vad / fused_speech_keep)
+# ---------------------------------------------------------------------------
+
+def _curve(spans, dur, hop, high, low):
+    """Build a piecewise-constant curve: `high` inside spans, `low` elsewhere."""
+    n = int(round(dur / hop))
+    arr = [low] * n
+    for s, e in spans:
+        for i in range(int(s / hop), min(n, int(round(e / hop)))):
+            arr[i] = high
+    return arr
+
+
+class TestVadFusion:
+    def test_keeps_vad_speech_drops_silence(self):
+        # speech at 1-2s and 4-5s in a 6s clip; everything else silence.
+        vad = _curve([(1.0, 2.0), (4.0, 5.0)], 6.0, 0.1, 0.9, 0.05)
+        peaks = _curve([(1.0, 2.0), (4.0, 5.0)], 6.0, 0.02, 0.8, 0.01)
+        words = [w("a", 1.0, 2.0), w("b", 4.0, 5.0)]
+        plan = tl.plan_speech_cleanup_vad(words, vad, 0.1, peaks, 0.02, 0.0, 6.0)
+        assert len(plan["keep"]) == 2
+        assert plan["keep"][0]["start"] == 0.95   # 0.05 pad before 1.0
+        assert plan["keep"][1]["end"] == 5.05
+        assert plan["saved"] > 3.5
+        assert plan["kept_words"] == 2
+
+    def test_recovers_word_backed_energy_vad_missed(self):
+        # VAD only fires 4-5s, but there is a word + energy at 2.0-2.4 (e.g. a
+        # quiet fricative VAD dropped) -> fusion keeps it.
+        vad = _curve([(4.0, 5.0)], 6.0, 0.1, 0.9, 0.05)
+        peaks = _curve([(2.0, 2.4), (4.0, 5.0)], 6.0, 0.02, 0.8, 0.01)
+        words = [w("see", 2.0, 2.4), w("b", 4.0, 5.0)]
+        keep = tl.fused_speech_keep(vad, 0.1, peaks, 0.02, words)
+        assert any(s <= 2.1 <= e for s, e in keep)
+
+    def test_rejects_wordless_energy(self):
+        # Energy burst at 2.0-2.4 with NO transcript word (room tone / thump)
+        # -> not kept.
+        vad = _curve([(4.0, 5.0)], 6.0, 0.1, 0.9, 0.05)
+        peaks = _curve([(2.0, 2.4), (4.0, 5.0)], 6.0, 0.02, 0.8, 0.01)
+        words = [w("b", 4.0, 5.0)]
+        keep = tl.fused_speech_keep(vad, 0.1, peaks, 0.02, words)
+        assert not any(s <= 2.1 <= e for s, e in keep)
+
+    def test_no_speech_keeps_whole_span(self):
+        vad = _curve([], 6.0, 0.1, 0.9, 0.05)
+        peaks = _curve([], 6.0, 0.02, 0.8, 0.01)
+        plan = tl.plan_speech_cleanup_vad([], vad, 0.1, peaks, 0.02, 0.0, 6.0)
+        assert plan["keep"] == [{"start": 0.0, "end": 6.0}]
+        assert plan["saved"] == 0.0
+
+    def test_micro_pause_kept_continuous(self):
+        # two speech runs 0.1s apart (< min_silence 0.25) -> single keep span.
+        vad = _curve([(1.0, 1.5), (1.6, 2.1)], 6.0, 0.1, 0.9, 0.05)
+        peaks = _curve([(1.0, 1.5), (1.6, 2.1)], 6.0, 0.02, 0.8, 0.01)
+        words = [w("a", 1.0, 1.5), w("b", 1.6, 2.1)]
+        keep = tl.fused_speech_keep(vad, 0.1, peaks, 0.02, words)
+        # the 0.1s gap is closed -> one continuous span around 1.0-2.1
+        assert len(keep) == 1
+
+    def test_expand_uses_vad_when_audio_supplied(self):
+        tl_obj = {
+            "version": 1, "width": 1080, "height": 1920, "fps": 30,
+            "tracks": [{"type": "video", "items": [
+                {"id": "v1", "kind": "clip", "source": "A.mov",
+                 "src_start": 0.0, "src_end": 6.0, "speed": 1.0,
+                 "transition_in": None}]}],
+        }
+        vad = _curve([(1.0, 2.0), (4.0, 5.0)], 6.0, 0.1, 0.9, 0.05)
+        peaks = _curve([(1.0, 2.0), (4.0, 5.0)], 6.0, 0.02, 0.8, 0.01)
+        words = [{"text": "a", "source": "A.mov", "start": 1.0, "end": 2.0},
+                 {"text": "b", "source": "A.mov", "start": 4.0, "end": 5.0}]
+        audio = {"vad_prob": vad, "vad_hop": 0.1, "peaks": peaks, "peaks_hop": 0.02}
+        out = tl.apply_ops(tl_obj, [{"op": "clean_speech", "id": "v1"}],
+                           words=words, audio_by_source={"A.mov": audio})
+        items = tl.video_items(out)
+        assert len(items) == 2  # two kept speech spans -> jump cut

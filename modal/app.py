@@ -146,6 +146,64 @@ def _load_words(project_id: str) -> list[dict]:
     return merged.get("words", []) or []
 
 
+def _load_audio_by_source(
+    project_id: str, timeline: dict, ops: list[dict]
+) -> dict:
+    """For each clip a clean_speech op targets, load its stored audio analysis
+    so the edit can use the VAD-fused silence crop.
+
+    Returns {filename: {vad_prob, vad_hop, peaks, peaks_hop}} for the clips that
+    have been analyzed; clips without an analysis are simply absent, and
+    apply_ops falls back to word-gap timing for those.
+    """
+    from timeline import video_items
+
+    target_ids = {
+        (o or {}).get("id")
+        for o in (ops or [])
+        if (o or {}).get("op") == "clean_speech"
+    }
+    if not target_ids:
+        return {}
+    sources = {
+        it.get("source")
+        for it in video_items(timeline)
+        if it.get("id") in target_ids and it.get("source")
+    }
+    if not sources:
+        return {}
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+    rows = sb.table("clips").select("id, filename").eq(
+        "project_id", project_id
+    ).execute()
+    id_by_name = {c["filename"]: c["id"] for c in (rows.data or [])}
+
+    out: dict = {}
+    for name in sources:
+        cid = id_by_name.get(name)
+        if not cid:
+            continue
+        key = f"projects/{project_id}/clips/{cid}/audio_analysis.json"
+        try:
+            doc = json.loads(r2.get_object(Bucket=bucket, Key=key)["Body"].read())
+        except Exception:
+            continue
+        vad = doc.get("vad") or {}
+        wave = doc.get("waveform") or {}
+        if not vad.get("prob"):
+            continue
+        out[name] = {
+            "vad_prob": vad.get("prob"),
+            "vad_hop": vad.get("hop") or 0.032,
+            "peaks": wave.get("peaks") or [],
+            "peaks_hop": wave.get("hop") or 0.02,
+        }
+    return out
+
+
 def _set_clip(sb, clip_id: str, **fields) -> None:
     sb.table("clips").update(fields).eq("id", clip_id).execute()
 
@@ -1831,7 +1889,13 @@ async def edit_timeline(request: Request) -> JSONResponse:
                 (o or {}).get("op") == "clean_speech" for o in ops
             )
             words = _load_words(story["project_id"]) if needs_words else None
-            new_timeline = apply_ops(base, ops, words=words)
+            audio_by_source = (
+                _load_audio_by_source(story["project_id"], base, ops)
+                if needs_words else None
+            )
+            new_timeline = apply_ops(
+                base, ops, words=words, audio_by_source=audio_by_source
+            )
             ops_record = ops
     except TimelineError as exc:
         # The op/validation message is written for the LLM caller — pass it up.
@@ -1904,8 +1968,17 @@ async def preview_clean_speech(request: Request) -> JSONResponse:
         base = timeline_from_ranges(ranges)
 
     words = _load_words(story["project_id"])
+    audio_map = _load_audio_by_source(
+        story["project_id"], base, [{"op": "clean_speech", "id": item_id}]
+    )
+    from timeline import video_items as _vitems
+    src = next((it.get("source") for it in _vitems(base)
+                if it.get("id") == item_id), None)
+    audio = audio_map.get(src)
     try:
-        new_timeline, plan = expand_clean_speech(base, item_id, words, params)
+        new_timeline, plan = expand_clean_speech(
+            base, item_id, words, params, audio
+        )
     except TimelineError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
