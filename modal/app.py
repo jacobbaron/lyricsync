@@ -364,6 +364,10 @@ def _words_from(data: dict) -> list[dict]:
             "word": (w.get("word") or w.get("text") or "").strip(),
             "start": float(w["start"]),
             "end": float(w["end"]),
+            # WhisperX forced-alignment confidence for this word (0–1); None
+            # when unavailable (e.g. Whisper-API output, or unaligned words).
+            # Lets downstream cleanup pad/skip low-confidence word boundaries.
+            "score": float(w["score"]) if w.get("score") is not None else None,
             # Per-clip speaker label (e.g. "SPEAKER_00"); None if diarization
             # was disabled or failed. See _load_diarizer / _assign_speakers.
             "speaker": w.get("speaker"),
@@ -797,6 +801,10 @@ def _align_worker(
                         "global_end": w["end"] + offset,
                         "local_start": w["start"],
                         "local_end": w["end"],
+                        # Forced-alignment confidence (0–1) or None — see
+                        # _words_from; used to gauge how tightly a word
+                        # boundary can be trusted when cleaning up dead air.
+                        "score": w.get("score"),
                         "source": cr["filename"],
                         "source_path": cr["r2_key"],
                         # Per-clip speaker label; (source, speaker) together
