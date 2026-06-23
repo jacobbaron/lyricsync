@@ -223,6 +223,36 @@ export async function POST(
       }
     }
 
+    // Kick off the clip audio analysis (waveform + Silero VAD curve) for each
+    // clip, so the VAD-fused clean_speech cut works without a manual "Analyze
+    // audio" step. Best-effort + idempotent (the worker overwrites its R2
+    // outputs); a failure here must not fail the merge.
+    const audioAnalyzeUrl =
+      process.env.MODAL_ANALYZE_AUDIO_URL ??
+      analyzeUrl.replace("analyze-visuals", "analyze-clip-audio");
+    if (webhookSecret) {
+      for (const clip of transcribedClips) {
+        after(async () => {
+          try {
+            const res = await fetch(audioAnalyzeUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-webhook-secret": webhookSecret,
+              },
+              body: JSON.stringify({ clip_id: clip.id }),
+            });
+            if (!res.ok) {
+              const text = await res.text().catch(() => "");
+              console.error(`[merge] audio analyze trigger ${res.status}: ${text}`);
+            }
+          } catch (err) {
+            console.error("[merge] audio analyze trigger failed:", err);
+          }
+        });
+      }
+    }
+
     return NextResponse.json({
       words: allWords.length,
       clips: transcribedClips.length,
