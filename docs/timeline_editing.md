@@ -98,6 +98,16 @@ The first sub-item keeps the original id and `transition_in`; the rest are hard
 cuts (or crossfades if `params.join` is set). `speed` / `mute` / `audio_fx` /
 `note` carry over.
 
+**Silence detection is VAD-fused when the clip has been analyzed.** If the
+source clip has a stored audio analysis (`audio_analysis.json` from the
+`analyze_clip_audio` worker), silence comes from a three-signal fusion — keep a
+moment if Silero VAD calls it speech *or* a waveform-energy burst coincides
+with a transcript word; cut only where all three agree there's nothing. This
+fixes WhisperX's early word onsets and recovers unvoiced consonants (a leading
+`/s/`) that VAD alone clips. Clips with no analysis fall back to word-gap
+timing. Tuning constants are fixed in `timeline.VAD_CLEANUP_DEFAULTS` (chosen
+via `experiments/vad_align/`), not exposed as knobs.
+
 `params` (all optional — defaults in `timeline.SPEECH_CLEANUP_DEFAULTS`):
 
 | Param | Default | Meaning |

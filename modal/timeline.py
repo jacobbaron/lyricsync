@@ -41,6 +41,7 @@ Conventions:
 from __future__ import annotations
 
 import copy
+import math
 import re
 import textwrap
 
@@ -638,7 +639,8 @@ _OPS = {
 
 
 def apply_ops(
-    timeline: dict, ops: list[dict], words: list[dict] | None = None
+    timeline: dict, ops: list[dict], words: list[dict] | None = None,
+    audio_by_source: dict | None = None,
 ) -> dict:
     """Apply edit operations to a copy of the timeline and validate the result.
 
@@ -648,6 +650,10 @@ def apply_ops(
     `words` are the project's aligned words; required only when an op needs
     transcript timing (currently just `clean_speech`). Passing them is cheap
     and harmless when no such op is present.
+
+    `audio_by_source` maps a clip filename to its stored audio analysis
+    ({vad_prob, vad_hop, peaks, peaks_hop}); when present for a clean_speech
+    target, the VAD-fused silence crop is used instead of word-gap timing.
     """
     result = copy.deepcopy(timeline)
     valid = sorted(list(_OPS) + ["clean_speech"])
@@ -660,8 +666,15 @@ def apply_ops(
                     "story, so word timings are unavailable"
                 )
             try:
+                item_id = (op or {}).get("id", "")
+                src = None
+                for it in video_items(result):
+                    if it.get("id") == item_id:
+                        src = it.get("source")
+                        break
+                audio = (audio_by_source or {}).get(src)
                 result, _ = expand_clean_speech(
-                    result, (op or {}).get("id", ""), words, (op or {}).get("params")
+                    result, item_id, words, (op or {}).get("params"), audio,
                 )
             except TimelineError as exc:
                 raise TimelineError(f"op {i} ({name}): {exc}") from exc
@@ -945,11 +958,226 @@ def _label_removed(
     return out
 
 
+# ---------------------------------------------------------------------------
+# VAD-fused speech cleanup (the validated silence crop)
+# ---------------------------------------------------------------------------
+#
+# Word timings alone make sloppy cuts: WhisperX onsets run ~0.1-0.7 s early
+# (worst right after a pause) and the gaps between its contiguous word spans
+# don't correspond to real silence. Silero VAD nails the speech/silence edge
+# but clips unvoiced consonants (a leading /s/) and occasionally drops quiet
+# speech. So we fuse three signals — keep a moment if VAD calls it speech OR an
+# energy burst (from the stored waveform peaks) coincides with a transcript
+# word; cut only where all three agree there's nothing. Constants below were
+# fixed by the experiments in experiments/vad_align (validated by ear).
+
+VAD_CLEANUP_DEFAULTS: dict = {
+    "tau": 0.5,             # VAD onset threshold
+    "tau_off": 0.35,        # VAD release threshold (hysteresis)
+    "energy_margin_db": 12.0,   # energy speech = this far above the noise floor
+    "pad": 0.05,            # speech-side margin so onsets/offsets aren't clipped
+    "min_silence": 0.25,    # gaps shorter than this are kept (natural micro-pauses)
+    "min_removed": 0.20,    # don't bother cutting a gap that reclaims less than this
+    "protect_gap_over": None,   # never cut a deliberate pause longer than this
+    "remove_fillers": False,    # silence crop only by default; fillers are opt-in
+    "filler_lexicon": None,
+}
+
+
+def _merge_iv(ivs: list[tuple[float, float]]) -> list[list[float]]:
+    out: list[list[float]] = []
+    for s, e in sorted(ivs):
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _speech_gate(
+    prob: list[float], hop: float, threshold: float, neg_threshold: float,
+    min_speech: float, min_silence: float, total: float | None,
+) -> list[tuple[float, float]]:
+    """Hysteresis speech gate over a probability/binary curve (seconds out).
+
+    Mirrors audio_analysis.intervals_from_curve, re-implemented here to keep
+    timeline.py self-contained (stdlib only, importable in tests by path)."""
+    if not prob:
+        return []
+    n = len(prob)
+    min_sil_win = max(1, round(min_silence / hop)) if hop > 0 else 1
+    raw: list[tuple[int, int]] = []
+    triggered = False
+    start = temp_end = 0
+    for i, pp in enumerate(prob):
+        if pp >= threshold:
+            temp_end = 0
+            if not triggered:
+                triggered, start = True, i
+        elif triggered and pp < neg_threshold:
+            if not temp_end:
+                temp_end = i
+            if i - temp_end >= min_sil_win:
+                raw.append((start, temp_end))
+                triggered, temp_end = False, 0
+    if triggered:
+        raw.append((start, n))
+    out: list[tuple[float, float]] = []
+    for s, e in raw:
+        if (e - s) * hop < min_speech:
+            continue
+        st, en = s * hop, e * hop
+        if total is not None:
+            en = min(en, total)
+        if en > st:
+            out.append((st, en))
+    return out
+
+
+def _energy_speech(
+    peaks: list[float], hop: float, margin_db: float, min_silence: float,
+    total: float | None,
+) -> list[tuple[float, float]]:
+    """Speech bursts from the stored waveform peak envelope, thresholded
+    relative to the clip's own noise floor (10th-percentile peak)."""
+    if not peaks:
+        return []
+    db = [20 * math.log10(p + 1e-4) for p in peaks]
+    floor = sorted(db)[int(0.10 * len(db))]
+    thr = floor + margin_db
+    pseudo = [1.0 if d > thr else 0.0 for d in db]
+    return _speech_gate(pseudo, hop, 0.5, 0.5, 0.05, min_silence, total)
+
+
+def _overlaps_word(s: float, e: float, words: list[dict], slack: float = 0.15) -> bool:
+    for w in words:
+        ws, we = _word_bounds(w)
+        if we + slack >= s and ws - slack <= e:
+            return True
+    return False
+
+
+def fused_speech_keep(
+    vad_prob: list[float], vad_hop: float, peaks: list[float], peaks_hop: float,
+    words: list[dict], params: dict | None = None,
+) -> list[tuple[float, float]]:
+    """Clip-local KEEP intervals from the three-signal fusion (see notes above)."""
+    p = {**VAD_CLEANUP_DEFAULTS, **(params or {})}
+    total = (len(vad_prob) * vad_hop) if vad_prob else (
+        len(peaks) * peaks_hop if peaks else 0.0)
+    pad = float(p["pad"])
+    min_sil = float(p["min_silence"])
+    vad = _speech_gate(vad_prob, vad_hop, float(p["tau"]), float(p["tau_off"]),
+                       0.10, min_sil, total)
+    eng = _energy_speech(peaks, peaks_hop, float(p["energy_margin_db"]), min_sil, total)
+    eng = [iv for iv in eng if _overlaps_word(iv[0], iv[1], words)]
+    padded = [(max(0.0, s - pad), min(total, e + pad)) for s, e in (vad + eng)]
+    keep = _merge_iv(padded)
+    # Re-close gaps shorter than min_silence so micro-pauses survive.
+    closed: list[list[float]] = []
+    for s, e in keep:
+        if closed and s - closed[-1][1] < min_sil:
+            closed[-1][1] = e
+        else:
+            closed.append([s, e])
+    return [(s, e) for s, e in closed]
+
+
+def plan_speech_cleanup_vad(
+    words: list[dict],
+    vad_prob: list[float], vad_hop: float,
+    peaks: list[float], peaks_hop: float,
+    span_start: float, span_end: float,
+    params: dict | None = None,
+) -> dict:
+    """VAD-fused analogue of plan_speech_cleanup over [span_start, span_end].
+
+    Same return shape. Silence comes from the three-signal fusion (not word
+    gaps); optional filler removal subtracts filler-word spans from the kept
+    speech. Falls back to keeping the whole span when there's no speech.
+    """
+    p = {**VAD_CLEANUP_DEFAULTS, **(params or {})}
+    span_start, span_end = float(span_start), float(span_end)
+    before = span_end - span_start
+
+    untouched = {
+        "keep": [{"start": round(span_start, 3), "end": round(span_end, 3)}],
+        "removed": [], "duration_before": round(before, 3),
+        "duration_after": round(before, 3), "saved": 0.0,
+        "kept_words": 0, "filler_words": 0,
+    }
+
+    speech = fused_speech_keep(vad_prob, vad_hop, peaks, peaks_hop, words, p)
+    # Restrict to the item's span.
+    keep = [[max(span_start, s), min(span_end, e)]
+            for s, e in speech if e > span_start and s < span_end]
+    keep = [seg for seg in keep if seg[1] - seg[0] > 1e-3]
+    if not keep:
+        return untouched
+
+    # Words inside the span (for counts + filler removal).
+    inside = [w for w in words if _word_bounds(w)[1] > span_start
+              and _word_bounds(w)[0] < span_end]
+    flags = (_filler_flags(inside, p.get("filler_lexicon"))
+             if p.get("remove_fillers") else [False] * len(inside))
+    filler_words = [w for w, f in zip(inside, flags) if f]
+
+    # Subtract filler spans from the kept speech (creating jump cuts), but only
+    # when the reclaimed slice is worth a cut.
+    min_removed = float(p["min_removed"])
+    for fw in filler_words:
+        fs, fe = _word_bounds(fw)
+        if fe - fs < min_removed:
+            continue
+        next_keep: list[list[float]] = []
+        for s, e in keep:
+            lo, hi = max(s, fs), min(e, fe)
+            if hi <= lo:
+                next_keep.append([s, e])
+                continue
+            if lo - s > 1e-3:
+                next_keep.append([s, lo])
+            if e - hi > 1e-3:
+                next_keep.append([hi, e])
+        keep = next_keep
+
+    # Drop cuts that reclaim less than min_removed (re-close them).
+    closed: list[list[float]] = []
+    for s, e in keep:
+        if closed and s - closed[-1][1] < min_removed:
+            closed[-1][1] = e
+        else:
+            closed.append([s, e])
+    keep = closed
+
+    keep_rounded = [{"start": round(s, 3), "end": round(e, 3)} for s, e in keep]
+    removed: list[dict] = []
+    cursor = span_start
+    for seg in keep:
+        if seg[0] > cursor + 1e-6:
+            removed.append(_label_removed(cursor, seg[0], span_start, span_end,
+                                          filler_words))
+        cursor = max(cursor, seg[1])
+    if span_end > cursor + 1e-6:
+        removed.append(_label_removed(cursor, span_end, span_start, span_end,
+                                      filler_words))
+
+    after = sum(seg["end"] - seg["start"] for seg in keep_rounded)
+    return {
+        "keep": keep_rounded, "removed": removed,
+        "duration_before": round(before, 3), "duration_after": round(after, 3),
+        "saved": round(before - after, 3),
+        "kept_words": len(inside) - len(filler_words),
+        "filler_words": len(filler_words),
+    }
+
+
 def expand_clean_speech(
     timeline: dict,
     item_id: str,
     words: list[dict],
     params: dict | None = None,
+    audio: dict | None = None,
 ) -> tuple[dict, dict]:
     """Replace one clip item with tight jump-cut sub-items per the cleanup plan.
 
@@ -971,8 +1199,17 @@ def expand_clean_speech(
     src = item.get("source")
     relevant = [w for w in (words or []) if w.get("source") in (None, src)]
 
+    # Prefer the VAD-fused plan when this clip's audio analysis is available
+    # (accurate silence edges); fall back to word-gap timing otherwise.
     try:
-        plan = plan_speech_cleanup(relevant, span_start, span_end, params)
+        if audio and audio.get("vad_prob"):
+            plan = plan_speech_cleanup_vad(
+                relevant, audio.get("vad_prob") or [], float(audio.get("vad_hop") or 0.032),
+                audio.get("peaks") or [], float(audio.get("peaks_hop") or 0.02),
+                span_start, span_end, params,
+            )
+        else:
+            plan = plan_speech_cleanup(relevant, span_start, span_end, params)
     except (ValueError, TypeError) as exc:
         raise TimelineError(f"clean_speech on {item_id}: bad params ({exc})")
 
