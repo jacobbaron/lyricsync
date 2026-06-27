@@ -1549,6 +1549,40 @@ def _probe_display_dims(video_path: Path) -> tuple[int, int] | None:
     return (w, h)
 
 
+# The Gemini File API rejects uploads larger than 2 GiB (it returns a 413
+# FAILED_PRECONDITION "Media is too large. Limit: 2147483648"). A long raw
+# session straight off a phone — e.g. a 30-min vocal-tracking take — easily
+# exceeds that as a .mov, which kills visual analysis before it starts. When
+# the download is too big we transcode it down to a Gemini-friendly H.264 that
+# keeps enough visual detail for expression/segment analysis while landing well
+# under the cap.
+GEMINI_UPLOAD_LIMIT_BYTES = 2 * 1024**3  # hard cap from the File API 413
+# Trigger transcoding below the hard cap to leave headroom for muxing slack.
+GEMINI_UPLOAD_TARGET_BYTES = 1_800_000_000
+
+
+def _transcode_for_gemini(src: Path, out: Path) -> Path:
+    """Re-encode `src` down to fit under the Gemini File API size cap.
+
+    Fits the frame inside a 1280×1280 box (preserving aspect, even dims, no
+    upscaling) and re-encodes H.264 at a modest CRF. Audio is kept — the
+    ``with_transcript`` strategy benefits from the soundtrack. Returns `out`;
+    raises ``subprocess.CalledProcessError`` if ffmpeg fails.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vf",
+        "scale=1280:1280:force_original_aspect_ratio=decrease:"
+        "force_divisible_by=2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return out
+
+
 @app.function(image=analyze_image, secrets=secrets, timeout=60)
 @modal.fastapi_endpoint(method="POST")
 async def analyze_visuals(request: Request) -> JSONResponse:
@@ -1572,7 +1606,7 @@ async def analyze_visuals(request: Request) -> JSONResponse:
     return JSONResponse({"status": "accepted"})
 
 
-@app.function(image=analyze_image, secrets=secrets, timeout=600)
+@app.function(image=analyze_image, secrets=secrets, timeout=1800)
 def _analyze_worker(analysis_id: str) -> None:
     """Visual analysis worker (VIS-01).
 
@@ -1646,6 +1680,26 @@ def _analyze_worker(analysis_id: str) -> None:
 
             duration = clip.get("duration_secs") or _probe_duration(video_path)
             debug["duration_secs"] = duration
+
+            # Gemini's File API caps uploads at 2 GiB; a long raw session blows
+            # past that, so shrink it first when needed (otherwise upload as-is).
+            if video_path.stat().st_size > GEMINI_UPLOAD_TARGET_BYTES:
+                step(
+                    f"file is {video_path.stat().st_size / 1e9:.2f} GB — "
+                    "transcoding under Gemini's 2 GB upload cap"
+                )
+                shrunk = tmp / "clip_small.mp4"
+                try:
+                    _transcode_for_gemini(video_path, shrunk)
+                except subprocess.CalledProcessError as ff_exc:
+                    detail = ff_exc.stderr[-1500:] if ff_exc.stderr else str(ff_exc)
+                    raise RuntimeError(
+                        f"transcode for Gemini upload failed: {detail}"
+                    ) from ff_exc
+                new_size = shrunk.stat().st_size
+                debug["transcoded_size_bytes"] = new_size
+                step(f"transcoded to {new_size / 1e9:.2f} GB")
+                video_path = shrunk
 
             # Fetch the aligned transcript as ground-truth speech for the
             # transcript strategy. Best-effort: if it's missing we still run,
