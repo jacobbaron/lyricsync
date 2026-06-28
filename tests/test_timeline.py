@@ -54,9 +54,12 @@ RANGES = [
 
 
 def compile_simple(timeline):
+    # resolve_source receives the whole clip item; cross-project clips would
+    # resolve by item["clip_id"], but these single-project timelines use the
+    # bare source filename.
     return tl.compile_timeline(
         timeline,
-        resolve_source=lambda src: f"/cache/{src}",
+        resolve_source=lambda item: f"/cache/{item['source']}",
         workdir="/tmp/render",
         font_path="/root/overlay_font.ttf",
     )
@@ -434,17 +437,48 @@ class TestCompile:
         with pytest.raises(tl.TimelineError, match="cannot compile"):
             compile_simple(timeline)
 
-    def test_resolver_receives_source_names(self):
+    def test_resolver_receives_clip_items(self):
+        # The compiler hands the whole clip item to resolve_source so callers
+        # can resolve cross-project clips by item["clip_id"] before falling
+        # back to item["source"].
         seen = []
 
-        def resolver(src):
-            seen.append(src)
-            return f"/x/{src}"
+        def resolver(item):
+            seen.append(item)
+            return f"/x/{item['source']}"
 
         tl.compile_timeline(
             make_timeline(2), resolver, workdir="/w", font_path="/f.ttf",
         )
-        assert seen == ["IMG_0001.mov", "IMG_0001.mov"]
+        assert [it["source"] for it in seen] == ["IMG_0001.mov", "IMG_0001.mov"]
+        assert all(it["kind"] == "clip" for it in seen)
+
+    def test_clip_id_item_validates_and_compiles(self):
+        # A clip item carrying a cross-project clip_id (and no useful source
+        # filename) is valid and resolvable by clip_id.
+        timeline = make_timeline(1)
+        item = tl.video_items(timeline)[0]
+        item["clip_id"] = "11111111-2222-3333-4444-555555555555"
+        item.pop("source", None)
+        assert tl.validate_timeline(timeline) == []
+
+        seen = []
+        tl.compile_timeline(
+            timeline,
+            resolve_source=lambda it: seen.append(it.get("clip_id")) or "/x/y",
+            workdir="/w",
+            font_path="/f.ttf",
+        )
+        assert seen == ["11111111-2222-3333-4444-555555555555"]
+
+    def test_empty_clip_id_is_rejected(self):
+        timeline = make_timeline(1)
+        item = tl.video_items(timeline)[0]
+        item["clip_id"] = ""  # present but empty
+        item.pop("source", None)
+        errors = tl.validate_timeline(timeline)
+        assert any("clip_id" in e or "source filename or a clip_id" in e
+                   for e in errors)
 
 
 # ---------------------------------------------------------------------------
