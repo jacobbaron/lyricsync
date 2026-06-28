@@ -375,15 +375,79 @@ class TestApplyOpsCleanSpeech:
                 t, [{"op": "clean_speech", "id": "vX"}], words=[],
             )
 
-    def test_clean_speech_on_cross_project_clip_errors(self):
-        # Tier 2 boundary: clean_speech can't yet resolve a foreign clip's word
-        # timings, so it must fail with a clear message rather than no-op.
+    def test_clean_speech_on_cross_project_clip_uses_clip_id_words(self):
+        # Tier 2 (shipped): a clean_speech target carrying a global clip_id
+        # resolves its words from words_by_clip_id (the foreign clip's own
+        # project), so the cut works exactly like a local one.
         t = one_clip_timeline(0.0, 5.0)
         tl.video_items(t)[0]["clip_id"] = "abc-123"
-        with pytest.raises(tl.TimelineError, match="cross-project"):
-            tl.apply_ops(
-                t, [{"op": "clean_speech", "id": "v1"}], words=[],
-            )
+        words = [
+            sword("a", "FOREIGN.mov", 0.5, 0.9),
+            sword("b", "FOREIGN.mov", 3.6, 4.0),
+        ]
+        out = tl.apply_ops(
+            t, [{"op": "clean_speech", "id": "v1",
+                 "params": {"pad_start": 0.0, "pad_end": 0.0,
+                            "protect_gap_over": None}}],
+            words=None,  # no home-project transcript at all
+            words_by_clip_id={"abc-123": words},
+        )
+        assert len(tl.video_items(out)) == 2  # jump cut produced
+        assert tl.validate_timeline(out) == []
+
+    def test_clean_speech_no_transcript_at_all_errors(self):
+        # The remaining guard: neither flat words nor a clip_id map -> clear
+        # "no transcript loaded" error (not a silent no-op).
+        t = one_clip_timeline(0.0, 5.0)
+        with pytest.raises(tl.TimelineError, match="no transcript"):
+            tl.apply_ops(t, [{"op": "clean_speech", "id": "v1"}])
+
+    def test_filename_collision_each_clip_gets_own_words(self):
+        # Two clips in DIFFERENT projects share the filename "IMG_2427.mov". A
+        # foreign clip referenced by clip_id must use ONLY its own words (from
+        # words_by_clip_id), never the home-project clip's words that happen to
+        # carry the same filename. The two word sets carve the span differently
+        # so the wrong source would yield a different cut.
+        t = one_clip_timeline(0.0, 6.0, source="IMG_2427.mov")
+        tl.video_items(t)[0]["clip_id"] = "foreign-uuid"
+        # Home-project words for the SAME filename (would mislead a filename
+        # filter): one continuous block of speech -> no cut.
+        home_words = [sword("hello", "IMG_2427.mov", 0.2, 5.8)]
+        # The foreign clip's OWN words: two bursts with a long gap -> a cut.
+        foreign_words = [
+            sword("a", "IMG_2427.mov", 0.5, 0.9),
+            sword("b", "IMG_2427.mov", 4.6, 5.0),
+        ]
+        out = tl.apply_ops(
+            t, [{"op": "clean_speech", "id": "v1",
+                 "params": {"pad_start": 0.0, "pad_end": 0.0,
+                            "protect_gap_over": None}}],
+            words=home_words,
+            words_by_clip_id={"foreign-uuid": foreign_words},
+        )
+        # Used the foreign words -> a real jump cut, not the home-words no-op.
+        assert len(tl.video_items(out)) == 2
+
+    def test_same_project_clean_speech_unchanged_with_clip_id_maps_present(self):
+        # Back-compat: a LOCAL item (no clip_id) must behave identically whether
+        # or not Tier 2 clip_id maps are passed alongside.
+        t = one_clip_timeline(0.0, 5.0, source="IMG_0001.mov")
+        words = [
+            sword("a", "IMG_0001.mov", 0.5, 0.9),
+            sword("b", "IMG_0001.mov", 3.6, 4.0),
+        ]
+        params = {"pad_start": 0.0, "pad_end": 0.0, "protect_gap_over": None}
+        baseline = tl.apply_ops(
+            t, [{"op": "clean_speech", "id": "v1", "params": params}],
+            words=words,
+        )
+        with_maps = tl.apply_ops(
+            t, [{"op": "clean_speech", "id": "v1", "params": params}],
+            words=words,
+            words_by_clip_id={"some-other-clip": [sword("x", "X.mov", 0, 1)]},
+            audio_by_clip_id={"some-other-clip": {}},
+        )
+        assert tl.video_items(baseline) == tl.video_items(with_maps)
 
     def test_result_revalidates(self):
         # A crossfade join longer than a tiny breath piece must be caught by
@@ -482,3 +546,30 @@ class TestVadFusion:
                            words=words, audio_by_source={"A.mov": audio})
         items = tl.video_items(out)
         assert len(items) == 2  # two kept speech spans -> jump cut
+
+    def test_expand_uses_clip_id_audio_for_foreign_clip(self):
+        # Tier 2: a foreign clip's VAD audio is keyed by clip_id, not filename.
+        # apply_ops must route it through audio_by_clip_id for the cut.
+        tl_obj = {
+            "version": 1, "width": 1080, "height": 1920, "fps": 30,
+            "tracks": [{"type": "video", "items": [
+                {"id": "v1", "kind": "clip", "source": "LABEL.mov",
+                 "clip_id": "foreign-uuid",
+                 "src_start": 0.0, "src_end": 6.0, "speed": 1.0,
+                 "transition_in": None}]}],
+        }
+        vad = _curve([(1.0, 2.0), (4.0, 5.0)], 6.0, 0.1, 0.9, 0.05)
+        peaks = _curve([(1.0, 2.0), (4.0, 5.0)], 6.0, 0.02, 0.8, 0.01)
+        # Foreign words tagged with the foreign clip's own filename.
+        words = [{"text": "a", "source": "REAL.mov", "start": 1.0, "end": 2.0},
+                 {"text": "b", "source": "REAL.mov", "start": 4.0, "end": 5.0}]
+        audio = {"vad_prob": vad, "vad_hop": 0.1, "peaks": peaks,
+                 "peaks_hop": 0.02}
+        out = tl.apply_ops(
+            tl_obj, [{"op": "clean_speech", "id": "v1"}],
+            words=None,
+            words_by_clip_id={"foreign-uuid": words},
+            audio_by_clip_id={"foreign-uuid": audio},
+        )
+        items = tl.video_items(out)
+        assert len(items) == 2  # VAD-driven jump cut on the foreign clip

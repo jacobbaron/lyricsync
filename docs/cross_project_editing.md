@@ -10,8 +10,8 @@ Cross-project cuts let a single story/timeline splice clips that live in
 **different** projects, so one rendered output can mix footage from your whole
 library — without moving or copying clips between projects.
 
-This is shipped in two tiers. **Tier 1 (this doc's first half) is built.**
-Tier 2 (transcript-dependent "smart" editing across projects) is planned.
+This is shipped in two tiers. **Tier 1 (assembly / trims / overlays) and Tier 2
+(transcript-dependent "smart" editing across projects) are both built.**
 
 ---
 
@@ -119,54 +119,75 @@ tests.
 
 ---
 
-## Tier 2 — plan (NOT built here)
+## Tier 2 — what shipped
 
 Tier 2 makes the **transcript-dependent / "smart"** editing features work across
-projects. Today these resolve a clip's word timings and audio analysis by
-`(home project_id, filename)`, which misses for a foreign clip.
+projects. Previously these resolved a clip's word timings and audio analysis by
+`(home project_id, filename)`, which missed for a foreign clip — so Tier 1
+**blocked** `clean_speech` on a `clip_id` item with a clear error. Tier 2 routes
+those lookups through a **per-clip resolver keyed by `clip_id`**, so editing a
+foreign clip behaves identically to a local one.
 
-### What's affected
+### Final design
+
+Transcript/audio lookups are resolved **per referenced clip item**, keyed by
+`clip_id` when present (cross-project) and falling back to the home-project
+filename otherwise (legacy/local):
+
+- **Words** (`_load_words_by_clip_id` in `app.py`): for each `clean_speech`
+  target that carries a `clip_id`, resolve the clip's owning `project_id` from a
+  single global `clips` lookup, read THAT project's `merged.json` once, and keep
+  only that clip's words (sliced by the clip's own filename within its own
+  project). Returns `{clip_id: [words…]}`.
+- **Audio** (`_load_audio_by_clip_id` in `app.py`): resolve each target's
+  `clip_id → (project_id, clip_id)` globally and read its per-clip
+  `projects/<pid>/clips/<cid>/audio_analysis.json` directly (the path was always
+  per-clip; only the lookup was home-scoped). Returns
+  `{clip_id: {vad_prob, vad_hop, peaks, peaks_hop}}`. Shared read/shape logic
+  lives in `_read_clip_audio_analysis`, used by both the filename and clip_id
+  paths.
+- **Threading** (`timeline.py`): `apply_ops` and `expand_clean_speech` gained
+  `words_by_clip_id` / `audio_by_clip_id` params. The pure helper
+  `_words_for_item` picks a clip item's words: `words_by_clip_id[clip_id]` for a
+  foreign clip (used verbatim — NOT re-filtered by the label `source`), else the
+  flat home `words` filtered by filename. `_audio_for_item` does the analogous
+  pick for audio. The local default (flat words / `audio_by_source`) is
+  unchanged.
+
+**Filename-collision safety.** Two clips in different projects can share a
+filename (every iPhone makes an `IMG_2427.mov`). Tier 2 never globs the home
+project's flat word list by filename for a foreign clip — it resolves words
+per `clip_id` from the clip's own project, so a foreign clip can't pick up a
+home-project clip's words just because the filenames match. This is covered by a
+dedicated collision test.
+
+**Call sites wired:** `edit_timeline` and `preview_clean_speech` (both in
+`app.py`) now gather the `clip_id`s their `clean_speech` ops reference and pass
+the clip_id-keyed words/audio maps through. `clean_speech` is expanded and
+persisted at **edit time** (stored into `timeline_json`), so the render worker
+needs no transcript lookup — it stays purely byte-level (already cross-project
+since Tier 1).
+
+**Back-compatibility.** Same-project `clean_speech` (items with a bare filename,
+no `clip_id`) takes exactly the legacy path and produces identical cuts; the
+clip_id maps are additive and ignored for local items. The only guard left in
+`apply_ops` is the "no transcript loaded at all" error (neither flat words nor a
+clip_id map) — the Tier 1 "cross-project not supported" guard is removed.
+
+### What was affected (now working)
 
 1. **`clean_speech`** (`modal/timeline.py` `apply_ops` →
-   `expand_clean_speech`). It needs the targeted clip's aligned word timings and
+   `expand_clean_speech`) — needs the targeted clip's aligned word timings and
    per-clip audio analysis (VAD curve + waveform peaks) to plan the silence /
-   filler jump-cuts.
-   - `_load_words(project_id)` (`app.py:~132`) reads the **home** project's
-     `projects/<pid>/merged.json`. A foreign clip's words aren't there.
-   - `_load_audio_by_source(project_id, …)` (`app.py:~149`) maps a clip filename
-     → `id` within the **home** project, then reads
-     `projects/<pid>/clips/<cid>/audio_analysis.json`. A foreign clip's filename
-     doesn't match a home-project clip.
-
-   **Tier 1 behavior:** `clean_speech` on an item that carries a `clip_id` is
-   **blocked with a clear error** (rather than silently producing a no-op cut).
-   The render-time path is unaffected because `clean_speech` is expanded at edit
-   time and stored in `timeline_json`.
+   filler jump-cuts. Now resolved per `clip_id` (see Final design above) so a
+   foreign clip's words/audio come from its own owning project.
 
 2. **Word-aligned overlays** — any future feature that auto-places overlay copy
-   from a clip's transcript words has the same `(project_id, filename)` lookup
-   problem. (Plain `add_text` drawtext overlays do **not** — they're output-time
-   and already cross-project.)
+   from a clip's transcript words shares the same per-clip resolver, so it
+   inherits cross-project support for free. (Plain `add_text` drawtext overlays
+   never needed it — they're output-time and were cross-project from Tier 1.)
 
-### Proposed implementation
-
-Route the transcript/audio lookups through a **per-clip resolver keyed by
-`clip_id`** instead of `(home project_id, filename)`:
-
-- **Words**: resolve the foreign clip's owning `project_id` from its `clip_id`,
-  then read that project's `merged.json` and filter by `source` (filename). A
-  cleaner long-term option is a **per-clip words file**
-  (e.g. `projects/<pid>/clips/<cid>/words.json`) so a cross-project edit reads
-  exactly one clip's words without loading another project's whole transcript.
-- **Audio analysis**: already per-clip at
-  `projects/<pid>/clips/<cid>/audio_analysis.json`. Only the **lookup** needs to
-  go global: resolve `clip_id → (project_id, clip_id)` and read that path
-  directly, instead of mapping filename→id within the home project.
-- Generalize `_load_words` / `_load_audio_by_source` (and the render-time
-  `clean_speech` expansion path) to accept a set of `clip_id`s and return data
-  keyed by `clip_id`, removing the implicit home-project assumption.
-
-### Product decisions already made
+### Product decisions (settled)
 
 - **Single-user.** No permissions / sharing work is needed; all clips belong to
   the same owner, so a global `clip_id` lookup is safe.
@@ -180,11 +201,22 @@ Route the transcript/audio lookups through a **per-clip resolver keyed by
 
 ## Implementation map
 
+**Tier 1**
 - `modal/timeline.py` — `clip_id` in the schema docstring, `validate_timeline`
   (accept `clip_id`), `compile_timeline` (`resolve_source(item)` contract),
-  `_op_insert_clip` (`clip_id` passthrough), `apply_ops` (Tier 2 `clean_speech`
-  guard).
+  `_op_insert_clip` (`clip_id` passthrough).
 - `modal/app.py` → `_render_worker` — global `clip_id` resolution +
   home-project filename fallback; per-item `_resolve_r2_key`.
-- `tests/test_timeline.py`, `tests/test_speech_cleanup.py` — item-based resolver
-  contract, `clip_id` validation/compile, cross-project `clean_speech` guard.
+
+**Tier 2**
+- `modal/timeline.py` — `_words_for_item` / `_audio_for_item` per-clip pickers;
+  `apply_ops` and `expand_clean_speech` gain `words_by_clip_id` /
+  `audio_by_clip_id`; the Tier 1 cross-project `clean_speech` guard removed (the
+  "no transcript loaded" guard kept).
+- `modal/app.py` — `_load_words_by_clip_id`, `_load_audio_by_clip_id`,
+  `_resolve_clips_global`, `_read_clip_audio_analysis`, `_clean_speech_targets`;
+  `_load_audio_by_source` scoped to local (no-`clip_id`) targets; `edit_timeline`
+  and `preview_clean_speech` wired to pass the clip_id-keyed maps.
+- `tests/test_timeline.py` (`_words_for_item` incl. filename collision),
+  `tests/test_speech_cleanup.py` (foreign-clip words + VAD audio by clip_id,
+  filename-collision cut, same-project back-compat unchanged).
