@@ -79,7 +79,7 @@ invalid, nothing is saved and the error message says which op failed and why.
 | `set_speed` | `id`, `speed` | 0.25–20.0; clips only |
 | `set_mute` | `id`, `mute` | `true` silences the clip (e.g. silent time-lapse); clips only |
 | `set_transition` | `id`, `transition` | `null` or `{"type": "crossfade", "duration": s}` (joins to previous item) |
-| `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`? | Appends when `index` omitted |
+| `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`?, `clip_id`? | Appends when `index` omitted. `clip_id` (uuid) references a clip in *any* project (cross-project cuts — see `docs/cross_project_editing.md`); `source` is then just a label |
 | `insert_blank` | `duration`, `index`? | Black + silence spacer |
 | `add_text` | `text`, `start`, `end`, `size`?, `position`?, `wrap`? | Output-time window |
 | `update_text` | `id`, any text fields | Partial update |

@@ -17,6 +17,7 @@ Schema (version 1):
       "tracks": [
         {"type": "video", "items": [
           {"id": "v1", "kind": "clip", "source": "IMG_2415.mov",
+           "clip_id": null,  # optional: global clip uuid for cross-project cuts
            "src_start": 12.40, "src_end": 18.20, "speed": 1.0,
            "transition_in": null, "note": "optional transcript text"},
           {"id": "v2", "kind": "blank", "duration": 1.0,
@@ -313,8 +314,22 @@ def validate_timeline(timeline: dict) -> list[str]:
 
         kind = item.get("kind")
         if kind == "clip":
-            if not item.get("source") or not isinstance(item["source"], str):
-                errors.append(f"{label}: clip items need a source filename")
+            # A clip item is resolvable either by a bare `source` filename
+            # (within the story's home project) or by a global `clip_id`
+            # (cross-project; see docs/cross_project_editing.md). When `clip_id`
+            # is present it is the authoritative reference and `source` is just
+            # a human-readable label, so a source filename is optional then.
+            has_clip_id = bool(
+                isinstance(item.get("clip_id"), str) and item.get("clip_id")
+            )
+            if not has_clip_id and (
+                not item.get("source") or not isinstance(item["source"], str)
+            ):
+                errors.append(
+                    f"{label}: clip items need a source filename or a clip_id"
+                )
+            if item.get("clip_id") is not None and not has_clip_id:
+                errors.append(f"{label}: clip_id must be a non-empty string")
             try:
                 s, e = float(item["src_start"]), float(item["src_end"])
                 if s < 0:
@@ -564,6 +579,11 @@ def _op_insert_clip(timeline: dict, op: dict) -> None:
         "speed": float(op.get("speed") or 1.0),
         "transition_in": None,
     }
+    # Optional global clip reference (cross-project; see
+    # docs/cross_project_editing.md). When present it is the authoritative
+    # source; `source` may still be supplied as a human-readable label.
+    if op.get("clip_id") is not None:
+        item["clip_id"] = op.get("clip_id")
     index = op.get("index")
     if index is None:
         index = len(items)
@@ -668,10 +688,25 @@ def apply_ops(
             try:
                 item_id = (op or {}).get("id", "")
                 src = None
+                target = None
                 for it in video_items(result):
                     if it.get("id") == item_id:
                         src = it.get("source")
+                        target = it
                         break
+                # Tier 2 boundary: clean_speech needs the clip's word timings
+                # and audio analysis, which are still addressed by
+                # (home project_id, filename). A foreign clip (referenced by a
+                # cross-project clip_id) isn't covered yet — fail with a clear
+                # message rather than silently producing a no-op cut.
+                # See docs/cross_project_editing.md (Tier 2 plan).
+                if target is not None and target.get("clip_id"):
+                    raise TimelineError(
+                        f"op {i} (clean_speech): clean_speech is not yet "
+                        f"supported on cross-project clips (item {item_id!r} "
+                        "references a clip_id from another project). This is "
+                        "planned for Tier 2; see docs/cross_project_editing.md."
+                    )
                 audio = (audio_by_source or {}).get(src)
                 result, _ = expand_clean_speech(
                     result, item_id, words, (op or {}).get("params"), audio,
@@ -1287,7 +1322,11 @@ def compile_timeline(
 ) -> dict:
     """Compile a timeline into ffmpeg invocation pieces.
 
-    resolve_source(filename) -> local file path for clip items.
+    resolve_source(item) -> local file path for a clip item. The callback is
+    passed the whole clip item so it can resolve cross-project clips by the
+    optional `clip_id` (authoritative, global) before falling back to the
+    `source` filename (scoped to the story's home project). See
+    docs/cross_project_editing.md.
 
     Returns {
       "inputs":         list of ffmpeg input-arg lists, in filter-index order,
@@ -1348,7 +1387,7 @@ def compile_timeline(
             )
             continue
 
-        path = resolve_source(item["source"])
+        path = resolve_source(item)
         src_start = float(item["src_start"])
         span = float(item["src_end"]) - src_start
         speed = float(item.get("speed") or 1.0)

@@ -2124,13 +2124,69 @@ def _render_worker(story_id: str) -> None:
             return
         timeline = timeline_from_ranges(ranges)
 
-    # 2. Fetch all clips for this project to resolve source → r2_key
-    clips_row = sb.table("clips").select(
-        "id, filename, r2_key"
-    ).eq("project_id", project_id).execute()
-    clip_map: dict[str, str] = {
-        c["filename"]: c["r2_key"] for c in (clips_row.data or [])
+    # 2. Resolve every clip the timeline references to an r2_key.
+    #
+    # Two reference styles coexist (see docs/cross_project_editing.md):
+    #   • bare `source` filename → resolved within the story's HOME project
+    #     (legacy, the only style for single-project cuts);
+    #   • global `clip_id` (uuid) → resolved across ALL projects, so one cut can
+    #     splice clips from several projects (Tier 1 cross-project cuts).
+    # `clip_id`, when present on an item, is authoritative; `source` is then
+    # only a human-readable label. r2_key is globally unique, so the download
+    # cache below stays keyed by r2_key regardless of how a clip was referenced.
+    vclip_items = [
+        item
+        for track in timeline.get("tracks", [])
+        if track.get("type") == "video"
+        for item in track.get("items", [])
+        if item.get("kind") == "clip"
+    ]
+    ref_clip_ids = {
+        item["clip_id"] for item in vclip_items if item.get("clip_id")
     }
+    ref_filenames = {
+        item["source"]
+        for item in vclip_items
+        if not item.get("clip_id") and item.get("source")
+    }
+
+    # Foreign/global clips by id (cross-project), then home-project clips by
+    # filename. Only the rows the timeline actually references are fetched.
+    r2_key_by_clip_id: dict[str, str] = {}
+    if ref_clip_ids:
+        rows = sb.table("clips").select("id, r2_key, project_id").in_(
+            "id", sorted(ref_clip_ids)
+        ).execute()
+        r2_key_by_clip_id = {
+            c["id"]: c["r2_key"] for c in (rows.data or []) if c.get("r2_key")
+        }
+
+    r2_key_by_filename: dict[str, str] = {}
+    if ref_filenames:
+        rows = sb.table("clips").select("filename, r2_key").eq(
+            "project_id", project_id
+        ).in_("filename", sorted(ref_filenames)).execute()
+        # If a filename somehow appears more than once in the home project the
+        # last write wins; bare filenames are unique within a project in
+        # practice, and cross-project disambiguation is what clip_id is for.
+        r2_key_by_filename = {
+            c["filename"]: c["r2_key"]
+            for c in (rows.data or [])
+            if c.get("r2_key")
+        }
+
+    def _resolve_r2_key(item: dict) -> str:
+        cid = item.get("clip_id")
+        if cid:
+            key = r2_key_by_clip_id.get(cid)
+            if not key:
+                raise ValueError(f"clip not found for clip_id: {cid!r}")
+            return key
+        src = item.get("source")
+        key = r2_key_by_filename.get(src)
+        if not key:
+            raise ValueError(f"source clip not found in project: {src!r}")
+        return key
 
     try:
         errors = validate_timeline(timeline)
@@ -2147,19 +2203,13 @@ def _render_worker(story_id: str) -> None:
             cache_dir.mkdir(parents=True, exist_ok=True)
             render_cache.reload()  # see clips cached by earlier render runs
 
-            sources = {
-                item["source"]
-                for track in timeline.get("tracks", [])
-                if track.get("type") == "video"
-                for item in track.get("items", [])
-                if item.get("kind") == "clip"
-            }
-            local_paths: dict[str, Path] = {}  # source filename → cached file
+            # Unique r2_keys the timeline needs (deduped across both ref styles).
+            needed_keys = sorted({
+                _resolve_r2_key(item) for item in vclip_items
+            })
+            local_paths: dict[str, Path] = {}  # r2_key → cached file
             downloaded_any = False
-            for source in sorted(sources):
-                r2_key = clip_map.get(source)
-                if not r2_key:
-                    raise ValueError(f"source clip not found in project: {source!r}")
+            for r2_key in needed_keys:
                 # Cache key mirrors the R2 key so it's unique per clip.
                 cached = cache_dir / r2_key.replace("/", "_")
                 if cached.exists() and cached.stat().st_size > 0:
@@ -2173,7 +2223,7 @@ def _render_worker(story_id: str) -> None:
                     r2.download_file(bucket, r2_key, str(staging))
                     staging.replace(cached)
                     downloaded_any = True
-                local_paths[source] = cached
+                local_paths[r2_key] = cached
 
             # Persist any newly downloaded clips so future renders reuse them.
             if downloaded_any:
@@ -2198,10 +2248,12 @@ def _render_worker(story_id: str) -> None:
                     timeline = {**timeline, "width": fit_w, "height": fit_h}
                     print(f"[render] auto-fit canvas {cur_w}x{cur_h} -> {fit_w}x{fit_h}")
 
-            # 4. Compile the timeline and run ffmpeg.
+            # 4. Compile the timeline and run ffmpeg. resolve_source receives
+            # the whole clip item so cross-project clips resolve by clip_id;
+            # the r2_key it maps to is the cache key from step 3.
             compiled = compile_timeline(
                 timeline,
-                resolve_source=lambda src: str(local_paths[src]),
+                resolve_source=lambda item: str(local_paths[_resolve_r2_key(item)]),
                 workdir=str(tmp),
                 font_path=OVERLAY_FONT,
             )

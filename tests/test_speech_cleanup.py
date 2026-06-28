@@ -375,6 +375,16 @@ class TestApplyOpsCleanSpeech:
                 t, [{"op": "clean_speech", "id": "vX"}], words=[],
             )
 
+    def test_clean_speech_on_cross_project_clip_errors(self):
+        # Tier 2 boundary: clean_speech can't yet resolve a foreign clip's word
+        # timings, so it must fail with a clear message rather than no-op.
+        t = one_clip_timeline(0.0, 5.0)
+        tl.video_items(t)[0]["clip_id"] = "abc-123"
+        with pytest.raises(tl.TimelineError, match="cross-project"):
+            tl.apply_ops(
+                t, [{"op": "clean_speech", "id": "v1"}], words=[],
+            )
+
     def test_result_revalidates(self):
         # A crossfade join longer than a tiny breath piece must be caught by
         # validation (crossfade must be shorter than both adjacent items).
