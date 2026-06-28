@@ -79,11 +79,9 @@ basis: `docs/visual_perception_research.md`. Ticket specs: issues #84–#89.
 
 ## Scheduling
 
-The durable runner is `.github/workflows/auto-pipeline.yml` (cron every 4h on
-`main`). It invokes Claude Code headless with the prompt "execute one iteration of
-`docs/auto_pipeline.md`." It requires a repo secret holding Claude credentials
-(`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) and `contents: write` +
-`pull-requests: write` permissions. Until that secret exists the workflow is a
-no-op. An in-session `CronCreate` can bridge the gap while a Claude session is
-live, but it is **not** durable across container reclaim — the Action is the
-real scheduler.
+**TBD** — the trigger that fires "one iteration" on a cadence is not decided yet.
+This playbook deliberately describes a single self-contained iteration so it can
+be driven by whatever scheduler we pick later (a GitHub Actions cron, a Claude
+Code on the web scheduled trigger, or a manual kick). Whatever drives it should
+invoke: "Read `docs/auto_pipeline.md` and execute one iteration." Until a
+scheduler is wired up, tickets can be worked by kicking a session manually.
