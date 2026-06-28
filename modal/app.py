@@ -146,16 +146,33 @@ def _load_words(project_id: str) -> list[dict]:
     return merged.get("words", []) or []
 
 
-def _load_audio_by_source(
-    project_id: str, timeline: dict, ops: list[dict]
-) -> dict:
-    """For each clip a clean_speech op targets, load its stored audio analysis
-    so the edit can use the VAD-fused silence crop.
+def _read_clip_audio_analysis(r2, bucket: str, project_id: str, clip_id: str):
+    """Read + shape one clip's stored audio_analysis.json from R2.
 
-    Returns {filename: {vad_prob, vad_hop, peaks, peaks_hop}} for the clips that
-    have been analyzed; clips without an analysis are simply absent, and
-    apply_ops falls back to word-gap timing for those.
+    Returns {vad_prob, vad_hop, peaks, peaks_hop} or None when the analysis is
+    missing or has no VAD curve (in which case clean_speech falls back to
+    word-gap timing). The path is per-clip and the same for local and foreign
+    clips — only the (project_id, clip_id) lookup differs by caller.
     """
+    key = f"projects/{project_id}/clips/{clip_id}/audio_analysis.json"
+    try:
+        doc = json.loads(r2.get_object(Bucket=bucket, Key=key)["Body"].read())
+    except Exception:
+        return None
+    vad = doc.get("vad") or {}
+    wave = doc.get("waveform") or {}
+    if not vad.get("prob"):
+        return None
+    return {
+        "vad_prob": vad.get("prob"),
+        "vad_hop": vad.get("hop") or 0.032,
+        "peaks": wave.get("peaks") or [],
+        "peaks_hop": wave.get("hop") or 0.02,
+    }
+
+
+def _clean_speech_targets(timeline: dict, ops: list[dict]) -> list[dict]:
+    """The video items a clean_speech op in `ops` targets (by id)."""
     from timeline import video_items
 
     target_ids = {
@@ -164,11 +181,25 @@ def _load_audio_by_source(
         if (o or {}).get("op") == "clean_speech"
     }
     if not target_ids:
-        return {}
+        return []
+    return [it for it in video_items(timeline) if it.get("id") in target_ids]
+
+
+def _load_audio_by_source(
+    project_id: str, timeline: dict, ops: list[dict]
+) -> dict:
+    """For each LOCAL clip a clean_speech op targets (bare filename, no
+    clip_id), load its stored audio analysis so the edit can use the VAD-fused
+    silence crop. Cross-project targets are handled by _load_audio_by_clip_id.
+
+    Returns {filename: {vad_prob, vad_hop, peaks, peaks_hop}} for the clips that
+    have been analyzed; clips without an analysis are simply absent, and
+    apply_ops falls back to word-gap timing for those.
+    """
     sources = {
         it.get("source")
-        for it in video_items(timeline)
-        if it.get("id") in target_ids and it.get("source")
+        for it in _clean_speech_targets(timeline, ops)
+        if it.get("source") and not it.get("clip_id")
     }
     if not sources:
         return {}
@@ -186,21 +217,95 @@ def _load_audio_by_source(
         cid = id_by_name.get(name)
         if not cid:
             continue
-        key = f"projects/{project_id}/clips/{cid}/audio_analysis.json"
-        try:
-            doc = json.loads(r2.get_object(Bucket=bucket, Key=key)["Body"].read())
-        except Exception:
-            continue
-        vad = doc.get("vad") or {}
-        wave = doc.get("waveform") or {}
-        if not vad.get("prob"):
-            continue
-        out[name] = {
-            "vad_prob": vad.get("prob"),
-            "vad_hop": vad.get("hop") or 0.032,
-            "peaks": wave.get("peaks") or [],
-            "peaks_hop": wave.get("hop") or 0.02,
-        }
+        data = _read_clip_audio_analysis(r2, bucket, project_id, cid)
+        if data is not None:
+            out[name] = data
+    return out
+
+
+def _resolve_clips_global(sb, clip_ids) -> dict:
+    """Resolve a set of global clip_ids → {clip_id: {project_id, filename}}.
+
+    Single-user app: any clip_id is resolvable across all projects with no
+    permission check (see docs/cross_project_editing.md). Only the rows actually
+    referenced are fetched.
+    """
+    ids = sorted({c for c in (clip_ids or []) if c})
+    if not ids:
+        return {}
+    rows = sb.table("clips").select("id, project_id, filename").in_(
+        "id", ids
+    ).execute()
+    return {
+        c["id"]: {"project_id": c["project_id"], "filename": c.get("filename")}
+        for c in (rows.data or [])
+    }
+
+
+def _load_words_by_clip_id(timeline: dict, ops: list[dict]) -> dict:
+    """Words for each FOREIGN clip a clean_speech op targets, keyed by clip_id.
+
+    Tier 2: a cross-project clean_speech target carries a global `clip_id`. We
+    resolve each one's owning project, read THAT project's merged.json, and keep
+    only that clip's words (matched by the clip's own filename within its own
+    project). Returns {clip_id: [words…]}; absent/unanalyzed clips are simply
+    omitted. Resolving per clip_id — not by filename over the home project —
+    avoids the filename-collision trap (two clips, same filename, different
+    projects). See docs/cross_project_editing.md (Tier 2).
+    """
+    clip_ids = {
+        it.get("clip_id")
+        for it in _clean_speech_targets(timeline, ops)
+        if it.get("clip_id")
+    }
+    if not clip_ids:
+        return {}
+
+    sb = _supabase()
+    resolved = _resolve_clips_global(sb, clip_ids)
+    # Load each owning project's merged.json once, then slice per clip filename.
+    words_by_project: dict[str, list[dict]] = {}
+    out: dict[str, list[dict]] = {}
+    for cid, info in resolved.items():
+        pid = info["project_id"]
+        filename = info.get("filename")
+        if pid not in words_by_project:
+            words_by_project[pid] = _load_words(pid)
+        clip_words = [
+            w for w in words_by_project[pid]
+            if w.get("source") in (None, filename)
+        ]
+        out[cid] = clip_words
+    return out
+
+
+def _load_audio_by_clip_id(timeline: dict, ops: list[dict]) -> dict:
+    """Audio analysis for each FOREIGN clean_speech target, keyed by clip_id.
+
+    Tier 2: resolve each target's clip_id → (project_id, clip_id) globally and
+    read its per-clip audio_analysis.json directly (the path is already
+    per-clip; only the lookup was home-scoped). Returns
+    {clip_id: {vad_prob, vad_hop, peaks, peaks_hop}}; unanalyzed clips are
+    omitted and clean_speech falls back to word-gap timing for those.
+    """
+    clip_ids = {
+        it.get("clip_id")
+        for it in _clean_speech_targets(timeline, ops)
+        if it.get("clip_id")
+    }
+    if not clip_ids:
+        return {}
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+    resolved = _resolve_clips_global(sb, clip_ids)
+
+    out: dict = {}
+    for cid, info in resolved.items():
+        data = _read_clip_audio_analysis(r2, bucket, info["project_id"], cid)
+        if data is not None:
+            out[cid] = data
     return out
 
 
@@ -1939,6 +2044,10 @@ async def edit_timeline(request: Request) -> JSONResponse:
                     )
                 base = timeline_from_ranges(ranges)
             # clean_speech needs the aligned transcript; load it only when used.
+            # Home-project words/audio cover local targets (bare filename); the
+            # *_by_clip_id maps cover cross-project targets (Tier 2) — each
+            # foreign clip's words/audio come from its OWN owning project, keyed
+            # by clip_id. See docs/cross_project_editing.md.
             needs_words = any(
                 (o or {}).get("op") == "clean_speech" for o in ops
             )
@@ -1947,8 +2056,16 @@ async def edit_timeline(request: Request) -> JSONResponse:
                 _load_audio_by_source(story["project_id"], base, ops)
                 if needs_words else None
             )
+            words_by_clip_id = (
+                _load_words_by_clip_id(base, ops) if needs_words else None
+            )
+            audio_by_clip_id = (
+                _load_audio_by_clip_id(base, ops) if needs_words else None
+            )
             new_timeline = apply_ops(
-                base, ops, words=words, audio_by_source=audio_by_source
+                base, ops, words=words, audio_by_source=audio_by_source,
+                words_by_clip_id=words_by_clip_id,
+                audio_by_clip_id=audio_by_clip_id,
             )
             ops_record = ops
     except TimelineError as exc:
@@ -2021,17 +2138,26 @@ async def preview_clean_speech(request: Request) -> JSONResponse:
             )
         base = timeline_from_ranges(ranges)
 
+    # Home-project words/audio for a local target; the *_by_clip_id maps cover a
+    # cross-project target (Tier 2) — keyed by the foreign clip's global
+    # clip_id, sourced from its own owning project. See cross_project_editing.md.
+    probe_ops = [{"op": "clean_speech", "id": item_id}]
     words = _load_words(story["project_id"])
-    audio_map = _load_audio_by_source(
-        story["project_id"], base, [{"op": "clean_speech", "id": item_id}]
-    )
+    audio_map = _load_audio_by_source(story["project_id"], base, probe_ops)
+    words_by_clip_id = _load_words_by_clip_id(base, probe_ops)
+    audio_by_clip_id = _load_audio_by_clip_id(base, probe_ops)
+
     from timeline import video_items as _vitems
-    src = next((it.get("source") for it in _vitems(base)
-                if it.get("id") == item_id), None)
-    audio = audio_map.get(src)
+    target = next((it for it in _vitems(base) if it.get("id") == item_id), None)
+    cid = (target or {}).get("clip_id")
+    if cid and cid in audio_by_clip_id:
+        audio = audio_by_clip_id.get(cid)
+    else:
+        audio = audio_map.get((target or {}).get("source"))
     try:
         new_timeline, plan = expand_clean_speech(
-            base, item_id, words, params, audio
+            base, item_id, words, params, audio,
+            words_by_clip_id=words_by_clip_id,
         )
     except TimelineError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

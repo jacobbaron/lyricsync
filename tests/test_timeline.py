@@ -481,6 +481,37 @@ class TestCompile:
                    for e in errors)
 
 
+class TestWordsForItem:
+    """Tier 2 per-clip word resolver (filename-collision-safe)."""
+
+    def test_local_item_filters_flat_words_by_filename(self):
+        item = {"id": "v1", "kind": "clip", "source": "A.mov"}
+        words = [
+            {"text": "a", "source": "A.mov", "start": 0, "end": 1},
+            {"text": "b", "source": "B.mov", "start": 0, "end": 1},
+        ]
+        got = tl._words_for_item(item, words, None)
+        assert [w["text"] for w in got] == ["a"]
+
+    def test_foreign_item_uses_clip_id_map_not_filename(self):
+        # The home flat list shares the foreign clip's filename — must be
+        # ignored in favor of the clip_id-keyed list.
+        item = {"id": "v1", "kind": "clip", "source": "LABEL.mov",
+                "clip_id": "cid-1"}
+        home_words = [{"text": "home", "source": "LABEL.mov", "start": 0, "end": 1}]
+        foreign = [{"text": "foreign", "source": "REAL.mov", "start": 0, "end": 1}]
+        got = tl._words_for_item(item, home_words, {"cid-1": foreign})
+        assert [w["text"] for w in got] == ["foreign"]
+
+    def test_foreign_item_missing_from_map_falls_back_to_filename(self):
+        # If the clip_id isn't in the map (unanalyzed / no words), fall back to
+        # the home filename filter rather than crashing.
+        item = {"id": "v1", "kind": "clip", "source": "A.mov", "clip_id": "cid-x"}
+        home_words = [{"text": "a", "source": "A.mov", "start": 0, "end": 1}]
+        got = tl._words_for_item(item, home_words, {"other": []})
+        assert [w["text"] for w in got] == ["a"]
+
+
 # ---------------------------------------------------------------------------
 # choose_canvas — output frame auto-fit
 # ---------------------------------------------------------------------------

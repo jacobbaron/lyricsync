@@ -658,58 +658,77 @@ _OPS = {
 }
 
 
+def _audio_for_item(
+    item: dict,
+    audio_by_source: dict | None,
+    audio_by_clip_id: dict | None,
+) -> dict | None:
+    """Resolve one clip item's stored audio analysis.
+
+    Cross-project clips (with a global `clip_id`) read from
+    `audio_by_clip_id[clip_id]` — keyed globally, so a foreign clip's analysis
+    is found regardless of the home project. Local clips fall back to the legacy
+    filename-keyed `audio_by_source`. See docs/cross_project_editing.md (Tier 2).
+    """
+    cid = item.get("clip_id")
+    if cid and audio_by_clip_id is not None and cid in audio_by_clip_id:
+        return audio_by_clip_id.get(cid)
+    return (audio_by_source or {}).get(item.get("source"))
+
+
 def apply_ops(
     timeline: dict, ops: list[dict], words: list[dict] | None = None,
     audio_by_source: dict | None = None,
+    words_by_clip_id: dict | None = None,
+    audio_by_clip_id: dict | None = None,
 ) -> dict:
     """Apply edit operations to a copy of the timeline and validate the result.
 
     Raises TimelineError with an LLM-readable message naming the failing op.
     The input timeline is never mutated.
 
-    `words` are the project's aligned words; required only when an op needs
+    `words` are the home project's aligned words; required only when an op needs
     transcript timing (currently just `clean_speech`). Passing them is cheap
     and harmless when no such op is present.
 
     `audio_by_source` maps a clip filename to its stored audio analysis
     ({vad_prob, vad_hop, peaks, peaks_hop}); when present for a clean_speech
     target, the VAD-fused silence crop is used instead of word-gap timing.
+
+    `words_by_clip_id` / `audio_by_clip_id` (Tier 2, cross-project) are keyed by
+    a clip's global `clip_id`. When a clean_speech target carries a `clip_id`,
+    its words/audio are taken from these maps (already scoped to that clip's
+    owning project) instead of the home-project filename lookup — so editing a
+    foreign clip works, and a filename shared by two clips in different projects
+    never cross-contaminates. Local clips (no `clip_id`) keep the legacy path.
     """
     result = copy.deepcopy(timeline)
     valid = sorted(list(_OPS) + ["clean_speech"])
     for i, op in enumerate(ops or []):
         name = (op or {}).get("op")
         if name == "clean_speech":
-            if words is None:
+            if words is None and words_by_clip_id is None:
                 raise TimelineError(
                     f"op {i} (clean_speech): no transcript is loaded for this "
                     "story, so word timings are unavailable"
                 )
             try:
                 item_id = (op or {}).get("id", "")
-                src = None
                 target = None
                 for it in video_items(result):
                     if it.get("id") == item_id:
-                        src = it.get("source")
                         target = it
                         break
-                # Tier 2 boundary: clean_speech needs the clip's word timings
-                # and audio analysis, which are still addressed by
-                # (home project_id, filename). A foreign clip (referenced by a
-                # cross-project clip_id) isn't covered yet — fail with a clear
-                # message rather than silently producing a no-op cut.
-                # See docs/cross_project_editing.md (Tier 2 plan).
-                if target is not None and target.get("clip_id"):
-                    raise TimelineError(
-                        f"op {i} (clean_speech): clean_speech is not yet "
-                        f"supported on cross-project clips (item {item_id!r} "
-                        "references a clip_id from another project). This is "
-                        "planned for Tier 2; see docs/cross_project_editing.md."
-                    )
-                audio = (audio_by_source or {}).get(src)
+                # Tier 2 (shipped): a clean_speech target carrying a global
+                # clip_id resolves its words/audio per-clip from the *_by_clip_id
+                # maps (the clip's owning project), so cross-project cleanup
+                # works exactly like local. See docs/cross_project_editing.md.
+                audio = _audio_for_item(
+                    target or {}, audio_by_source, audio_by_clip_id
+                )
                 result, _ = expand_clean_speech(
                     result, item_id, words, (op or {}).get("params"), audio,
+                    words_by_clip_id=words_by_clip_id,
                 )
             except TimelineError as exc:
                 raise TimelineError(f"op {i} ({name}): {exc}") from exc
@@ -1207,20 +1226,55 @@ def plan_speech_cleanup_vad(
     }
 
 
+def _words_for_item(
+    item: dict,
+    words: list[dict] | None,
+    words_by_clip_id: dict | None,
+) -> list[dict]:
+    """Pick the aligned words that belong to one clip item.
+
+    Cross-project clips (carrying a global `clip_id`) take their words from
+    `words_by_clip_id[clip_id]` — already scoped to exactly that clip's owning
+    project, so a filename shared by two clips in different projects can't bleed
+    across (the filename-collision trap). Local clips (bare `source` filename,
+    no `clip_id`) keep the legacy behavior: filter the flat home-project `words`
+    list by `source` filename. See docs/cross_project_editing.md (Tier 2).
+    """
+    cid = item.get("clip_id")
+    if cid and words_by_clip_id is not None and cid in words_by_clip_id:
+        # Authoritative per-clip words — already the right project's, so use as
+        # is. We do NOT re-filter by `source` filename: a foreign clip's words
+        # may be tagged with that clip's real filename, which can differ from
+        # the human-readable label `source` carried on the timeline item.
+        return list(words_by_clip_id.get(cid) or [])
+    src = item.get("source")
+    return [w for w in (words or []) if w.get("source") in (None, src)]
+
+
 def expand_clean_speech(
     timeline: dict,
     item_id: str,
     words: list[dict],
     params: dict | None = None,
     audio: dict | None = None,
+    words_by_clip_id: dict | None = None,
 ) -> tuple[dict, dict]:
     """Replace one clip item with tight jump-cut sub-items per the cleanup plan.
 
     Pure: returns a NEW timeline (the input is not mutated) plus the
     `plan_speech_cleanup` result so callers can report what was removed.
 
-    `words` are aligned words (with `source` + local times); only those whose
-    `source` matches the item are used. The first sub-item inherits the
+    `words` are aligned words (with `source` + local times); for a local clip
+    only those whose `source` matches the item are used. For a cross-project
+    clip (one carrying a global `clip_id`), per-clip words are taken from
+    `words_by_clip_id[clip_id]` instead — already scoped to that clip's owning
+    project, which avoids the filename-collision trap of filtering the flat
+    home-project list by a (possibly shared) filename. See
+    docs/cross_project_editing.md (Tier 2).
+
+    `audio` is this clip's stored audio analysis, already resolved by the caller
+    for the target clip (by clip_id when foreign, else by filename); when
+    present the VAD-fused silence crop is used. The first sub-item inherits the
     original item's `transition_in`; subsequent ones are hard cuts unless
     `params["join"]` supplies a crossfade transition to soften the seams. All
     other per-clip fields (speed, mute, audio_fx, note) carry over unchanged.
@@ -1231,8 +1285,7 @@ def expand_clean_speech(
 
     span_start = float(item["src_start"])
     span_end = float(item["src_end"])
-    src = item.get("source")
-    relevant = [w for w in (words or []) if w.get("source") in (None, src)]
+    relevant = _words_for_item(item, words, words_by_clip_id)
 
     # Prefer the VAD-fused plan when this clip's audio analysis is available
     # (accurate silence edges); fall back to word-gap timing otherwise.
