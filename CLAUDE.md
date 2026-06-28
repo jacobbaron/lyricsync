@@ -218,17 +218,28 @@ screen instead of the face, it's a blurry pan, it's sideways/letterboxed).
    `{time, kind, description, expression, tone}` per moment (e.g. *"195s — soft
    affectionate smile as he's called perfect"*). This is how you *find* the
    face-zoom / reaction / gag by time.
-4. **Actual frames** — the ground truth. Render a short **contact-sheet** of the
-   candidate moments, download it, extract stills
-   (`ffmpeg -ss <t> -i out.mp4 -frames:v 1 f.jpg` via `imageio-ffmpeg`), and
-   **look at them** (Read the .jpg). Do this *before* finalizing.
+4. **Interactive perception tools (roadmap §1.3)** — the ground truth, on demand.
+   Address a clip by its `id` (clip uuid); all are API-key callable and cached by
+   their params (a repeat is a cache hit). Prefer these over the old
+   render→download→`imageio-ffmpeg`-extract dance:
+   - `GET /api/clips/{id}/contact-sheet?start=&end=&cols=&rows=` (default 4×4) →
+     one tiled jpeg with timestamps burned in → returns a signed `url`; download
+     and **Read** it. Best first look at a window.
+   - `GET /api/clips/{id}/frames?t=&n=&interval=` → N frames → `frames:[{t, url}]`
+     (signed); download a `url` and **Read** it to confirm one exact moment.
+   - `POST /api/clips/{id}/describe {start, end, question?}` → Gemini Flash on
+     just that sub-range (sharper than the coarse whole-clip analysis on long
+     clips) → `{answer}`.
+   Do this *before* finalizing. (The old whole-clip analysis is still in
+   `result.highlights`; these tools let you zoom in where it's coarse.)
 
 ### Workflow
 1. **Broad:** clip list + durations + visual summaries + transcripts → get the
    story/arc.
 2. **Detailed:** highlights + exact line timings → list candidate beats w/ times.
-3. **Look:** one contact-sheet render of the candidates → extract + view frames
-   → keep beats whose *picture* works, fix/replace the rest.
+3. **Look:** `GET /api/clips/{id}/contact-sheet` over the candidate window → Read
+   the tiled image; `describe` a sub-range or pull `frames` where unsure → keep
+   beats whose *picture* works, fix/replace the rest.
 4. **Build → render → spot-check** the changed regions by frame → refine.
 5. **Deliver** the signed `download_url` as a clickable Markdown link.
 
@@ -265,8 +276,10 @@ screen instead of the face, it's a blurry pan, it's sideways/letterboxed).
 - **Data:** the app REST API (Bearer `lsk_…`) covers reads
   (projects/clips/visual/transcript) *and* writes (create story, render, edit
   ops) — prefer it; it's resilient when the Supabase MCP connector is flaky.
-- **Frames:** render → `signed-url` → download mp4 → `imageio-ffmpeg` extract →
-  Read the image.
+- **Frames (source footage):** `GET /api/clips/{id}/contact-sheet` or `/frames`
+  → download the signed `url` → Read the image; `POST /api/clips/{id}/describe`
+  for a Gemini read of a sub-range. (Only fall back to render→`signed-url`→
+  download→`imageio-ffmpeg` extract when you need to inspect a *rendered* cut.)
 - **Deliver:** the signed `download_url` as a one-click Markdown link.
 
 ## Gotchas

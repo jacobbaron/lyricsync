@@ -139,12 +139,27 @@ Visual sources, cheap → ground truth:
 2. **`clips.visual_description`** — coarse "what's in this clip."
 3. **`with_transcript` analysis `result.highlights`** — `{time, kind, description,
    expression, tone}` per moment; how you *find* the reaction / face-zoom / gag.
-4. **Actual frames** — the ground truth. Render → download → extract stills → **look**.
+4. **Interactive perception tools (roadmap §1.3)** — the ground truth, on demand,
+   addressing a clip by its `id` (clip uuid). Use these to *look* at the actual
+   footage before committing a beat — no render/download/extract dance:
+   - `GET /api/clips/{id}/contact-sheet?start=&end=&cols=&rows=` (default 4×4) →
+     one tiled jpeg with timestamps burned in across the range. Returns a signed
+     `url`; download it and **`Read`** it. Best first look at a window.
+   - `GET /api/clips/{id}/frames?t=&n=&interval=` → N individual frames at/after
+     `t`. Returns `frames:[{t, url}]` (signed); download a `url` and **`Read`**
+     it to confirm one exact moment.
+   - `POST /api/clips/{id}/describe {start, end, question?}` → Gemini Flash on
+     JUST that sub-range (much sharper than the coarse whole-clip analysis on a
+     long clip). Returns `{answer}`. Ask e.g. "is his face in frame and is the
+     expression a genuine laugh?".
+   All three are API-key callable (`Authorization: Bearer lsk_…`), cached by
+   their params (a repeat is a cache hit), and cross-project-safe (clip-id keyed).
 
 Process: **broad** (clip list + durations + summaries + transcript → the arc) →
 **detailed** (highlights + exact line timings → candidate beats) → **look**
-(contact-sheet render → extract frames → Read them → keep beats whose picture works)
-→ **build → render → spot-check the changed regions by frame** → **deliver**.
+(contact-sheet the candidate window → `Read` it; `describe` a sub-range or pull
+`frames` where unsure → keep beats whose picture works) → **build → render →
+spot-check the changed regions by frame** → **deliver**.
 
 Principles learned the hard way:
 - **Audio and picture must agree.** Great line over wrong frame = nonsense.
@@ -164,6 +179,9 @@ FF=$(python3 -c "import imageio_ffmpeg as f;print(f.get_ffmpeg_exe())")
 "$FF" -ss 8 -t 6 -i out.mp4 -lavfi showspectrumpic=s=600x300:legend=0 spec.png   # sine sweep = a clean rising diagonal curve
 "$FF" -ss $T -i out.mp4 -frames:v 1 -q:v 3 f.jpg                                 # extract a frame, then Read f.jpg
 ```
+(To look at *source* footage before rendering, prefer the §1.3 perception
+endpoints — `contact-sheet` / `frames` / `describe` — over a render-and-extract;
+the ffmpeg checks above are for verifying a *rendered* `out.mp4`.)
 Then `Read` the .jpg / .png to actually look. Confirm: no unwanted bars, audio
 present where expected, the sweep/sound survived, and the picture matches the
 line at each seam.
