@@ -1852,6 +1852,351 @@ def _analyze_worker(analysis_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PERCEPTION-01: Interactive perception tools (roadmap §1.3)
+# ---------------------------------------------------------------------------
+#
+# On-demand "zoom in" perception for an editing agent: instead of trusting a
+# single whole-clip Gemini analysis (coarse on long clips), the agent can pull
+# frames, ask Gemini about a specific sub-range, or grab a tiled contact sheet
+# of a window — the same way a human editor scrubs.
+#
+# Each tool is a synchronous Modal endpoint that Vercel calls and *awaits*
+# (results are wanted inline, unlike the fire-and-forget analyze worker). The
+# web route owns auth (Bearer lsk_…), cache lookup/write (clip_inspections),
+# and presigning the R2 keys these return. Outputs are immutable per params and
+# cached in R2 under the clip prefix.
+
+# Same base as analyze_image (ffmpeg + genai + boto3 + supabase + helper
+# modules) plus the bundled overlay font for burning timestamps into contact
+# sheets via drawtext.
+perception_image = analyze_image.add_local_file(
+    Path(__file__).parent / "assets" / "Montserrat.ttf",
+    "/root/overlay_font.ttf",
+)
+
+
+def _perception_clip(sb, clip_id: str) -> dict:
+    """Load the (r2_key, project_id, duration_secs) for a clip, or raise 404."""
+    row = sb.table("clips").select(
+        "id, r2_key, project_id, duration_secs, filename"
+    ).eq("id", clip_id).limit(1).execute()
+    if not row.data:
+        raise HTTPException(status_code=404, detail="clip not found")
+    clip = row.data[0]
+    if not clip.get("r2_key"):
+        raise HTTPException(status_code=409, detail="clip has no uploaded video yet")
+    return clip
+
+
+def _download_clip(r2, bucket: str, clip: dict, tmp: Path) -> Path:
+    ext = Path(clip["r2_key"]).suffix or ".mp4"
+    video_path = tmp / f"clip{ext}"
+    r2.download_file(bucket, clip["r2_key"], str(video_path))
+    return video_path
+
+
+def _extract_frame(video_path: Path, t: float, out: Path) -> None:
+    """Fast-seek a single frame at time `t` to `out` as a JPEG.
+
+    `-ss` before `-i` is the fast input seek; `-frames:v 1` grabs one frame.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{max(t, 0):.3f}", "-i", str(video_path),
+        "-frames:v", "1", "-q:v", "3",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+@app.function(image=perception_image, secrets=secrets, timeout=300)
+@modal.fastapi_endpoint(method="POST")
+async def perception_frames(request: Request) -> JSONResponse:
+    """Extract N frames from a clip and store them in R2.
+
+    Body: {clip_id, t, n, interval}. Extracts `n` frames starting at `t`,
+    `interval` seconds apart (fast-seek per frame), uploads each to
+    projects/<pid>/clips/<cid>/frames/<t>.jpg, and returns the R2 keys + the
+    exact times. The web route presigns the keys.
+
+    Response: {clip_id, frames: [{t, key}]}
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    clip_id = body.get("clip_id")
+    if not clip_id:
+        raise HTTPException(status_code=400, detail="clip_id required")
+    t0 = float(body.get("t") or 0.0)
+    n = max(1, min(int(body.get("n") or 1), 30))
+    interval = float(body.get("interval") or 1.0)
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+    clip = _perception_clip(sb, clip_id)
+    project_id = clip["project_id"]
+    duration = clip.get("duration_secs")
+
+    frames: list[dict] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        video_path = _download_clip(r2, bucket, clip, tmp)
+        if duration is None:
+            duration = _probe_duration(video_path)
+        for i in range(n):
+            t = t0 + i * interval
+            if duration is not None and t > float(duration):
+                break
+            out = tmp / f"f{i}.jpg"
+            try:
+                _extract_frame(video_path, t, out)
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or "")[-800:]
+                raise HTTPException(
+                    status_code=500, detail=f"ffmpeg frame extract failed: {detail}"
+                ) from exc
+            key = f"projects/{project_id}/clips/{clip_id}/frames/{t:.3f}.jpg"
+            r2.upload_file(
+                str(out), bucket, key,
+                ExtraArgs={"ContentType": "image/jpeg"},
+            )
+            frames.append({"t": round(t, 3), "key": key})
+
+    return JSONResponse({"clip_id": clip_id, "frames": frames})
+
+
+@app.function(image=perception_image, secrets=secrets, timeout=600)
+@modal.fastapi_endpoint(method="POST")
+async def perception_describe(request: Request) -> JSONResponse:
+    """Ask Gemini Flash about a sub-range of a clip.
+
+    Body: {clip_id, start, end, question?}. Trims [start, end] with ffmpeg,
+    uploads the short clip to the Gemini File API, and asks `question` (or a
+    sensible default describing who's on screen, expressions, and actions).
+
+    Response: {clip_id, start, end, answer, model}
+    """
+    import time
+
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    clip_id = body.get("clip_id")
+    if not clip_id:
+        raise HTTPException(status_code=400, detail="clip_id required")
+    start = float(body.get("start") or 0.0)
+    end = float(body.get("end") if body.get("end") is not None else start + 5.0)
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end must be greater than start")
+    question = (body.get("question") or "").strip() or (
+        "Describe exactly what is happening in this short clip: who is on "
+        "screen, their facial expressions and emotional tone, what they are "
+        "doing, the framing/shot type, and anything notable for an editor "
+        "choosing whether to use this moment. Be concrete and concise."
+    )
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+    clip = _perception_clip(sb, clip_id)
+
+    from google import genai
+
+    model = "gemini-3.5-flash"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        video_path = _download_clip(r2, bucket, clip, tmp)
+
+        # Trim the sub-range. Re-encode (not stream-copy) so the cut is frame
+        # accurate and small for the Gemini upload.
+        sub = tmp / "sub.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(video_path),
+            "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:"
+            "force_divisible_by=2",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+            str(sub),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or "")[-800:]
+            raise HTTPException(
+                status_code=500, detail=f"ffmpeg trim failed: {detail}"
+            ) from exc
+
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        gfile = client.files.upload(file=str(sub))
+        t0 = time.time()
+        while getattr(gfile.state, "name", str(gfile.state)) == "PROCESSING":
+            if time.time() - t0 > 120:
+                raise HTTPException(status_code=504, detail="Gemini upload timed out")
+            time.sleep(2)
+            gfile = client.files.get(name=gfile.name)
+        state = getattr(gfile.state, "name", str(gfile.state))
+        if state != "ACTIVE":
+            raise HTTPException(
+                status_code=502, detail=f"Gemini file processing ended in state {state}"
+            )
+
+        prompt = (
+            f"This clip covers seconds {start:.1f}–{end:.1f} of a longer "
+            f"video.\n\n{question}"
+        )
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=[gfile, prompt]
+            )
+            answer = (resp.text or "").strip()
+        finally:
+            try:
+                client.files.delete(name=gfile.name)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return JSONResponse({
+        "clip_id": clip_id,
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "answer": answer,
+        "model": model,
+    })
+
+
+@app.function(image=perception_image, secrets=secrets, timeout=300)
+@modal.fastapi_endpoint(method="POST")
+async def perception_contact_sheet(request: Request) -> JSONResponse:
+    """Build one tiled contact-sheet image across a clip range.
+
+    Body: {clip_id, start, end, cols, rows} (default 4×4). Samples cols*rows
+    frames evenly across [start, end], burns the timestamp into each, and tiles
+    them into a single JPEG stored in R2.
+
+    Response: {clip_id, start, end, cols, rows, key}
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    clip_id = body.get("clip_id")
+    if not clip_id:
+        raise HTTPException(status_code=400, detail="clip_id required")
+    cols = max(1, min(int(body.get("cols") or 4), 8))
+    rows = max(1, min(int(body.get("rows") or 4), 8))
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+    clip = _perception_clip(sb, clip_id)
+    project_id = clip["project_id"]
+    duration = clip.get("duration_secs")
+
+    count = cols * rows
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        video_path = _download_clip(r2, bucket, clip, tmp)
+        if duration is None:
+            duration = _probe_duration(video_path) or 0.0
+
+        start = float(body.get("start") or 0.0)
+        end = float(body.get("end") if body.get("end") is not None else duration)
+        if end <= start:
+            end = start + max(float(duration) - start, 1.0)
+        # Even sampling across [start, end]; place each sample at the midpoint
+        # of its cell so the first/last frames aren't exactly on the edges.
+        span = end - start
+        times = [start + span * (i + 0.5) / count for i in range(count)]
+
+        # Extract + label each thumbnail. drawtext burns the wall-clock time of
+        # the sample into the bottom-left of the frame so the agent can map a
+        # tile back to a timestamp.
+        thumbs: list[Path] = []
+        for i, t in enumerate(times):
+            raw = tmp / f"r{i}.jpg"
+            try:
+                _extract_frame(video_path, t, raw)
+            except subprocess.CalledProcessError:
+                # Past EOF or a bad seek — skip; tiling tolerates fewer inputs.
+                continue
+            labeled = tmp / f"l{i}.jpg"
+            label = f"{t:.1f}s"
+            draw = (
+                f"scale=480:-2,"
+                f"drawtext=fontfile={OVERLAY_FONT}:text='{label}':"
+                f"x=8:y=h-th-8:fontsize=28:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=6"
+            )
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(raw), "-vf", draw, str(labeled)],
+                    check=True, capture_output=True, text=True,
+                )
+                thumbs.append(labeled)
+            except subprocess.CalledProcessError:
+                thumbs.append(raw)
+
+        if not thumbs:
+            raise HTTPException(status_code=500, detail="no frames could be extracted")
+
+        # Tile into one image. The tile filter needs rows*cols inputs to fill
+        # the grid; pad the count with the last thumb if some were skipped.
+        while len(thumbs) < count:
+            thumbs.append(thumbs[-1])
+        # Feed the thumbnails as a numbered image sequence so ffmpeg's tile
+        # filter can lay them out in one pass.
+        seq_dir = tmp / "seq"
+        seq_dir.mkdir()
+        for i, p in enumerate(thumbs[:count]):
+            (seq_dir / f"{i:03d}.jpg").write_bytes(p.read_bytes())
+
+        sheet = tmp / "sheet.jpg"
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-framerate", "1", "-i", str(seq_dir / "%03d.jpg"),
+                    "-vf", f"tile={cols}x{rows}:padding=4:margin=4:color=black",
+                    "-frames:v", "1", "-q:v", "3",
+                    str(sheet),
+                ],
+                check=True, capture_output=True, text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or "")[-800:]
+            raise HTTPException(
+                status_code=500, detail=f"ffmpeg tile failed: {detail}"
+            ) from exc
+
+        key = (
+            f"projects/{project_id}/clips/{clip_id}/contact_sheets/"
+            f"{start:.2f}_{end:.2f}_{cols}x{rows}.jpg"
+        )
+        r2.upload_file(
+            str(sheet), bucket, key, ExtraArgs={"ContentType": "image/jpeg"},
+        )
+
+    return JSONResponse({
+        "clip_id": clip_id,
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "cols": cols,
+        "rows": rows,
+        "key": key,
+    })
+
+
+# ---------------------------------------------------------------------------
 # EDL-01: Edit Timeline (synchronous — Vercel proxies the LLM's edit ops here)
 # ---------------------------------------------------------------------------
 
