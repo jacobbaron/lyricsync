@@ -112,6 +112,78 @@ so accuracy on the user's recurring vocabulary climbs without any model training
 
 ---
 
+## RAG retrieval layer — context corpus, searched per clip
+
+The flywheel above is a *structured term list*. A RAG layer generalizes it: a
+**document corpus** of richer context (not just terms) that you semantically
+search and inject. It's the retrieval engine *under* Levers 1+2 — the answer to
+"how do we pick what to inject" once the corpus is bigger than a hand-curated
+list.
+
+### The crux: there's no query until you've transcribed
+
+Normal RAG embeds a **text query** and retrieves against it. Transcription has no
+text query up front — the thing you'd search with is the audio you haven't
+transcribed yet. Naive "RAG for transcription" trips on exactly this. Resolve it
+by forming the query from signals you *do* have, in two passes:
+
+1. **Pre-transcription query** (before any audio): project name/description, clip
+   filename, sibling clips in the project, and **OCR / visual analysis** of this
+   clip (on-screen product labels, the DAW screen). Retrieve a first context set.
+2. **Post-first-pass query** (the natural fit): run the cheap raw Whisper pass,
+   then **use that noisy transcript as the query** to retrieve precise context,
+   and feed it into the **correction pass (Lever 2)** — re-decoding isn't needed
+   because alignment runs on the corrected text anyway. The raw transcript *is*
+   the query; this is the cleanest design.
+
+Granularity: retrieve **per clip** (sweet spot), or **per window** for long
+technical clips where the topic drifts (acoustics → mixing → measurement).
+
+### What gets injected where — match retrieval to the budget
+
+RAG returns *passages*; the two levers want different shapes:
+- **→ Lever 2 (LLM correction): the primary home.** No 224-token cap — feed the
+  retrieved chunks straight in ("here are reference passages about this project's
+  domain; fix misheard terms"). The LLM reasons over prose and ignores irrelevant
+  hits. RAG fits here naturally.
+- **→ Lever 1 (Whisper prompt): distill, don't dump.** 224 tokens wants
+  high-precision *terms*, not paragraphs — and off-topic prose actively induces
+  hallucination. So extract the salient entities from the retrieved chunks into a
+  short term list. For the tight prompt, the curated lexicon is often still better
+  than raw RAG; use RAG to *keep the lexicon fresh*, not to fill the prompt with
+  prose.
+
+### Corpus sources
+
+- Everything the flywheel already mines (prior transcripts, OCR, overlay copy,
+  user corrections) — now stored as searchable chunks, not just term counts.
+- The user's **project notes / descriptions / scripts**.
+- **External reference docs** that a term list can't capture: product spec sheets
+  & manuals (brand spellings, model numbers), an audio-engineering glossary, tool
+  terminology. This is where RAG earns its keep over the lexicon — large,
+  unstructured, domain corpora you'd never hand-curate.
+
+### Infra — no new datastore
+
+Postgres is already there → use **pgvector** (`context_documents` +
+`context_chunks(embedding vector)` tables). Embed chunks on ingest (an embedding
+API or a small Modal function), cosine-search at transcription time. No separate
+vector DB; matches the repo's "JSON sidecar + a table" pattern.
+
+### Risks
+
+- **Wrong-context injection** is the main failure: a confident-but-irrelevant
+  retrieval biases toward words not actually said (worst in the Whisper prompt,
+  where it hallucinates). Mitigate with a similarity floor, anchoring relevance to
+  the first-pass transcript, and preferring the correction-pass home where the LLM
+  can disregard bad hits.
+- **Cold start**: empty corpus for a new user → seed with the external domain
+  reference docs + project metadata until their own content accumulates.
+- **Cost/latency**: two passes + retrieval per clip; cache project-level
+  retrievals across clips.
+
+---
+
 ## Fine-tuning — when it's actually warranted (not first)
 
 Be honest about the heavy path: fine-tuning is rarely needed for "get the jargon
@@ -136,7 +208,10 @@ data (hundreds+ of corrected utterances). Note two constraints:
    overlay copy; relevance-rank to fill the 224-token budget.
 3. **Lever 2** — LLM glossary-correction before alignment (timing-safe). Biggest
    accuracy lift; uses the full lexicon.
-4. **Correction UI** — capture user edits → strongest lexicon signal + future
-   training data.
-5. **Lever 3 / fine-tuning** — only if A/B shows the API engine is the ceiling, or
+4. **RAG layer** — pgvector corpus + two-pass retrieval (raw transcript as query)
+   feeding the Lever 2 correction pass; add external reference docs. Generalizes
+   the flywheel once the corpus outgrows a curated term list.
+5. **Correction UI** — capture user edits → strongest lexicon/corpus signal +
+   future training data.
+6. **Lever 3 / fine-tuning** — only if A/B shows the API engine is the ceiling, or
    the correction corpus grows enough to justify training. Data-gated, not now.
