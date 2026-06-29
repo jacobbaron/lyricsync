@@ -16,9 +16,33 @@ basis: `docs/visual_perception_research.md`. Ticket specs: issues #84–#89.
             └── T5(#88) ── T6(#89)
   T4(#87)  (independent)
   ```
-- A ticket is **actionable** when *every* dependency ticket is **closed** and the
-  ticket has no open PR and no `🤖 claimed` comment newer than 6h (the claim TTL —
-  lets a stalled claim be retried).
+- **Status labels** (applying a missing label auto-creates it):
+  `status:todo` (not started), `status:in-progress` (claimed/being worked),
+  `status:blocked` (unmet dependency). **Done = issue closed.**
+- A ticket is **actionable** when *every* dependency ticket is **closed** and it is
+  not `status:in-progress` with activity (commit or `🤖` comment) newer than 90 min
+  (the claim TTL — a staler in-progress ticket is treated as a dead run and resumed,
+  see Crash recovery).
+
+## Crash recovery / anti-duplication
+
+The failure to design against: an agent stops mid-ticket (e.g. credits run out) and
+the work is lost or, worse, redone from scratch by the next run. Mitigations, in
+priority order:
+
+1. **Claim visibly and early.** Before any feature code: set `status:in-progress`,
+   create the branch, push a WIP commit, and open a **draft PR** whose body is the
+   acceptance-criteria checklist. This makes in-flight work discoverable.
+2. **Commit + push frequently** (after every passing test / new file / working
+   endpoint) and tick the PR checklist. The commits + checklist are the breadcrumb
+   the next agent resumes from. Never hold uncommitted work for more than a few
+   minutes.
+3. **Recover before starting new work.** Every run's *first* action is to scan
+   open `status:in-progress` issues. If one has no activity for > 90 min, it's a
+   dead run: check out its branch, read the PR checklist, comment `🤖 resumed
+   <UTC>`, and continue from the last commit. Resuming a stalled ticket always
+   takes priority over picking a new one. Only a ticket with fresh activity
+   (< 90 min) is assumed actively owned and left alone.
 
 ## One run = one iteration
 
@@ -79,9 +103,12 @@ basis: `docs/visual_perception_research.md`. Ticket specs: issues #84–#89.
 
 ## Scheduling
 
-**TBD** — the trigger that fires "one iteration" on a cadence is not decided yet.
-This playbook deliberately describes a single self-contained iteration so it can
-be driven by whatever scheduler we pick later (a GitHub Actions cron, a Claude
-Code on the web scheduled trigger, or a manual kick). Whatever drives it should
-invoke: "Read `docs/auto_pipeline.md` and execute one iteration." Until a
-scheduler is wired up, tickets can be worked by kicking a session manually.
+Mechanism is left to whatever driver we point at this playbook (a Claude Code
+scheduled trigger, a CI cron, or a manual kick) — the iteration is self-contained.
+
+Recommended cadence: **every 5 hours**, cron `23 */5 * * *` (fires 00:23 / 05:23 /
+10:23 / 15:23 / 20:23 local; the 20→00 wrap is 4h, harmless). The driver invokes a
+single iteration of this playbook — Steps 1–5 above, recovery first. The canonical
+routine prompt is kept alongside this doc; whatever schedules it should pass that
+prompt (or simply: "Read `docs/auto_pipeline.md` and execute one iteration,
+recovering any stalled `status:in-progress` ticket before starting new work").
