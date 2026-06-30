@@ -2468,6 +2468,194 @@ def _quality_worker(signal_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PERCEPTION T2: camera-motion / shot-dynamics signal (clip_signals,
+# kind='camera_motion'). Reuses the T1 clip_signals table + worker pattern.
+# ---------------------------------------------------------------------------
+
+motion_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    .pip_install(
+        "fastapi[standard]>=0.115",
+        "boto3>=1.34",
+        "supabase>=2.10",
+        "opencv-python-headless>=4.9",
+        "numpy>=1.26",
+    )
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
+    .add_local_file(Path(__file__).parent / "motion.py", "/root/motion.py")
+)
+
+MOTION_SAMPLE_FPS = 3.0
+SCENE_THRESHOLD = 0.4  # ffmpeg scene score for a shot boundary
+
+
+@app.function(image=motion_image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def analyze_motion(request: Request) -> JSONResponse:
+    """Vercel calls this to kick off a camera-motion run; spawns the worker and
+    returns immediately. Body: {"signal_id": "<uuid>"} — the worker reads the
+    clip off the pre-created clip_signals row.
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    signal_id = body.get("signal_id")
+    if not signal_id:
+        raise HTTPException(status_code=400, detail="signal_id required")
+
+    _motion_worker.spawn(signal_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(image=motion_image, secrets=secrets, timeout=1800)
+def _motion_worker(signal_id: str) -> None:
+    """Camera-motion / shot-dynamics worker (PERCEPTION T2).
+
+    1. Load the clip_signals row → clip (r2_key, duration).
+    2. Download the clip, sample frames at ~3 fps via ffmpeg.
+    3. Per consecutive frame pair: dense Farneback optical flow → global
+       translation (dx, dy median), radial divergence (scale = per-frame zoom
+       fraction), and mean magnitude (mag).
+    4. Run an ffmpeg scene-score pass for in-camera shot boundaries.
+    5. Hand the raw per-frame numbers to motion.py for bucketing / labeling.
+    6. Store the per-second sidecar in R2 + a compact summary on the row.
+    """
+    import traceback
+
+    import cv2
+    import numpy as np
+    from motion import build_motion_doc, parse_scene_cuts
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    debug: dict = {"steps": []}
+
+    def step(msg: str) -> None:
+        print(f"[motion:{signal_id}] {msg}")
+        debug["steps"].append(msg)
+
+    row = sb.table("clip_signals").select("id, clip_id").eq("id", signal_id).limit(1).execute()
+    if not row.data:
+        print(f"[motion] signal {signal_id} not found — skipping")
+        return
+    clip_id = row.data[0]["clip_id"]
+
+    clip_row = sb.table("clips").select(
+        "id, r2_key, project_id, duration_secs"
+    ).eq("id", clip_id).limit(1).execute()
+    if not clip_row.data or not clip_row.data[0].get("r2_key"):
+        _set_signal(sb, signal_id, status="error", error="clip not found or has no video")
+        return
+    clip = clip_row.data[0]
+    project_id = clip["project_id"]
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            video_path = _download_clip(r2, bucket, clip, tmp)
+            duration = clip.get("duration_secs") or _probe_duration(video_path)
+            if not duration:
+                raise RuntimeError("could not determine clip duration")
+            step(f"downloaded, duration={duration:.2f}s")
+
+            frames_dir = tmp / "frames"
+            frames_dir.mkdir()
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(video_path),
+                    "-vf", f"fps={MOTION_SAMPLE_FPS},scale=320:-1",
+                    str(frames_dir / "f%06d.jpg"),
+                ],
+                check=True, capture_output=True, text=True,
+            )
+            frame_paths = sorted(frames_dir.glob("f*.jpg"))
+            step(f"sampled {len(frame_paths)} frames at {MOTION_SAMPLE_FPS} fps")
+
+            # Precompute the radial-unit grid lazily once the frame size is known
+            # (height varies with aspect; width is pinned to 320). `scale` is the
+            # mean of the flow's radial component divided by radius → roughly the
+            # per-frame fractional zoom (positive = expanding outward = zoom-in).
+            radial_x = radial_y = inv_r = mask = None
+
+            samples: list[dict] = []
+            prev_gray = None
+            for i, fp in enumerate(frame_paths):
+                img = cv2.imread(str(fp))
+                if img is None:
+                    continue
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                if prev_gray is not None:
+                    flow = cv2.calcOpticalFlowFarneback(
+                        prev_gray, gray, None,
+                        0.5, 3, 15, 3, 5, 1.2, 0,
+                    )
+                    fx, fy = flow[..., 0], flow[..., 1]
+                    if radial_x is None:
+                        h, w = gray.shape
+                        ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+                        rx = xs - w / 2.0
+                        ry = ys - h / 2.0
+                        r = np.sqrt(rx * rx + ry * ry)
+                        mask = r > 8.0  # skip the center singularity
+                        inv_r = np.zeros_like(r)
+                        inv_r[mask] = 1.0 / r[mask]
+                        radial_x = rx * inv_r
+                        radial_y = ry * inv_r
+                    radial = (fx * radial_x + fy * radial_y) * inv_r
+                    samples.append({
+                        "t": i / MOTION_SAMPLE_FPS,
+                        "dx": float(np.median(fx)),
+                        "dy": float(np.median(fy)),
+                        "scale": float(np.mean(radial[mask])) if mask is not None else 0.0,
+                        "mag": float(np.mean(np.sqrt(fx * fx + fy * fy))),
+                    })
+                prev_gray = gray
+            step(f"computed optical flow for {len(samples)} frame pairs")
+
+            scene = subprocess.run(
+                [
+                    "ffmpeg", "-i", str(video_path),
+                    "-vf", f"select='gt(scene,{SCENE_THRESHOLD})',showinfo",
+                    "-an", "-f", "null", "-",
+                ],
+                capture_output=True, text=True,
+            )
+            scene_cuts = parse_scene_cuts(scene.stderr)
+            step(f"scene detection found {len(scene_cuts)} cut(s)")
+
+            doc = build_motion_doc(duration, MOTION_SAMPLE_FPS, samples, scene_cuts)
+
+            motion_key = f"projects/{project_id}/clips/{clip_id}/motion.json"
+            r2.put_object(
+                Bucket=bucket, Key=motion_key,
+                Body=json.dumps(doc).encode(), ContentType="application/json",
+            )
+            step(f"wrote sidecar {motion_key}")
+
+            _set_signal(
+                sb, signal_id, status="done",
+                result={
+                    "summary": doc["summary"],
+                    "spans": doc["spans"],
+                    "scene_cuts": doc["scene_cuts"],
+                },
+                result_r2_key=motion_key, debug=debug,
+            )
+            print(f"[motion] clip {clip_id} ✓ {doc['summary']}")
+    except Exception as exc:  # noqa: BLE001
+        debug["traceback"] = traceback.format_exc()
+        _set_signal(sb, signal_id, status="error", error=str(exc), debug=debug)
+        print(f"[motion] clip {clip_id} failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # EDL-01: Edit Timeline (synchronous — Vercel proxies the LLM's edit ops here)
 # ---------------------------------------------------------------------------
 
