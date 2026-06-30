@@ -26,10 +26,82 @@ HIGHLIGHT_KINDS = (
 )
 
 
+def _fmt_secs(value: object) -> str:
+    """Compact second formatting for prompt text: 4 not 4.0, 12.5 kept."""
+    try:
+        f = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(f)) if f == int(f) else f"{f:.1f}"
+
+
+def format_signals_prompt(signals: dict | None) -> str:
+    """Render the deterministic perception signals (PERCEPTION T1 quality + T2
+    camera motion) into a compact grounding block for the Gemini prompt.
+
+    `signals` is `{"quality": <quality result>, "camera_motion": <motion
+    result>}` — each value is the compact `clip_signals.result` JSON for that
+    kind (or absent/None). Returns "" when there's nothing to ground on, so the
+    caller's prompt is byte-for-byte unchanged in the ungrounded case.
+
+    Grounding a small model on cheap structured facts beats letting a big one
+    guess spatial/temporal detail: the block tells Gemini exactly when the
+    camera moves, where the in-camera cuts are, and which spans are technically
+    unusable, so it places timestamps against reality instead of hallucinating.
+    """
+    if not signals:
+        return ""
+
+    lines: list[str] = []
+
+    motion = signals.get("camera_motion")
+    if motion:
+        spans = motion.get("spans") or []
+        if spans:
+            seg = ", ".join(
+                f"{_fmt_secs(s['start'])}-{_fmt_secs(s['end'])}s {s['label']}"
+                for s in spans
+            )
+            lines.append(f"- Camera motion over time: {seg}.")
+        cuts = motion.get("scene_cuts") or []
+        if cuts:
+            lines.append(
+                "- In-camera shot cuts at: "
+                + ", ".join(f"{_fmt_secs(c)}s" for c in cuts)
+                + "."
+            )
+
+    quality = signals.get("quality")
+    if quality:
+        flagged = quality.get("flagged_spans") or []
+        if flagged:
+            seg = "; ".join(
+                f"{_fmt_secs(s['start'])}-{_fmt_secs(s['end'])}s "
+                f"{'/'.join(s.get('reasons') or ['flagged'])}"
+                for s in flagged
+            )
+            lines.append(f"- Technically unusable spans (avoid cutting here): {seg}.")
+        else:
+            lines.append("- Footage quality: no unusable spans detected.")
+
+    if not lines:
+        return ""
+
+    return (
+        "\n\nDeterministic signals computed for this clip — treat them as GROUND "
+        "TRUTH for camera movement, in-camera cuts, and which spans are "
+        "technically unusable. Do not contradict them; use them to anchor your "
+        "timestamps and to avoid flagging unusable footage as a highlight:\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
 def build_prompt(
     duration_secs: float | None,
     strategy: str = "default",
     transcript_text: str | None = None,
+    signals: dict | None = None,
 ) -> str:
     """Build the Gemini instruction asking for timestamped visual JSON.
 
@@ -152,9 +224,12 @@ def build_prompt(
             "setting), not what is said.\n"
         )
 
+    signals_block = format_signals_prompt(signals)
+
     return (
         f"{intro}"
-        f"{transcript_block}\n\n"
+        f"{transcript_block}"
+        f"{signals_block}\n\n"
         "Return ONLY a JSON object (no markdown, no code fences) with this shape:\n"
         "{\n"
         '  "summary": "one or two sentences on what this clip shows",\n'
