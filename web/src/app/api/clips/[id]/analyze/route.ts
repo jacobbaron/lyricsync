@@ -23,6 +23,9 @@ const VARIANTS = [
   "editorial",
   "audio_aware",
   "with_transcript",
+  // PERCEPTION T3: with_transcript grounded on the clip's QC + camera-motion
+  // signals (see modal/app.py VISUAL_VARIANTS).
+  "grounded",
 ] as const;
 type Variant = (typeof VARIANTS)[number];
 
