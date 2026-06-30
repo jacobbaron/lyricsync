@@ -1538,6 +1538,19 @@ VISUAL_VARIANTS: dict[str, dict] = {
         "fps": 3,
         "needs_transcript": True,
     },
+    # PERCEPTION T3: same as with_transcript, but also grounded on the cheap
+    # deterministic signals (T1 quality + T2 camera_motion) — the prompt gets a
+    # ground-truth block of when the camera moves / where the cuts are / which
+    # spans are unusable. Run alongside with_transcript to A/B grounded vs
+    # ungrounded before making grounding the default.
+    "grounded": {
+        "model": "gemini-3.5-flash",
+        "strategy": "transcript",
+        "media_resolution": "MEDIA_RESOLUTION_HIGH",
+        "fps": 3,
+        "needs_transcript": True,
+        "use_signals": True,
+    },
     # Disabled — gemini-2.5-pro / 3.x pro tiers are ~10x flash and gave only
     # marginally better selection in testing. Re-enable here if you want the
     # quality ceiling back.
@@ -1560,6 +1573,34 @@ CANONICAL_VISUAL_VARIANT = "with_transcript"
 
 def _set_analysis(sb, analysis_id: str, **fields) -> None:
     sb.table("visual_analyses").update(fields).eq("id", analysis_id).execute()
+
+
+def _load_clip_signals(sb, clip_id: str) -> dict:
+    """PERCEPTION T3: latest done quality + camera_motion signal results for a
+    clip, as `{"quality": <result>, "camera_motion": <result>}`.
+
+    Best-effort and degrades gracefully: a kind with no completed row is simply
+    omitted, so grounding falls back to the ungrounded prompt for whatever's
+    missing. Each `result` is the compact `clip_signals.result` JSON.
+    """
+    out: dict = {}
+    for kind in ("quality", "camera_motion"):
+        try:
+            r = (
+                sb.table("clip_signals")
+                .select("result")
+                .eq("clip_id", clip_id)
+                .eq("kind", kind)
+                .eq("status", "done")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if r.data and r.data[0].get("result"):
+                out[kind] = r.data[0]["result"]
+        except Exception:  # noqa: BLE001 — grounding is best-effort
+            pass
+    return out
 
 
 def _format_clip_transcript(tdata: dict) -> str:
@@ -1825,10 +1866,24 @@ def _analyze_worker(analysis_id: str) -> None:
                     step("no transcript_r2_key on clip — running without it")
                 debug["transcript_text"] = transcript_text
 
+            # PERCEPTION T3: ground the prompt on the clip's deterministic
+            # quality + camera-motion signals when the variant opts in. Loaded
+            # only for grounded variants so existing variants are byte-for-byte
+            # unchanged; missing signals degrade to the ungrounded prompt.
+            signals = None
+            if variant.get("use_signals"):
+                signals = _load_clip_signals(sb, clip_id)
+                debug["signals"] = signals
+                step(
+                    "loaded grounding signals: "
+                    + ", ".join(sorted(signals)) if signals else "no grounding signals found"
+                )
+
             prompt = build_prompt(
                 duration,
                 strategy=variant["strategy"],
                 transcript_text=transcript_text,
+                signals=signals,
             )
             debug["model"] = variant["model"]
             debug["prompt"] = prompt
