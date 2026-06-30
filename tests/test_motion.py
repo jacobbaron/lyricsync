@@ -42,45 +42,53 @@ class TestBucketBySecond:
         assert m.bucket_by_second([], duration=3.0) == []
 
 
-def _bucket(dx=0.0, dy=0.0, scale=0.0, mag=0.1, jitter=0.0, t=0):
+def _bucket(dx=0.0, dy=0.0, scale=0.0, mag=10.0, jitter=0.0, t=0):
+    # mag defaults to ~10 to mirror the real per-pixel flow noise floor; it is
+    # deliberately NOT used by the classifier.
     return {"t": t, "dx": dx, "dy": dy, "scale": scale, "mag": mag, "jitter": jitter}
 
 
 class TestClassifyBucket:
-    def test_static_when_no_motion(self):
-        assert m.classify_bucket(_bucket(mag=0.2)) == "static"
+    def test_static_when_translation_tiny(self):
+        # Held shot: high mag noise floor but near-zero coherent translation.
+        assert m.classify_bucket(_bucket(dx=0.2, dy=0.2, mag=12.0)) == "static"
 
-    def test_whip_on_huge_magnitude(self):
-        assert m.classify_bucket(_bucket(mag=15.0, dx=12.0)) == "whip"
+    def test_whip_on_huge_translation(self):
+        assert m.classify_bucket(_bucket(dx=14.0, dy=2.0)) == "whip"
 
     def test_zoom_in_on_positive_divergence(self):
-        assert m.classify_bucket(_bucket(mag=2.0, scale=0.05)) == "zoom_in"
+        assert m.classify_bucket(_bucket(dx=0.2, dy=0.2, scale=0.05)) == "zoom_in"
 
     def test_zoom_out_on_negative_divergence(self):
-        assert m.classify_bucket(_bucket(mag=2.0, scale=-0.05)) == "zoom_out"
+        assert m.classify_bucket(_bucket(dx=0.2, dy=0.2, scale=-0.05)) == "zoom_out"
 
     def test_pan_when_horizontal_dominates(self):
-        assert m.classify_bucket(_bucket(mag=2.0, dx=3.0, dy=0.2)) == "pan"
+        assert m.classify_bucket(_bucket(dx=5.0, dy=0.5)) == "pan"
 
     def test_tilt_when_vertical_dominates(self):
-        assert m.classify_bucket(_bucket(mag=2.0, dx=0.2, dy=3.0)) == "tilt"
+        assert m.classify_bucket(_bucket(dx=0.5, dy=5.0)) == "tilt"
 
-    def test_handheld_when_motion_but_no_net_direction(self):
+    def test_handheld_when_jitter_without_net_direction(self):
         assert m.classify_bucket(
-            _bucket(mag=2.0, dx=0.1, dy=0.1, jitter=3.0)
+            _bucket(dx=0.3, dy=0.3, jitter=8.0)
         ) == "handheld"
 
-    def test_zoom_takes_priority_over_pan(self):
-        # Strong radial divergence + some horizontal drift → still a zoom.
-        assert m.classify_bucket(_bucket(mag=2.0, scale=0.05, dx=2.0)) == "zoom_in"
+    def test_handheld_on_midrange_drift(self):
+        # Coherent drift above static but below a deliberate pan → handheld.
+        assert m.classify_bucket(_bucket(dx=2.5, dy=0.3)) == "handheld"
+
+    def test_pan_beats_zoom_when_translation_is_large(self):
+        # A real pan carries incidental radial noise; large net keeps it a pan,
+        # not a zoom (zoom only wins when translation is small).
+        assert m.classify_bucket(_bucket(dx=5.0, dy=0.5, scale=0.05)) == "pan"
 
 
 class TestMergeLabelSpans:
     def test_contiguous_same_label_merges(self):
         seconds = m.label_seconds([
-            _bucket(t=0, dx=3.0, mag=2.0),
-            _bucket(t=1, dx=3.0, mag=2.0),
-            _bucket(t=2, mag=0.1),
+            _bucket(t=0, dx=5.0),
+            _bucket(t=1, dx=5.0),
+            _bucket(t=2, dx=0.0),
         ])
         spans = m.merge_label_spans(seconds)
         assert spans == [
@@ -90,8 +98,8 @@ class TestMergeLabelSpans:
 
     def test_gap_breaks_a_span(self):
         seconds = m.label_seconds([
-            _bucket(t=0, dx=3.0, mag=2.0),
-            _bucket(t=2, dx=3.0, mag=2.0),
+            _bucket(t=0, dx=5.0),
+            _bucket(t=2, dx=5.0),
         ])
         spans = m.merge_label_spans(seconds)
         assert len(spans) == 2
@@ -120,8 +128,8 @@ class TestBuildMotionDoc:
     def test_full_doc_shape(self):
         samples = [
             _sample(0.0, mag=0.1),
-            _sample(1.0, dx=3.0, mag=2.0),
-            _sample(2.0, dx=3.0, mag=2.0),
+            _sample(1.0, dx=5.0, mag=2.0),
+            _sample(2.0, dx=5.0, mag=2.0),
         ]
         doc = m.build_motion_doc(
             duration=3.0, fps_sampled=3.0, samples=samples, scene_cuts=[1.0],
