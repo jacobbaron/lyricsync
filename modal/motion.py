@@ -16,11 +16,16 @@ the first):
     {"t": 0.33, "dx": 1.2, "dy": -0.3, "scale": 0.004, "mag": 1.6}
 
   dx, dy — median global translation (px) vs the previous frame: + dx = scene
-           moving right (camera pans left) etc. Sign is kept; we only use it
-           to pick pan vs tilt and to tell a real pan from handheld jitter.
+           moving right (camera pans left) etc. Sign is kept; we use the
+           coherent translation magnitude hypot(dx, dy) as the primary motion
+           discriminator and dx vs dy to pick pan vs tilt.
   scale  — mean radial divergence of the flow field: > 0 = field expands
            outward (push-in / zoom-in), < 0 = contracts (pull-out / zoom-out).
-  mag    — mean flow magnitude (overall motion intensity, unsigned).
+  mag    — mean flow magnitude (overall motion intensity, unsigned). Kept for
+           reference only — dense optical flow has a large per-pixel noise
+           floor (texture / compression / rolling shutter), so `mag` sits near
+           ~10 even on a locked-off shot and can't separate static from moving.
+           Classification keys off the coherent translation instead.
 
 Stored sidecar JSON shape (R2: projects/<pid>/clips/<cid>/motion.json):
 
@@ -50,13 +55,16 @@ MOTION_VERSION = 1
 # Labels we classify a second of footage into.
 LABELS = ("static", "pan", "tilt", "zoom_in", "zoom_out", "handheld", "whip")
 
-# Thresholds (empirical starting points on a 320px-wide sampled frame at ~3 fps
-# — easy to retune without touching the shaping logic below).
-STATIC_MAG = 0.6        # mean flow magnitude below this = locked-off / static
-WHIP_MAG = 9.0          # mean flow magnitude above this = whip pan / violent move
-PAN_MIN = 1.0           # net |dx| or |dy| above this = a real directional pan/tilt
-ZOOM_SCALE = 0.015      # |mean radial divergence| above this = zoom in/out
-HANDHELD_JITTER = 2.0   # in-second std(dx)+std(dy) above this (no net dir) = handheld
+# Thresholds on the coherent translation net = hypot(dx, dy), in px/frame on a
+# 320px-wide sampled frame at ~3 fps. Calibrated against real footage (a Home
+# Depot aisle walk vs a handheld talking-head): a held shot sits at net < ~2,
+# deliberate pans run ~3.5–12, and a whip flick spikes past ~13. Easy to retune
+# without touching the shaping logic below.
+STATIC_NET = 2.0        # coherent translation below this = camera essentially held
+PAN_NET = 3.5           # net at/above this = a deliberate directional pan/tilt
+WHIP_NET = 13.0         # net at/above this = whip / very fast move
+ZOOM_SCALE = 0.035      # |mean radial divergence| above this (and small net) = zoom
+HANDHELD_JITTER = 6.0   # in-second std(dx)+std(dy) above this (no net dir) = handheld
 
 
 def _mean(xs: list[float]) -> float:
@@ -106,20 +114,21 @@ def bucket_by_second(samples: list[dict], duration: float) -> list[dict]:
 def classify_bucket(b: dict) -> str:
     """Label one second of motion from its aggregated metrics.
 
-    Order matters: magnitude gates (static / whip) first, then radial zoom,
-    then a net-directional pan/tilt, falling back to handheld when there's
-    motion but no consistent direction.
+    Driven by the coherent translation `net = hypot(dx, dy)` (robust, median-
+    based) rather than the noisy mean flow magnitude. Order: a whip flick (very
+    large net) first; then a zoom, but only when translation is small so a real
+    pan with incidental radial noise isn't misread as a zoom; then a directional
+    pan/tilt; finally static vs handheld for low-translation seconds (handheld =
+    motion energy / jitter without a sustained direction).
     """
-    mag = b["mag"]
-    if mag < STATIC_MAG:
-        return "static"
-    if mag >= WHIP_MAG:
+    net = (b["dx"] ** 2 + b["dy"] ** 2) ** 0.5
+    if net >= WHIP_NET:
         return "whip"
-    if abs(b["scale"]) >= ZOOM_SCALE:
+    if abs(b["scale"]) >= ZOOM_SCALE and net < PAN_NET:
         return "zoom_in" if b["scale"] > 0 else "zoom_out"
-    if abs(b["dx"]) >= PAN_MIN or abs(b["dy"]) >= PAN_MIN:
+    if net >= PAN_NET:
         return "pan" if abs(b["dx"]) >= abs(b["dy"]) else "tilt"
-    if b["jitter"] >= HANDHELD_JITTER:
+    if net >= STATIC_NET or b["jitter"] >= HANDHELD_JITTER:
         return "handheld"
     return "static"
 
