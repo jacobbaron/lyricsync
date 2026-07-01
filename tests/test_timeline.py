@@ -665,82 +665,92 @@ class TestMute:
 
 
 # ---------------------------------------------------------------------------
-# Music track (external finished-mix laid under the footage)
+# Music bed (a finished song under the whole cut; video cuts over it)
 # ---------------------------------------------------------------------------
 
-def compile_with_music(timeline, music_path="/cache/song.mp3"):
+def with_bed(music, n_clips=1):
+    t = make_timeline(n_clips=n_clips)
+    t["music"] = music
+    return t
+
+
+def compile_with_music(timeline, song_path="/cache/song.mp3"):
     return tl.compile_timeline(
         timeline,
         resolve_source=lambda item: f"/cache/{item['source']}",
         workdir="/tmp/render",
         font_path="/root/overlay_font.ttf",
-        music_path=music_path,
+        resolve_music=lambda song_id: song_path,
     )
 
 
 class TestMusicValidation:
-    def test_valid_replace(self):
-        t = make_timeline()
-        t["music"] = {"song_id": "s1", "song_start": 41.9}
-        assert tl.validate_timeline(t) == []
+    def test_valid_minimal(self):
+        assert tl.validate_timeline(with_bed({"song_id": "s1", "song_start": 41.9})) == []
 
-    def test_valid_duck(self):
-        t = make_timeline()
-        t["music"] = {"song_id": "s1", "song_start": 0.0,
-                      "gain_db": 3.0, "scratch_gain_db": -12.0}
-        assert tl.validate_timeline(t) == []
+    def test_valid_full(self):
+        assert tl.validate_timeline(with_bed(
+            {"song_id": "s1", "song_start": 0.0, "gain_db": -3.0,
+             "fade_in_s": 1.5, "fade_out_s": 2.0}
+        )) == []
 
     def test_missing_song_id(self):
-        t = make_timeline()
-        t["music"] = {"song_start": 1.0}
-        assert any("song_id" in e for e in tl.validate_timeline(t))
+        assert any("song_id" in e for e in tl.validate_timeline(with_bed({"song_start": 1.0})))
 
     def test_negative_song_start(self):
-        t = make_timeline()
-        t["music"] = {"song_id": "s1", "song_start": -2.0}
-        assert any("song_start" in e for e in tl.validate_timeline(t))
+        assert any("song_start" in e
+                   for e in tl.validate_timeline(with_bed({"song_id": "s1", "song_start": -2.0})))
 
     def test_music_not_object(self):
-        t = make_timeline()
-        t["music"] = "nope"
-        assert any("music must be an object" in e for e in tl.validate_timeline(t))
+        assert any("music must be an object" in e
+                   for e in tl.validate_timeline(with_bed("nope")))
 
     def test_bad_gain(self):
-        t = make_timeline()
-        t["music"] = {"song_id": "s1", "song_start": 0.0, "gain_db": "loud"}
-        assert any("gain_db" in e for e in tl.validate_timeline(t))
+        errs = tl.validate_timeline(with_bed({"song_id": "s1", "song_start": 0.0, "gain_db": "loud"}))
+        assert any("gain_db" in e for e in errs)
+
+    def test_negative_fade(self):
+        errs = tl.validate_timeline(with_bed({"song_id": "s1", "song_start": 0.0, "fade_in_s": -1}))
+        assert any("fade_in_s" in e for e in errs)
 
 
 class TestMusicCompile:
-    def test_replace_adds_input_and_mutes_scratch(self):
-        t = make_timeline(n_clips=1)
-        t["music"] = {"song_id": "s1", "song_start": 12.5}
+    def test_bed_adds_input_and_replaces_audio(self):
+        t = with_bed({"song_id": "s1", "song_start": 12.5})
         c = compile_with_music(t)
-        # one clip input + one song input
-        assert len(c["inputs"]) == 2
-        assert c["inputs"][-1] == ["-ss", "12.500", "-t",
-                                   f"{c['duration']:.3f}", "-i", "/cache/song.mp3"]
+        assert len(c["inputs"]) == 2  # clip + bed song
+        assert c["inputs"][-1][:2] == ["-ss", "12.500"]
+        assert c["inputs"][-1][-1] == "/cache/song.mp3"
         fc = c["filter_complex"]
-        assert "amix=inputs=2:normalize=0:duration=first[aout]" in fc
-        assert "[a0]volume=0[ascr]" in fc  # scratch replaced
+        assert "[ascr][bed]amix=inputs=2:normalize=0:duration=first[aout]" in fc
+        assert "volume=0[ascr]" in fc  # scratch muted under the bed
 
-    def test_duck_uses_db_and_gain(self):
-        t = make_timeline(n_clips=1)
-        t["music"] = {"song_id": "s1", "song_start": 0.0,
-                      "gain_db": 2.0, "scratch_gain_db": -10.0}
+    def test_gain_and_fades(self):
+        t = with_bed({"song_id": "s1", "song_start": 0.0,
+                      "gain_db": -6.0, "fade_in_s": 1.0, "fade_out_s": 2.0})
         fc = compile_with_music(t)["filter_complex"]
-        assert "volume=2.0dB[amus]" in fc
-        assert "[a0]volume=-10.0dB[ascr]" in fc
+        assert "volume=-6.0dB" in fc
+        assert "afade=t=in:st=0:d=1.000" in fc
+        assert "afade=t=out:st=" in fc and "d=2.000" in fc
 
-    def test_no_music_path_falls_back_to_scratch(self):
-        # music present but the worker didn't supply a file → plain scratch audio
-        t = make_timeline(n_clips=1)
-        t["music"] = {"song_id": "s1", "song_start": 5.0}
-        c = compile_with_music(t, music_path=None)
+    def test_bed_spans_a_multiclip_cut(self):
+        # one bed under a 2-clip cut → one song input total, both clips joined
+        t = with_bed({"song_id": "s1", "song_start": 5.0}, n_clips=2)
+        c = compile_with_music(t)
+        assert len(c["inputs"]) == 3  # clip0 + clip1 + bed
+        assert "concat=n=2:v=1:a=1" in c["filter_complex"]
+
+    def test_no_resolver_falls_back_to_scratch(self):
+        t = with_bed({"song_id": "s1", "song_start": 5.0})
+        c = tl.compile_timeline(
+            t, resolve_source=lambda it: f"/cache/{it['source']}",
+            workdir="/tmp", font_path="/f", resolve_music=None,
+        )
         assert len(c["inputs"]) == 1
-        assert "anull[aout]" in c["filter_complex"]
+        assert "amix" not in c["filter_complex"]
 
     def test_absent_music_is_unchanged(self):
         c = compile_with_music(make_timeline(n_clips=1))
+        assert len(c["inputs"]) == 1
         assert "amix" not in c["filter_complex"]
         assert "anull[aout]" in c["filter_complex"]

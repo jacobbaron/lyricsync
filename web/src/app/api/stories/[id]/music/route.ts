@@ -5,21 +5,22 @@ import { resolveAuth } from "@/lib/auth/resolve";
 export const runtime = "nodejs";
 
 // ── POST /api/stories/[id]/music ────────────────────────────────────────────
-// Set (or clear) the external music track under a story's footage, then
-// re-render. Stored in stories.music_json; the render worker injects it as
-// timeline.music (see modal/timeline.py). Use this to place/nudge a song
-// manually; POST /api/stories/[id]/align-music computes song_start for you.
+// Set (or clear) the music BED under a story — a finished song that plays under
+// the whole cut while the video cuts over it — then re-render. Stored in
+// stories.music_json and injected as timeline.music by the render worker
+// (modal/timeline.py). Lip-sync a specific clip to this bed with
+// POST /api/stories/[id]/lipsync.
 //
-// Body: { song_id, song_start, gain_db?, scratch_gain_db? } to set,
-//        or { song_id: null } to clear the track.
+// Body: { song_id, song_start, gain_db?, fade_in_s?, fade_out_s? } to set the
+// bed (song_start = song time aligned to output t=0), or { song_id: null } to
+// remove it.
 
 const SetBody = z.object({
   song_id: z.string().uuid(),
   song_start: z.number().min(0).max(36000),
   gain_db: z.number().min(-40).max(20).optional(),
-  // null (or omitted) → replace clip audio; a number → duck clip audio to that
-  // dB and mix the song over it.
-  scratch_gain_db: z.number().min(-60).max(0).nullable().optional(),
+  fade_in_s: z.number().min(0).max(30).optional(),
+  fade_out_s: z.number().min(0).max(30).optional(),
 });
 const ClearBody = z.object({ song_id: z.null() });
 const Body = z.union([SetBody, ClearBody]);
@@ -46,16 +47,15 @@ export async function POST(
 
   const { data: story } = await supabase
     .from("stories")
-    .select("id, project_id, status")
+    .select("id, project_id, render_epoch")
     .eq("id", storyId)
     .maybeSingle();
   if (!story) {
     return NextResponse.json({ error: "Story not found" }, { status: 404 });
   }
 
-  let musicJson: Record<string, unknown> | null = null;
+  let bed: Record<string, unknown> | null = null;
   if (parsed.data.song_id !== null) {
-    // The song must exist, belong to the same project, and be uploaded.
     const { data: song } = await supabase
       .from("songs")
       .select("id, project_id, status")
@@ -73,20 +73,25 @@ export async function POST(
         { status: 409 },
       );
     }
-    musicJson = {
+    bed = {
       song_id: parsed.data.song_id,
       song_start: parsed.data.song_start,
       gain_db: parsed.data.gain_db ?? 0,
-      scratch_gain_db: parsed.data.scratch_gain_db ?? null,
+      fade_in_s: parsed.data.fade_in_s ?? 0,
+      fade_out_s: parsed.data.fade_out_s ?? 0,
     };
   }
 
   await supabase
     .from("stories")
-    .update({ music_json: musicJson, status: "rendering", error_message: null })
+    .update({
+      music_json: bed,
+      status: "rendering",
+      error_message: null,
+      render_epoch: (story.render_epoch ?? 0) + 1,
+    })
     .eq("id", storyId);
 
-  // Fire Modal render (fire-and-forget), same pattern as the render route.
   const renderUrl = process.env.MODAL_RENDER_URL;
   const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
   if (renderUrl && webhookSecret) {
@@ -102,5 +107,5 @@ export async function POST(
     console.warn("[music] MODAL_RENDER_URL not set — render not triggered");
   }
 
-  return NextResponse.json({ status: "accepted", music: musicJson });
+  return NextResponse.json({ status: "accepted", music: bed });
 }
