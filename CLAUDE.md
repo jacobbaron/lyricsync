@@ -22,7 +22,11 @@ Full GitHub API: PRs, issues, branches, Actions runs/logs, file contents.
 ### Supabase (`mcp__Supabase__*`)
 Direct DB access including raw SQL.
 - Run queries: `mcp__Supabase__execute_sql` (project_id: `ywfdqggvqrapwvxdzrfi`)
-- Apply migrations: `mcp__Supabase__apply_migration`
+- `mcp__Supabase__apply_migration` — **reads/experiments only; do NOT use it to
+  ship schema changes.** It records its own wall-clock version in
+  `schema_migrations`, which won't match your migration filename → `db push`
+  sees drift and the **DB migrate** CI fails. Ship schema via CI instead (see
+  "Database migrations" under Deployment).
 
 ### Vercel (`mcp__Vercel__*`)
 Deployment status and runtime logs.
@@ -54,6 +58,43 @@ It uses `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` stored as GitHub secrets.
 To manually trigger: push a no-op commit to `modal/app.py` (e.g., append a blank line).
 
 The `workflow_dispatch` trigger exists but the GitHub MCP integration currently returns 403 for dispatch — use the push approach instead.
+
+### Database migrations (ship via CI — never hand-apply)
+
+Schema changes ship through the **DB migrate** Action (`db-migrate.yml`), not by
+hand. The flow is seamless if you follow it:
+
+1. Add `supabase/migrations/<YYYYMMDDHHMMSS>_short_name.sql` (14-digit UTC
+   timestamp prefix = apply order). Write idempotent SQL (`create ... if not
+   exists`, `add column if not exists`).
+2. Commit + open a PR. On the PR the Action runs `db push --dry-run` (review
+   gate); on merge to `main` it runs `db push`, which records the version =
+   **your filename's timestamp**. Filename == recorded version, so no drift.
+
+**Do NOT `mcp__Supabase__apply_migration` to ship schema.** It stamps its own
+clock version (e.g. `20260701121837`) that won't match your filename
+(`20260701120000`), so `db push` reports "Remote migration versions not found in
+local migrations directory" and fails *before* running any SQL. If you ever must
+pre-apply (e.g. a deploy-order dependency), immediately reconcile so
+`recorded version == filename`:
+`update supabase_migrations.schema_migrations set version='<filename ts>' where version='<mcp ts>' and name='<name>';`
+Then confirm no drift: every `schema_migrations.version` must have a matching
+local file. Prefer just letting CI apply it — the migration is additive and CI
+runs in ~30s.
+
+### After a merge, verify CI yourself (don't wait for an email)
+
+A merge to `main` fires **several** workflows (CI, Python tests, Deploy Modal,
+DB migrate). Don't call a merge done until you've checked them all:
+
+1. Get the merge SHA, then `mcp__github__actions_list list_workflow_runs` per
+   workflow (or list all) filtered to that SHA / `branch: main`.
+2. **Poll until every run completes** and assert `conclusion == success`.
+   Deploy/migrate finish after the merge returns, so an immediate check will
+   show `in_progress` — wait it out.
+3. On any failure, pull `mcp__github__get_job_logs` (`failed_only: true`),
+   diagnose, and fix — proactively, without the user reporting it. Re-running a
+   failed run via MCP may 403; push the fix or reconcile state instead.
 
 ## Key secrets
 
