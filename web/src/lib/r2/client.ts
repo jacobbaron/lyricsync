@@ -47,6 +47,14 @@ export function clipObjectKey(
   return `projects/${projectId}/clips/${clipId}/original.${extension}`;
 }
 
+export function songObjectKey(
+  projectId: string,
+  songId: string,
+  extension: string,
+): string {
+  return `projects/${projectId}/songs/${songId}/original.${extension}`;
+}
+
 export async function presignClipUpload(
   key: string,
   contentType: string,

@@ -662,3 +662,85 @@ class TestMute:
         assert tl.validate_timeline(t) == []
         fc = compile_simple(t)["filter_complex"]
         assert "atempo" in fc and "aecho=" in fc and "volume=0" in fc
+
+
+# ---------------------------------------------------------------------------
+# Music track (external finished-mix laid under the footage)
+# ---------------------------------------------------------------------------
+
+def compile_with_music(timeline, music_path="/cache/song.mp3"):
+    return tl.compile_timeline(
+        timeline,
+        resolve_source=lambda item: f"/cache/{item['source']}",
+        workdir="/tmp/render",
+        font_path="/root/overlay_font.ttf",
+        music_path=music_path,
+    )
+
+
+class TestMusicValidation:
+    def test_valid_replace(self):
+        t = make_timeline()
+        t["music"] = {"song_id": "s1", "song_start": 41.9}
+        assert tl.validate_timeline(t) == []
+
+    def test_valid_duck(self):
+        t = make_timeline()
+        t["music"] = {"song_id": "s1", "song_start": 0.0,
+                      "gain_db": 3.0, "scratch_gain_db": -12.0}
+        assert tl.validate_timeline(t) == []
+
+    def test_missing_song_id(self):
+        t = make_timeline()
+        t["music"] = {"song_start": 1.0}
+        assert any("song_id" in e for e in tl.validate_timeline(t))
+
+    def test_negative_song_start(self):
+        t = make_timeline()
+        t["music"] = {"song_id": "s1", "song_start": -2.0}
+        assert any("song_start" in e for e in tl.validate_timeline(t))
+
+    def test_music_not_object(self):
+        t = make_timeline()
+        t["music"] = "nope"
+        assert any("music must be an object" in e for e in tl.validate_timeline(t))
+
+    def test_bad_gain(self):
+        t = make_timeline()
+        t["music"] = {"song_id": "s1", "song_start": 0.0, "gain_db": "loud"}
+        assert any("gain_db" in e for e in tl.validate_timeline(t))
+
+
+class TestMusicCompile:
+    def test_replace_adds_input_and_mutes_scratch(self):
+        t = make_timeline(n_clips=1)
+        t["music"] = {"song_id": "s1", "song_start": 12.5}
+        c = compile_with_music(t)
+        # one clip input + one song input
+        assert len(c["inputs"]) == 2
+        assert c["inputs"][-1] == ["-ss", "12.500", "-t",
+                                   f"{c['duration']:.3f}", "-i", "/cache/song.mp3"]
+        fc = c["filter_complex"]
+        assert "amix=inputs=2:normalize=0:duration=first[aout]" in fc
+        assert "[a0]volume=0[ascr]" in fc  # scratch replaced
+
+    def test_duck_uses_db_and_gain(self):
+        t = make_timeline(n_clips=1)
+        t["music"] = {"song_id": "s1", "song_start": 0.0,
+                      "gain_db": 2.0, "scratch_gain_db": -10.0}
+        fc = compile_with_music(t)["filter_complex"]
+        assert "volume=2.0dB[amus]" in fc
+        assert "[a0]volume=-10.0dB[ascr]" in fc
+
+    def test_no_music_path_falls_back_to_scratch(self):
+        # music present but the worker didn't supply a file → plain scratch audio
+        t = make_timeline(n_clips=1)
+        t["music"] = {"song_id": "s1", "song_start": 5.0}
+        c = compile_with_music(t, music_path=None)
+        assert len(c["inputs"]) == 1
+        assert "anull[aout]" in c["filter_complex"]
+
+    def test_absent_music_is_unchanged(self):
+        c = compile_with_music(make_timeline(n_clips=1))
+        assert "amix" not in c["filter_complex"]
+        assert "anull[aout]" in c["filter_complex"]
