@@ -440,12 +440,12 @@ def validate_timeline(timeline: dict) -> list[str]:
 
 
 def _validate_music(music: object) -> list[str]:
-    """Validate the optional top-level `music` object (external track under the
-    footage). Returns error strings; empty when absent or well-formed.
+    """Validate the optional top-level `music` bed (a finished song under the
+    whole cut). Returns error strings; empty when absent or well-formed.
 
-    Shape: {song_id: str, song_start: >=0, gain_db?: num, scratch_gain_db?: num|None}.
-    `scratch_gain_db=None` (or absent) means replace the clip audio with the song;
-    a number means duck the clip audio to that gain (dB) and mix the song over it.
+    Shape: {song_id: str, song_start: >=0, gain_db?: num,
+            fade_in_s?: >=0, fade_out_s?: >=0}. song_start is the song time
+    aligned to output t=0; gain_db trims the level; fades ramp the bed.
     """
     if music is None:
         return []
@@ -459,10 +459,14 @@ def _validate_music(music: object) -> list[str]:
             errors.append("music: song_start must be >= 0")
     except (TypeError, ValueError):
         errors.append("music: song_start must be a number")
-    for key in ("gain_db", "scratch_gain_db"):
+    if music.get("gain_db") is not None and not isinstance(
+        music.get("gain_db"), (int, float)
+    ):
+        errors.append("music: gain_db must be a number")
+    for key in ("fade_in_s", "fade_out_s"):
         v = music.get(key)
-        if v is not None and not isinstance(v, (int, float)):
-            errors.append(f"music: {key} must be a number or null")
+        if v is not None and (not isinstance(v, (int, float)) or v < 0):
+            errors.append(f"music: {key} must be a number >= 0")
     return errors
 
 
@@ -1400,7 +1404,7 @@ def compile_timeline(
     resolve_source,
     workdir: str,
     font_path: str,
-    music_path: str | None = None,
+    resolve_music=None,
 ) -> dict:
     """Compile a timeline into ffmpeg invocation pieces.
 
@@ -1541,32 +1545,36 @@ def compile_timeline(
     draw = (",".join(draw_filters) + ",") if draw_filters else ""
     parts.append(f"[{cv}]{draw}format=yuv420p[vout]")
 
-    # Optional external music track laid under the footage (see _validate_music).
-    # One extra input, seeked to song_start and trimmed/padded to the output
-    # length so a short song can't truncate the video's audio. `scratch_gain_db`
-    # None → replace (clip audio muted); a number → duck clip audio and mix.
+    # Music bed: a finished song under the WHOLE cut (see _validate_music). The
+    # video cuts freely over it; a clip is lip-synced by positioning its src so
+    # its footage matches the bed (an edit-time op, not a render trick). One
+    # extra input, seeked to song_start, trimmed/padded to the output length,
+    # with gain + optional fade in/out. Replaces the clip audio (the muted
+    # scratch keeps [ca] consumed so ffmpeg has no dangling label).
     music = timeline.get("music")
-    if music and music_path:
-        midx = in_idx  # next free input index (== len(inputs))
+    bed_path = resolve_music(music["song_id"]) if (music and resolve_music) else None
+    if music and bed_path:
+        midx = in_idx
         inputs.append([
             "-ss", f"{float(music['song_start']):.3f}",
-            "-t", f"{out_dur:.3f}", "-i", str(music_path),
+            "-t", f"{out_dur:.3f}", "-i", str(bed_path),
         ])
         gain = float(music.get("gain_db") or 0.0)
         gvol = f",volume={gain}dB" if gain else ""
+        fin = float(music.get("fade_in_s") or 0.0)
+        fout = float(music.get("fade_out_s") or 0.0)
+        fade = ""
+        if fin > 0:
+            fade += f",afade=t=in:st=0:d={fin:.3f}"
+        if fout > 0:
+            fade += f",afade=t=out:st={max(0.0, out_dur - fout):.3f}:d={fout:.3f}"
         parts.append(
             f"[{midx}:a]asetpts=PTS-STARTPTS,aresample={sr},"
             f"aformat=channel_layouts=stereo,apad,"
-            f"atrim=duration={out_dur:.3f}{gvol}[amus]"
+            f"atrim=duration={out_dur:.3f}{gvol}{fade}[bed]"
         )
-        scratch = music.get("scratch_gain_db")
-        if scratch is None:
-            parts.append(f"[{ca}]volume=0[ascr]")  # replace: mute clip audio
-        else:
-            parts.append(f"[{ca}]volume={float(scratch)}dB[ascr]")  # duck + mix
-        parts.append(
-            "[ascr][amus]amix=inputs=2:normalize=0:duration=first[aout]"
-        )
+        parts.append(f"[{ca}]volume=0[ascr]")  # mute scratch; keep [ca] consumed
+        parts.append("[ascr][bed]amix=inputs=2:normalize=0:duration=first[aout]")
     else:
         parts.append(f"[{ca}]anull[aout]")
 
