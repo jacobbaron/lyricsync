@@ -435,6 +435,34 @@ def validate_timeline(timeline: dict) -> list[str]:
         ):
             errors.append(f"{label}: wrap must be between 4 and 80")
 
+    errors.extend(_validate_music(timeline.get("music")))
+    return errors
+
+
+def _validate_music(music: object) -> list[str]:
+    """Validate the optional top-level `music` object (external track under the
+    footage). Returns error strings; empty when absent or well-formed.
+
+    Shape: {song_id: str, song_start: >=0, gain_db?: num, scratch_gain_db?: num|None}.
+    `scratch_gain_db=None` (or absent) means replace the clip audio with the song;
+    a number means duck the clip audio to that gain (dB) and mix the song over it.
+    """
+    if music is None:
+        return []
+    if not isinstance(music, dict):
+        return ["music must be an object"]
+    errors: list[str] = []
+    if not isinstance(music.get("song_id"), str) or not music.get("song_id"):
+        errors.append("music: song_id must be a non-empty string")
+    try:
+        if float(music.get("song_start")) < 0:
+            errors.append("music: song_start must be >= 0")
+    except (TypeError, ValueError):
+        errors.append("music: song_start must be a number")
+    for key in ("gain_db", "scratch_gain_db"):
+        v = music.get(key)
+        if v is not None and not isinstance(v, (int, float)):
+            errors.append(f"music: {key} must be a number or null")
     return errors
 
 
@@ -1372,6 +1400,7 @@ def compile_timeline(
     resolve_source,
     workdir: str,
     font_path: str,
+    music_path: str | None = None,
 ) -> dict:
     """Compile a timeline into ffmpeg invocation pieces.
 
@@ -1511,7 +1540,35 @@ def compile_timeline(
 
     draw = (",".join(draw_filters) + ",") if draw_filters else ""
     parts.append(f"[{cv}]{draw}format=yuv420p[vout]")
-    parts.append(f"[{ca}]anull[aout]")
+
+    # Optional external music track laid under the footage (see _validate_music).
+    # One extra input, seeked to song_start and trimmed/padded to the output
+    # length so a short song can't truncate the video's audio. `scratch_gain_db`
+    # None → replace (clip audio muted); a number → duck clip audio and mix.
+    music = timeline.get("music")
+    if music and music_path:
+        midx = in_idx  # next free input index (== len(inputs))
+        inputs.append([
+            "-ss", f"{float(music['song_start']):.3f}",
+            "-t", f"{out_dur:.3f}", "-i", str(music_path),
+        ])
+        gain = float(music.get("gain_db") or 0.0)
+        gvol = f",volume={gain}dB" if gain else ""
+        parts.append(
+            f"[{midx}:a]asetpts=PTS-STARTPTS,aresample={sr},"
+            f"aformat=channel_layouts=stereo,apad,"
+            f"atrim=duration={out_dur:.3f}{gvol}[amus]"
+        )
+        scratch = music.get("scratch_gain_db")
+        if scratch is None:
+            parts.append(f"[{ca}]volume=0[ascr]")  # replace: mute clip audio
+        else:
+            parts.append(f"[{ca}]volume={float(scratch)}dB[ascr]")  # duck + mix
+        parts.append(
+            "[ascr][amus]amix=inputs=2:normalize=0:duration=first[aout]"
+        )
+    else:
+        parts.append(f"[{ca}]anull[aout]")
 
     return {
         "inputs": inputs,

@@ -2983,7 +2983,7 @@ def _render_worker(story_id: str) -> None:
 
     # 1. Fetch story
     row = sb.table("stories").select(
-        "id, project_id, ranges_json, timeline_json, status"
+        "id, project_id, ranges_json, timeline_json, music_json, status"
     ).eq("id", story_id).limit(1).execute()
     rows = row.data or []
 
@@ -3003,6 +3003,12 @@ def _render_worker(story_id: str) -> None:
             }).eq("id", story_id).execute()
             return
         timeline = timeline_from_ranges(ranges)
+
+    # 1b. External music track lives in its own column (stories.music_json) so
+    # timeline edit ops can't clobber it; inject it as timeline["music"] here,
+    # before validation, so the compiler lays the song under the footage.
+    if story.get("music_json"):
+        timeline = {**timeline, "music": story["music_json"]}
 
     # 2. Resolve every clip the timeline references to an r2_key.
     #
@@ -3128,6 +3134,24 @@ def _render_worker(story_id: str) -> None:
                     timeline = {**timeline, "width": fit_w, "height": fit_h}
                     print(f"[render] auto-fit canvas {cur_w}x{cur_h} -> {fit_w}x{fit_h}")
 
+            # 3c. External music track (timeline.music): download the song from
+            # R2 into the temp dir (small — not worth the render-cache) and hand
+            # its local path to the compiler, which lays it under the footage.
+            music_path: str | None = None
+            music = timeline.get("music")
+            if music and music.get("song_id"):
+                srow = sb.table("songs").select("r2_key").eq(
+                    "id", music["song_id"]
+                ).limit(1).execute()
+                song_key = (srow.data or [{}])[0].get("r2_key")
+                if not song_key:
+                    raise ValueError(
+                        f"music song not uploaded: {music['song_id']!r}"
+                    )
+                music_path = str(tmp / f"song{Path(song_key).suffix or '.mp3'}")
+                r2.download_file(bucket, song_key, music_path)
+                print(f"[render] music {song_key} -> {music_path}")
+
             # 4. Compile the timeline and run ffmpeg. resolve_source receives
             # the whole clip item so cross-project clips resolve by clip_id;
             # the r2_key it maps to is the cache key from step 3.
@@ -3136,6 +3160,7 @@ def _render_worker(story_id: str) -> None:
                 resolve_source=lambda item: str(local_paths[_resolve_r2_key(item)]),
                 workdir=str(tmp),
                 font_path=OVERLAY_FONT,
+                music_path=music_path,
             )
             for text_path, content in compiled["text_files"]:
                 Path(text_path).write_text(content)
@@ -3210,6 +3235,180 @@ def _render_worker(story_id: str) -> None:
             "error_message": msg[:500],
         }).eq("id", story_id).execute()
 
+
+
+# ---------------------------------------------------------------------------
+# Music sync: align a story's footage to a finished-mix song, then render the
+# footage with that track laid under it (see modal/music_align.py + timeline.music).
+# ---------------------------------------------------------------------------
+
+music_align_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    .pip_install(
+        "fastapi[standard]>=0.115",
+        "boto3>=1.34",
+        "supabase>=2.10",
+        "numpy>=1.26",
+        "scipy>=1.11",
+        "librosa>=0.10",
+        "soundfile>=0.12",
+    )
+    # app.py imports transcript + timeline at module level (cloudpickled), so
+    # every image that runs an app.py function must mount them.
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
+    # Imported lazily inside the worker — only this image needs librosa.
+    .add_local_file(Path(__file__).parent / "music_align.py", "/root/music_align.py")
+)
+
+
+@app.function(image=image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def align_music(request: Request) -> JSONResponse:
+    """Vercel → Modal: align a story's footage to a project song, then re-render.
+
+    Body: {"story_id": "<uuid>", "song_id": "<uuid>"}. Returns immediately; the
+    worker writes stories.music_json and spawns the render.
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    story_id = body.get("story_id")
+    song_id = body.get("song_id")
+    if not story_id or not song_id:
+        raise HTTPException(
+            status_code=400, detail="story_id and song_id required"
+        )
+
+    _align_music_worker.spawn(story_id, song_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(
+    image=music_align_image,
+    secrets=secrets,
+    timeout=1800,
+    volumes={RENDER_CACHE_DIR: render_cache},
+)
+def _align_music_worker(story_id: str, song_id: str) -> None:
+    """Locate the story's first footage take inside the song (chroma-DTW), store
+    the offset as stories.music_json, then re-render so the finished track plays
+    under the footage.
+
+    v1 aligns a single contiguous take: one song_start for the whole story (the
+    proven demo case). Per-phrase multi-take offsets are a documented follow-up.
+    """
+    import music_align  # heavy (librosa); only this image has it
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    try:
+        srow = sb.table("stories").select(
+            "id, project_id, ranges_json, timeline_json"
+        ).eq("id", story_id).limit(1).execute()
+        if not srow.data:
+            print(f"[align-music] story {story_id} not found — skipping")
+            return
+        story = srow.data[0]
+        project_id = story["project_id"]
+
+        gr = sb.table("songs").select("r2_key, status").eq(
+            "id", song_id
+        ).limit(1).execute()
+        song = (gr.data or [{}])[0]
+        if song.get("status") != "ready" or not song.get("r2_key"):
+            raise ValueError(f"song {song_id} not ready for alignment")
+
+        # First clip item defines the take we align (its src window in the clip).
+        timeline = story.get("timeline_json")
+        if timeline is None:
+            timeline = timeline_from_ranges(story.get("ranges_json") or [])
+        vitems = [
+            it
+            for tr in timeline.get("tracks", [])
+            if tr.get("type") == "video"
+            for it in tr.get("items", [])
+            if it.get("kind") == "clip"
+        ]
+        if not vitems:
+            raise ValueError("story has no clip items to align")
+        first = vitems[0]
+        src_start = float(first["src_start"])
+        src_end = float(first["src_end"])
+
+        if first.get("clip_id"):
+            cr = sb.table("clips").select("r2_key").eq(
+                "id", first["clip_id"]
+            ).limit(1).execute()
+        else:
+            cr = sb.table("clips").select("r2_key").eq(
+                "project_id", project_id
+            ).eq("filename", first.get("source")).limit(1).execute()
+        clip_key = (cr.data or [{}])[0].get("r2_key")
+        if not clip_key:
+            raise ValueError("could not resolve the first clip's r2_key")
+
+        # Reuse the render cache for the (large) source clip.
+        cache_dir = Path(RENDER_CACHE_DIR)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        render_cache.reload()
+        cached = cache_dir / clip_key.replace("/", "_")
+        if not (cached.exists() and cached.stat().st_size > 0):
+            staging = cached.with_name(cached.name + ".part")
+            r2.download_file(bucket, clip_key, str(staging))
+            staging.replace(cached)
+            render_cache.commit()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            song_path = tmp / f"song{Path(song['r2_key']).suffix or '.mp3'}"
+            r2.download_file(bucket, song["r2_key"], str(song_path))
+            # Fast-seek the take's audio window to wav for librosa.
+            win = tmp / "take.wav"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-ss", f"{src_start:.3f}", "-t", f"{src_end - src_start:.3f}",
+                    "-i", str(cached), "-ac", "1", "-ar", "22050", str(win),
+                ],
+                check=True,
+            )
+            res = music_align.align(str(win), str(song_path))
+        print(f"[align-music] story {story_id}: {res}")
+
+        music_json = {
+            "song_id": song_id,
+            "song_start": res["song_start"],
+            "gain_db": 0.0,
+            "scratch_gain_db": None,
+            "cost": res["cost"],
+        }
+        sb.table("stories").update({
+            "music_json": music_json,
+            "status": "rendering",
+            "error_message": None,
+        }).eq("id", story_id).execute()
+
+        # Re-render so the finished track plays under the footage.
+        _render_worker.spawn(story_id)
+        print(
+            f"[align-music] story {story_id} → song_start={res['song_start']}s "
+            f"cost={res['cost']} — rendering"
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        print(f"[align-music] error for story {story_id}: {msg}")
+        sb.table("stories").update({
+            "status": "error",
+            "error_message": msg[:500],
+        }).eq("id", story_id).execute()
 
 
 # ---------------------------------------------------------------------------
