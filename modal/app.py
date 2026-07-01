@@ -2711,6 +2711,236 @@ def _motion_worker(signal_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PERCEPTION T4: clip / frame embeddings (CLIP → pgvector). Own table
+# (clip_embeddings); a clip_signals row (kind='embedding') tracks run status so
+# the trigger is pollable exactly like the other perception workers.
+# ---------------------------------------------------------------------------
+
+# Persist the downloaded CLIP weights across cold starts so we don't re-fetch
+# ~350 MB on every container.
+embed_cache = modal.Volume.from_name(
+    "lyricsync-embed-cache", create_if_missing=True
+)
+EMBED_CACHE_DIR = "/embed_cache"
+
+embed_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    # CPU-only torch wheels — no CUDA, much smaller image, fine for CLIP inference.
+    .pip_install(
+        "torch==2.4.1",
+        "torchvision==0.19.1",
+        index_url="https://download.pytorch.org/whl/cpu",
+    )
+    .pip_install(
+        "fastapi[standard]>=0.115",
+        "boto3>=1.34",
+        "supabase>=2.10",
+        "sentence-transformers>=2.7,<4",
+        "pillow>=10.0",
+    )
+    .env({
+        "SENTENCE_TRANSFORMERS_HOME": EMBED_CACHE_DIR,
+        "HF_HOME": EMBED_CACHE_DIR,
+    })
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
+    .add_local_file(Path(__file__).parent / "embedding.py", "/root/embedding.py")
+)
+
+EMBED_SAMPLE_FPS = 1.0
+EMBED_MAX_FRAMES = 240
+
+# Process-global model cache: SentenceTransformer load is a few seconds, so keep
+# it warm across calls within a container (both embed_text and _embed_worker).
+_EMBED_MODEL_CACHE: dict = {}
+
+
+def _load_embed_model():
+    from sentence_transformers import SentenceTransformer
+    from embedding import EMBED_MODEL
+
+    m = _EMBED_MODEL_CACHE.get("model")
+    if m is None:
+        m = SentenceTransformer(
+            EMBED_MODEL, device="cpu", cache_folder=EMBED_CACHE_DIR
+        )
+        _EMBED_MODEL_CACHE["model"] = m
+    return m
+
+
+@app.function(
+    image=embed_image, secrets=secrets,
+    volumes={EMBED_CACHE_DIR: embed_cache}, timeout=60,
+)
+@modal.fastapi_endpoint(method="POST")
+async def embed_clip(request: Request) -> JSONResponse:
+    """Vercel calls this to kick off a clip-embedding run; spawns the worker and
+    returns immediately. Body: {"signal_id": "<uuid>"} — the worker reads the
+    clip off the pre-created clip_signals row (kind='embedding').
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    signal_id = body.get("signal_id")
+    if not signal_id:
+        raise HTTPException(status_code=400, detail="signal_id required")
+
+    _embed_worker.spawn(signal_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(
+    image=embed_image, secrets=secrets,
+    volumes={EMBED_CACHE_DIR: embed_cache}, timeout=1800,
+)
+def _embed_worker(signal_id: str) -> None:
+    """Clip-embedding worker (PERCEPTION T4).
+
+    1. Load the clip_signals row → clip (r2_key, duration).
+    2. Download the clip, sample ~1 fps frames via ffmpeg (capped).
+    3. CLIP-encode every frame (L2-normalized) → per-frame vectors.
+    4. Mean-pool into one whole-clip vector.
+    5. Replace this clip's rows for the model and insert per-frame + pooled
+       rows into clip_embeddings; mark the signal done.
+    """
+    import traceback
+
+    from PIL import Image
+    from embedding import (
+        EMBED_DIM, EMBED_MODEL, frame_time, mean_pool, to_pgvector,
+    )
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    debug: dict = {"steps": []}
+
+    def step(msg: str) -> None:
+        print(f"[embed:{signal_id}] {msg}")
+        debug["steps"].append(msg)
+
+    row = sb.table("clip_signals").select("id, clip_id").eq("id", signal_id).limit(1).execute()
+    if not row.data:
+        print(f"[embed] signal {signal_id} not found — skipping")
+        return
+    clip_id = row.data[0]["clip_id"]
+
+    clip_row = sb.table("clips").select(
+        "id, r2_key, project_id, duration_secs"
+    ).eq("id", clip_id).limit(1).execute()
+    if not clip_row.data or not clip_row.data[0].get("r2_key"):
+        _set_signal(sb, signal_id, status="error", error="clip not found or has no video")
+        return
+    clip = clip_row.data[0]
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            video_path = _download_clip(r2, bucket, clip, tmp)
+            step("downloaded clip")
+
+            frames_dir = tmp / "frames"
+            frames_dir.mkdir()
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(video_path),
+                    "-vf", f"fps={EMBED_SAMPLE_FPS},scale=256:-1",
+                    str(frames_dir / "f%06d.jpg"),
+                ],
+                check=True, capture_output=True, text=True,
+            )
+            frame_paths = sorted(frames_dir.glob("f*.jpg"))[:EMBED_MAX_FRAMES]
+            if not frame_paths:
+                raise RuntimeError("no frames sampled from clip")
+            step(f"sampled {len(frame_paths)} frames at {EMBED_SAMPLE_FPS} fps")
+
+            model = _load_embed_model()
+            images = [Image.open(fp).convert("RGB") for fp in frame_paths]
+            vecs = model.encode(
+                images, batch_size=32, convert_to_numpy=True,
+                normalize_embeddings=True, show_progress_bar=False,
+            )
+            step(f"encoded {len(vecs)} frame vectors (dim={vecs.shape[1]})")
+
+            per_frame = [v.tolist() for v in vecs]
+            pooled = mean_pool(per_frame)
+
+            rows = [
+                {
+                    "clip_id": clip_id,
+                    "t": frame_time(i),
+                    "embedding": to_pgvector(v),
+                    "model": EMBED_MODEL,
+                }
+                for i, v in enumerate(per_frame)
+            ]
+            rows.append({
+                "clip_id": clip_id,
+                "t": None,  # pooled whole-clip vector
+                "embedding": to_pgvector(pooled),
+                "model": EMBED_MODEL,
+            })
+
+            # Idempotent re-embed: drop this clip's prior rows for the model first.
+            sb.table("clip_embeddings").delete().eq("clip_id", clip_id).eq(
+                "model", EMBED_MODEL
+            ).execute()
+            for i in range(0, len(rows), 100):
+                sb.table("clip_embeddings").insert(rows[i:i + 100]).execute()
+            step(f"inserted {len(rows)} rows (incl. 1 pooled)")
+
+            _set_signal(
+                sb, signal_id, status="done",
+                result={"n_frames": len(per_frame), "model": EMBED_MODEL, "dim": EMBED_DIM},
+                debug=debug,
+            )
+            print(f"[embed] clip {clip_id} ✓ {len(per_frame)} frames")
+    except Exception as exc:  # noqa: BLE001
+        debug["traceback"] = traceback.format_exc()
+        _set_signal(sb, signal_id, status="error", error=str(exc), debug=debug)
+        print(f"[embed] clip {clip_id} failed: {exc}")
+
+
+@app.function(
+    image=embed_image, secrets=secrets,
+    volumes={EMBED_CACHE_DIR: embed_cache}, timeout=60,
+)
+@modal.fastapi_endpoint(method="POST")
+async def embed_text(request: Request) -> JSONResponse:
+    """Synchronous text→vector for cross-clip search. Vercel's search route
+    calls this to embed the query into the same CLIP space as the frames, then
+    runs the pgvector search itself (under the caller's RLS).
+
+    Body: {"text": "rolls of pink insulation"} → {embedding, model, dim}.
+    """
+    from embedding import EMBED_MODEL
+
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+
+    model = _load_embed_model()
+    vec = model.encode(
+        [text], convert_to_numpy=True, normalize_embeddings=True,
+        show_progress_bar=False,
+    )[0]
+    return JSONResponse(
+        {"embedding": vec.tolist(), "model": EMBED_MODEL, "dim": int(vec.shape[0])}
+    )
+
+
+# ---------------------------------------------------------------------------
 # EDL-01: Edit Timeline (synchronous — Vercel proxies the LLM's edit ops here)
 # ---------------------------------------------------------------------------
 
