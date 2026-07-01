@@ -3712,7 +3712,11 @@ async def align_music(request: Request) -> JSONResponse:
     if not alignment_id:
         raise HTTPException(status_code=400, detail="alignment_id required")
 
-    _align_music_worker.spawn(alignment_id)
+    # Await the async spawn: a blocking `.spawn()` in this async endpoint can be
+    # torn down when the handler returns before the enqueue RPC completes, so the
+    # job silently never runs (Modal's AsyncUsageWarning). `.spawn.aio()` awaits
+    # the enqueue, guaranteeing the worker is scheduled.
+    await _align_music_worker.spawn.aio(alignment_id)
     return JSONResponse({"status": "accepted"})
 
 
