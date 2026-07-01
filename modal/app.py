@@ -2941,6 +2941,186 @@ async def embed_text(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# PERCEPTION T5: object detection — closed-set YOLO test bed (clip_signals,
+# kind='detection'). Reuses the T1 clip_signals table + worker pattern; the
+# per-frame boxes go to a detections.json sidecar in R2.
+# ---------------------------------------------------------------------------
+
+DETECT_MODEL = "yolov8n"          # COCO 80-class nano detector — fast on CPU
+DETECT_SAMPLE_FPS = 2.0
+DETECT_MAX_FRAMES = 300
+DETECT_CONF = 0.25
+
+detection_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "libgl1", "libglib2.0-0")  # libgl1 for opencv/ultralytics
+    .pip_install(
+        "torch==2.4.1",
+        "torchvision==0.19.1",
+        index_url="https://download.pytorch.org/whl/cpu",
+    )
+    .pip_install(
+        "fastapi[standard]>=0.115",
+        "boto3>=1.34",
+        "supabase>=2.10",
+        "ultralytics>=8.2,<9",
+        "numpy>=1.26",
+    )
+    # Bake the COCO weights into the image so the worker never downloads at
+    # runtime (ultralytics fetches to CWD; /root is the container CWD).
+    .run_commands(
+        "cd /root && python -c \"from ultralytics import YOLO; YOLO('yolov8n.pt')\""
+    )
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
+    .add_local_file(Path(__file__).parent / "detection.py", "/root/detection.py")
+)
+
+_DETECT_MODEL_CACHE: dict = {}
+
+
+def _load_detect_model():
+    from ultralytics import YOLO
+
+    m = _DETECT_MODEL_CACHE.get("model")
+    if m is None:
+        m = YOLO("/root/yolov8n.pt")
+        _DETECT_MODEL_CACHE["model"] = m
+    return m
+
+
+@app.function(image=detection_image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def detect_objects(request: Request) -> JSONResponse:
+    """Vercel calls this to kick off a detection run; spawns the worker and
+    returns immediately. Body: {"signal_id": "<uuid>"} — the worker reads the
+    clip off the pre-created clip_signals row (kind='detection').
+    """
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    signal_id = body.get("signal_id")
+    if not signal_id:
+        raise HTTPException(status_code=400, detail="signal_id required")
+
+    _detect_worker.spawn(signal_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(image=detection_image, secrets=secrets, timeout=1800)
+def _detect_worker(signal_id: str) -> None:
+    """Object-detection worker (PERCEPTION T5, closed-set YOLO test bed).
+
+    1. Load the clip_signals row → clip (r2_key, duration).
+    2. Download the clip, sample ~2 fps frames via ffmpeg (capped).
+    3. Run YOLOv8n (COCO 80 classes) on each frame → per-frame boxes.
+    4. Hand the raw detections to detection.py for tracking + inventory.
+    5. Write the full per-frame sidecar to R2 + a compact inventory on the row.
+    """
+    import traceback
+
+    from detection import build_detection_doc, build_detection_result, track_detections
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    debug: dict = {"steps": []}
+
+    def step(msg: str) -> None:
+        print(f"[detect:{signal_id}] {msg}")
+        debug["steps"].append(msg)
+
+    row = sb.table("clip_signals").select("id, clip_id").eq("id", signal_id).limit(1).execute()
+    if not row.data:
+        print(f"[detect] signal {signal_id} not found — skipping")
+        return
+    clip_id = row.data[0]["clip_id"]
+
+    clip_row = sb.table("clips").select(
+        "id, r2_key, project_id, duration_secs"
+    ).eq("id", clip_id).limit(1).execute()
+    if not clip_row.data or not clip_row.data[0].get("r2_key"):
+        _set_signal(sb, signal_id, status="error", error="clip not found or has no video")
+        return
+    clip = clip_row.data[0]
+    project_id = clip["project_id"]
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            video_path = _download_clip(r2, bucket, clip, tmp)
+            duration = clip.get("duration_secs") or _probe_duration(video_path)
+            if not duration:
+                raise RuntimeError("could not determine clip duration")
+            step(f"downloaded, duration={duration:.2f}s")
+
+            frames_dir = tmp / "frames"
+            frames_dir.mkdir()
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(video_path),
+                    "-vf", f"fps={DETECT_SAMPLE_FPS},scale=640:-1",
+                    str(frames_dir / "f%06d.jpg"),
+                ],
+                check=True, capture_output=True, text=True,
+            )
+            frame_paths = sorted(frames_dir.glob("f*.jpg"))[:DETECT_MAX_FRAMES]
+            if not frame_paths:
+                raise RuntimeError("no frames sampled from clip")
+            step(f"sampled {len(frame_paths)} frames at {DETECT_SAMPLE_FPS} fps")
+
+            model = _load_detect_model()
+            names = model.names  # class-index → COCO name
+            results = model.predict(
+                [str(p) for p in frame_paths], conf=DETECT_CONF,
+                verbose=False, stream=False,
+            )
+
+            frames: list[dict] = []
+            for i, res in enumerate(results):
+                dets = []
+                boxes = getattr(res, "boxes", None)
+                if boxes is not None:
+                    for b in boxes:
+                        cls_idx = int(b.cls[0])
+                        xyxy = [round(float(v), 1) for v in b.xyxy[0].tolist()]
+                        dets.append({
+                            "class": names.get(cls_idx, str(cls_idx)),
+                            "conf": round(float(b.conf[0]), 3),
+                            "box": xyxy,
+                        })
+                frames.append({"t": round(i / DETECT_SAMPLE_FPS, 3), "detections": dets})
+            step(f"ran {DETECT_MODEL} on {len(frames)} frames")
+
+            tracklets = track_detections(frames)
+            doc = build_detection_doc(
+                frames, duration, DETECT_SAMPLE_FPS, DETECT_MODEL, tracklets
+            )
+            result = build_detection_result(frames, tracklets, DETECT_SAMPLE_FPS, DETECT_MODEL)
+
+            detect_key = f"projects/{project_id}/clips/{clip_id}/detections.json"
+            r2.put_object(
+                Bucket=bucket, Key=detect_key,
+                Body=json.dumps(doc).encode(), ContentType="application/json",
+            )
+            step(f"wrote sidecar {detect_key}")
+
+            _set_signal(
+                sb, signal_id, status="done",
+                result=result, result_r2_key=detect_key, debug=debug,
+            )
+            print(f"[detect] clip {clip_id} ✓ {result['summary']}")
+    except Exception as exc:  # noqa: BLE001
+        debug["traceback"] = traceback.format_exc()
+        _set_signal(sb, signal_id, status="error", error=str(exc), debug=debug)
+        print(f"[detect] clip {clip_id} failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # EDL-01: Edit Timeline (synchronous — Vercel proxies the LLM's edit ops here)
 # ---------------------------------------------------------------------------
 
