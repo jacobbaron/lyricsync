@@ -40,8 +40,9 @@ def create_app(project_dir: Path) -> Starlette:
             raw = json.loads(alignment_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and isinstance(raw.get("meta"), dict):
                 meta = raw["meta"]
-        except OSError:
-            pass
+        except OSError as e:
+            import logging
+            logging.getLogger(__name__).warning("failed to read alignment meta: %s", e)
         payload = alignment_to_dict(result, meta=meta or None)
         return JSONResponse(payload)
 
