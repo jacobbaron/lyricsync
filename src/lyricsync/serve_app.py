@@ -21,7 +21,7 @@ def _json_error(status: int, detail: str) -> JSONResponse:
     return JSONResponse({"detail": detail}, status_code=status)
 
 
-def create_app(project_dir: Path) -> Starlette:
+def create_app(project_dir: Path, host: str = "127.0.0.1", port: int = 8765) -> Starlette:
     """Serve one project directory (must contain ``alignment.json`` and ``audio.wav``)."""
     project_dir = project_dir.resolve()
     alignment_path = project_dir / "alignment.json"
@@ -86,9 +86,14 @@ def create_app(project_dir: Path) -> Starlette:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=[
+            f"http://{host}:{port}",
+            f"http://localhost:{port}",
+            "http://127.0.0.1:8765",
+            "http://localhost:8765",
+        ],
+        allow_methods=["GET", "PUT"],
+        allow_headers=["Content-Type"],
     )
 
     return app
@@ -98,7 +103,7 @@ def run_server(project_dir: Path, host: str = "127.0.0.1", port: int = 8765) -> 
     import uvicorn
 
     uvicorn.run(
-        create_app(project_dir),
+        create_app(project_dir, host=host, port=port),
         host=host,
         port=port,
         log_level="info",

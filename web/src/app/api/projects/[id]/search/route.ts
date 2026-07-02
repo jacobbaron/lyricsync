@@ -78,8 +78,9 @@ export async function GET(
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
+      console.error(`[search] embed_text returned ${res.status}: ${detail}`);
       return NextResponse.json(
-        { error: `Query embedding failed (${res.status})`, detail },
+        { error: `Query embedding failed (${res.status})` },
         { status: 502 },
       );
     }
@@ -92,8 +93,9 @@ export async function GET(
     }
     embedding = payload.embedding;
   } catch (err) {
+    console.error("[search] query embedding request failed:", err);
     return NextResponse.json(
-      { error: "Query embedding request failed", detail: String(err) },
+      { error: "Query embedding request failed" },
       { status: 502 },
     );
   }
