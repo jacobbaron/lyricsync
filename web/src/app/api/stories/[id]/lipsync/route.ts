@@ -162,11 +162,14 @@ export async function POST(
     .eq("song_id", bed.song_id)
     .eq("status", "ready")
     .order("created_at", { ascending: false });
+  // The render bakes ±PAD around each range, so the shown footage runs from
+  // srcStart-ish to srcEnd; require the alignment window to cover it, with a PAD
+  // tolerance so a window aligned to the exact in/out point still qualifies.
   const align = (aligns ?? []).find(
     (a) =>
-      Number(a.footage_start) <= target.srcStart + 1e-3 &&
-      Number(a.footage_end) >= target.srcStart - 1e-3 &&
-      a.song_start != null,
+      a.song_start != null &&
+      Number(a.footage_start) <= target.srcStart + PAD + 1e-3 &&
+      Number(a.footage_end) >= target.srcEnd - PAD - 1e-3,
   );
   if (!align) {
     return NextResponse.json(
