@@ -1,5 +1,8 @@
-import { after, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { requireClipWithVideo } from "@/lib/api/clips";
+import { createClipSignal } from "@/lib/api/signals";
+import { deferModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -22,68 +25,19 @@ export async function POST(
   if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  const { supabase } = auth;
 
-  const { data: clip } = await supabase
-    .from("clips")
-    .select("id, r2_key")
-    .eq("id", clipId)
-    .maybeSingle();
+  const clip = await requireClipWithVideo(auth.supabase, clipId);
+  if (clip instanceof NextResponse) return clip;
 
-  if (!clip) {
-    return NextResponse.json({ error: "Clip not found" }, { status: 404 });
-  }
-  if (!clip.r2_key) {
-    return NextResponse.json(
-      { error: "Clip has no uploaded video yet" },
-      { status: 409 },
-    );
-  }
+  const signal = await createClipSignal(auth.supabase, clipId, "embedding");
+  if (signal instanceof NextResponse) return signal;
 
-  const { data: signal, error } = await supabase
-    .from("clip_signals")
-    .insert({ clip_id: clipId, kind: "embedding", status: "processing" })
-    .select("id")
-    .single();
-
-  if (error || !signal) {
-    return NextResponse.json(
-      { error: error?.message ?? "Failed to create signal" },
-      { status: 500 },
-    );
-  }
-
-  // Same after()-deferred-fetch pattern as /quality and /motion: the 202
-  // returns immediately while Vercel keeps the function alive to finish the
-  // call to a (likely cold) Modal container.
-  const embedUrl =
+  deferModal(
+    "embed",
     process.env.MODAL_EMBED_URL ??
-    "https://jacobbaron--lyricsync-embed-clip.modal.run";
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (!webhookSecret) {
-    console.warn("[embed] MODAL_WEBHOOK_SECRET not set — embedding not triggered");
-  } else {
-    const signalId = signal.id;
-    after(async () => {
-      try {
-        const res = await fetch(embedUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-webhook-secret": webhookSecret,
-          },
-          body: JSON.stringify({ signal_id: signalId }),
-        });
-        const text = await res.text().catch(() => "");
-        console.log(`[embed] Modal responded ${res.status}: ${text}`);
-        if (!res.ok) {
-          console.error(`[embed] Modal error for ${signalId}: ${text}`);
-        }
-      } catch (err) {
-        console.error("[embed] Modal trigger failed:", err);
-      }
-    });
-  }
+      "https://jacobbaron--lyricsync-embed-clip.modal.run",
+    { signal_id: signal.id },
+  );
 
   return NextResponse.json(
     { id: signal.id, kind: "embedding", status: "processing" },

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { requireClipWithVideo } from "@/lib/api/clips";
+import { proxyModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -18,32 +20,16 @@ export async function POST(
   if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  const { supabase } = auth;
 
-  // RLS enforces ownership via the projects join.
-  const { data: clip } = await supabase
-    .from("clips")
-    .select("id, r2_key")
-    .eq("id", clipId)
-    .maybeSingle();
-
-  if (!clip) {
-    return NextResponse.json({ error: "Clip not found" }, { status: 404 });
-  }
-  if (!clip.r2_key) {
-    return NextResponse.json(
-      { error: "Clip has no uploaded source yet" },
-      { status: 409 },
-    );
-  }
+  const clip = await requireClipWithVideo(auth.supabase, clipId);
+  if (clip instanceof NextResponse) return clip;
 
   // analyze_clip_audio lives on the same Modal app as render_story, so derive
   // its URL from MODAL_RENDER_URL (override with MODAL_ANALYZE_AUDIO_URL).
   const analyzeUrl =
     process.env.MODAL_ANALYZE_AUDIO_URL ||
     process.env.MODAL_RENDER_URL?.replace("render-story", "analyze-clip-audio");
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (!analyzeUrl || !webhookSecret) {
+  if (!analyzeUrl) {
     return NextResponse.json(
       {
         error:
@@ -54,17 +40,10 @@ export async function POST(
     );
   }
 
-  const upstream = await fetch(analyzeUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-webhook-secret": webhookSecret,
-    },
-    body: JSON.stringify({ clip_id: clipId }),
-  });
-
-  const payload = await upstream.json().catch(() => ({
-    error: "audio analysis service returned a non-JSON response",
-  }));
-  return NextResponse.json(payload, { status: upstream.status });
+  const { payload, status } = await proxyModal(
+    analyzeUrl,
+    { clip_id: clipId },
+    "audio analysis service",
+  );
+  return NextResponse.json(payload, { status });
 }

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { triggerModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -149,21 +150,10 @@ export async function POST(
     .update({ status: "generating_stories", story_prompt: prompt })
     .eq("id", projectId);
 
-  // Fire Modal (fire-and-forget)
-  const generateUrl = process.env.MODAL_GENERATE_URL;
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (generateUrl && webhookSecret) {
-    fetch(generateUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": webhookSecret,
-      },
-      body: JSON.stringify({ project_id: projectId, round_id: round.id }),
-    }).catch((err) => console.error("[generate] Modal trigger failed:", err));
-  } else {
-    console.warn("[generate] MODAL_GENERATE_URL not set — generation not triggered");
-  }
+  triggerModal("generate", process.env.MODAL_GENERATE_URL, {
+    project_id: projectId,
+    round_id: round.id,
+  });
 
   return NextResponse.json({ round_id: round.id }, { status: 202 });
 }

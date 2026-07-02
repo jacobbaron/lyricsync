@@ -1,6 +1,7 @@
-import { after, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
 import { getObjectText, putObjectJson } from "@/lib/r2/client";
+import { deferModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -174,52 +175,31 @@ export async function POST(
     const analyzeUrl =
       process.env.MODAL_ANALYZE_URL ??
       "https://jacobbaron--lyricsync-analyze-visuals.modal.run";
-    const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-    if (webhookSecret) {
-      for (const clip of transcribedClips) {
-        try {
-          const { data: existing } = await supabase
-            .from("visual_analyses")
-            .select("id")
-            .eq("clip_id", clip.id)
-            .eq("variant", CANONICAL_VARIANT)
-            .in("status", ["analyzing", "done"])
-            .limit(1);
-          if (existing && existing.length > 0) continue;
+    for (const clip of transcribedClips) {
+      try {
+        const { data: existing } = await supabase
+          .from("visual_analyses")
+          .select("id")
+          .eq("clip_id", clip.id)
+          .eq("variant", CANONICAL_VARIANT)
+          .in("status", ["analyzing", "done"])
+          .limit(1);
+        if (existing && existing.length > 0) continue;
 
-          const { data: analysis } = await supabase
-            .from("visual_analyses")
-            .insert({
-              clip_id: clip.id,
-              variant: CANONICAL_VARIANT,
-              status: "analyzing",
-            })
-            .select("id")
-            .single();
-          if (!analysis) continue;
+        const { data: analysis } = await supabase
+          .from("visual_analyses")
+          .insert({
+            clip_id: clip.id,
+            variant: CANONICAL_VARIANT,
+            status: "analyzing",
+          })
+          .select("id")
+          .single();
+        if (!analysis) continue;
 
-          const analysisId = analysis.id;
-          after(async () => {
-            try {
-              const res = await fetch(analyzeUrl, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-webhook-secret": webhookSecret,
-                },
-                body: JSON.stringify({ analysis_id: analysisId }),
-              });
-              if (!res.ok) {
-                const text = await res.text().catch(() => "");
-                console.error(`[merge] analyze trigger ${res.status}: ${text}`);
-              }
-            } catch (err) {
-              console.error("[merge] analyze trigger failed:", err);
-            }
-          });
-        } catch (err) {
-          console.error("[merge] visual analysis spawn failed (non-fatal):", err);
-        }
+        deferModal("merge/analyze", analyzeUrl, { analysis_id: analysis.id });
+      } catch (err) {
+        console.error("[merge] visual analysis spawn failed (non-fatal):", err);
       }
     }
 
@@ -230,27 +210,8 @@ export async function POST(
     const audioAnalyzeUrl =
       process.env.MODAL_ANALYZE_AUDIO_URL ??
       analyzeUrl.replace("analyze-visuals", "analyze-clip-audio");
-    if (webhookSecret) {
-      for (const clip of transcribedClips) {
-        after(async () => {
-          try {
-            const res = await fetch(audioAnalyzeUrl, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-webhook-secret": webhookSecret,
-              },
-              body: JSON.stringify({ clip_id: clip.id }),
-            });
-            if (!res.ok) {
-              const text = await res.text().catch(() => "");
-              console.error(`[merge] audio analyze trigger ${res.status}: ${text}`);
-            }
-          } catch (err) {
-            console.error("[merge] audio analyze trigger failed:", err);
-          }
-        });
-      }
+    for (const clip of transcribedClips) {
+      deferModal("merge/audio", audioAnalyzeUrl, { clip_id: clip.id });
     }
 
     return NextResponse.json({

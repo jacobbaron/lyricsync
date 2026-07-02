@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { proxyModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -69,30 +70,22 @@ export async function POST(
   const editUrl =
     process.env.MODAL_EDIT_URL ||
     process.env.MODAL_RENDER_URL?.replace("render-story", "edit-timeline");
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (!editUrl || !webhookSecret) {
+  if (!editUrl) {
     return NextResponse.json(
       { error: "MODAL_EDIT_URL not configured (and could not derive it from MODAL_RENDER_URL)" },
       { status: 503 },
     );
   }
 
-  const upstream = await fetch(editUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-webhook-secret": webhookSecret,
-    },
-    body: JSON.stringify({
+  const { payload, status } = await proxyModal(
+    editUrl,
+    {
       story_id: storyId,
       ops: body.ops ?? [],
       base_revision: body.base_revision ?? null,
       restore_revision: body.restore_revision ?? null,
-    }),
-  });
-
-  const payload = await upstream.json().catch(() => ({
-    detail: "edit service returned a non-JSON response",
-  }));
-  return NextResponse.json(payload, { status: upstream.status });
+    },
+    "edit service",
+  );
+  return NextResponse.json(payload, { status });
 }

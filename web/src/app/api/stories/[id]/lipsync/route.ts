@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { triggerModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -202,20 +203,7 @@ export async function POST(
     })
     .eq("id", storyId);
 
-  const renderUrl = process.env.MODAL_RENDER_URL;
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (renderUrl && webhookSecret) {
-    fetch(renderUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": webhookSecret,
-      },
-      body: JSON.stringify({ story_id: storyId }),
-    }).catch((err) => console.error("[lipsync] Modal render trigger failed:", err));
-  } else {
-    console.warn("[lipsync] MODAL_RENDER_URL not set — render not triggered");
-  }
+  triggerModal("lipsync", process.env.MODAL_RENDER_URL, { story_id: storyId });
 
   return NextResponse.json({
     status: "accepted",

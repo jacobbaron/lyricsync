@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { proxyModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -75,8 +76,7 @@ export async function POST(
     process.env.MODAL_PREVIEW_CLEAN_URL ||
     process.env.MODAL_EDIT_URL?.replace("edit-timeline", "preview-clean-speech") ||
     process.env.MODAL_RENDER_URL?.replace("render-story", "preview-clean-speech");
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (!previewUrl || !webhookSecret) {
+  if (!previewUrl) {
     return NextResponse.json(
       {
         error:
@@ -87,21 +87,14 @@ export async function POST(
     );
   }
 
-  const upstream = await fetch(previewUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-webhook-secret": webhookSecret,
-    },
-    body: JSON.stringify({
+  const { payload, status } = await proxyModal(
+    previewUrl,
+    {
       story_id: storyId,
       id: body.id,
       params: body.params ?? {},
-    }),
-  });
-
-  const payload = await upstream.json().catch(() => ({
-    detail: "clean-speech preview service returned a non-JSON response",
-  }));
-  return NextResponse.json(payload, { status: upstream.status });
+    },
+    "clean-speech preview service",
+  );
+  return NextResponse.json(payload, { status });
 }
