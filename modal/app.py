@@ -336,7 +336,7 @@ async def transcribe_clip(request: Request) -> JSONResponse:
     if not clip_id:
         raise HTTPException(status_code=400, detail="clip_id required")
 
-    _transcribe_worker.spawn(clip_id)
+    await _transcribe_worker.spawn.aio(clip_id)
     return JSONResponse({"status": "accepted"})
 
 
@@ -757,7 +757,7 @@ async def align_and_merge(request: Request) -> JSONResponse:
         except (TypeError, ValueError):
             return None
 
-    _align_worker.spawn(
+    await _align_worker.spawn.aio(
         project_id,
         num_speakers=_opt_int("num_speakers"),
         min_speakers=_opt_int("min_speakers"),
@@ -1257,7 +1257,7 @@ async def generate_stories(request: Request) -> JSONResponse:
     if not project_id or not round_id:
         raise HTTPException(status_code=400, detail="project_id and round_id required")
 
-    _generate_worker.spawn(project_id, round_id)
+    await _generate_worker.spawn.aio(project_id, round_id)
     return JSONResponse({"status": "accepted"})
 
 
@@ -1748,7 +1748,7 @@ async def analyze_visuals(request: Request) -> JSONResponse:
     if not analysis_id:
         raise HTTPException(status_code=400, detail="analysis_id required")
 
-    _analyze_worker.spawn(analysis_id)
+    await _analyze_worker.spawn.aio(analysis_id)
     return JSONResponse({"status": "accepted"})
 
 
@@ -2399,7 +2399,7 @@ async def analyze_quality(request: Request) -> JSONResponse:
     if not signal_id:
         raise HTTPException(status_code=400, detail="signal_id required")
 
-    _quality_worker.spawn(signal_id)
+    await _quality_worker.spawn.aio(signal_id)
     return JSONResponse({"status": "accepted"})
 
 
@@ -2563,7 +2563,7 @@ async def analyze_motion(request: Request) -> JSONResponse:
     if not signal_id:
         raise HTTPException(status_code=400, detail="signal_id required")
 
-    _motion_worker.spawn(signal_id)
+    await _motion_worker.spawn.aio(signal_id)
     return JSONResponse({"status": "accepted"})
 
 
@@ -2789,7 +2789,7 @@ async def embed_clip(request: Request) -> JSONResponse:
     if not signal_id:
         raise HTTPException(status_code=400, detail="signal_id required")
 
-    _embed_worker.spawn(signal_id)
+    await _embed_worker.spawn.aio(signal_id)
     return JSONResponse({"status": "accepted"})
 
 
@@ -3006,7 +3006,7 @@ async def detect_objects(request: Request) -> JSONResponse:
     if not signal_id:
         raise HTTPException(status_code=400, detail="signal_id required")
 
-    _detect_worker.spawn(signal_id)
+    await _detect_worker.spawn.aio(signal_id)
     return JSONResponse({"status": "accepted"})
 
 
@@ -3361,7 +3361,7 @@ async def render_story(request: Request) -> JSONResponse:
     if not story_id:
         raise HTTPException(status_code=400, detail="story_id required")
 
-    _render_worker.spawn(story_id)
+    await _render_worker.spawn.aio(story_id)
     return JSONResponse({"status": "accepted"})
 
 
@@ -3887,7 +3887,7 @@ async def analyze_clip_audio(request: Request) -> JSONResponse:
     if not clip_id:
         raise HTTPException(status_code=400, detail="clip_id required")
 
-    _analyze_clip_audio_worker.spawn(clip_id)
+    await _analyze_clip_audio_worker.spawn.aio(clip_id)
     return JSONResponse({"status": "accepted"})
 
 
