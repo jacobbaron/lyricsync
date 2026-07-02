@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { triggerModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -194,19 +195,10 @@ export async function POST(
   // at 'transcribed' so the range picker remains available for new cuts.
   // Individual stories track their own rendering lifecycle.
 
-  // Trigger render
-  const renderUrl = process.env.MODAL_RENDER_URL;
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (renderUrl && webhookSecret) {
-    fetch(renderUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": webhookSecret,
-      },
-      body: JSON.stringify({ project_id: projectId, story_id: story.id }),
-    }).catch((err) => console.error("[stories] render trigger failed:", err));
-  }
+  triggerModal("stories", process.env.MODAL_RENDER_URL, {
+    project_id: projectId,
+    story_id: story.id,
+  });
 
   return NextResponse.json({ id: story.id }, { status: 201 });
 }

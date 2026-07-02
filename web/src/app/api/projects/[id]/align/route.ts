@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { triggerModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -71,40 +72,10 @@ export async function POST(
     if (n !== undefined) speakerArgs[key] = n;
   }
 
-  // Invoke Modal asynchronously — fire and don't await the response body.
-  const modalUrl = process.env.MODAL_ALIGN_URL;
-  const modalSecret = process.env.MODAL_WEBHOOK_SECRET;
-
-  if (!modalUrl || !modalSecret) {
-    // Dev/test: env not configured — log and return accepted so the client
-    // isn't stuck waiting.
-    console.warn(
-      "MODAL_ALIGN_URL or MODAL_WEBHOOK_SECRET not set — skipping Modal call",
-    );
-    return NextResponse.json(
-      { status: "accepted", modal: false },
-      { status: 202 },
-    );
-  }
-
-  try {
-    const res = await fetch(modalUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": modalSecret,
-      },
-      body: JSON.stringify({ project_id: projectId, ...speakerArgs }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(`Modal align returned ${res.status}: ${text}`);
-      // Don't fail the request — an operator can retry via the DB or UI.
-    }
-  } catch (err) {
-    console.error("Failed to reach Modal align endpoint:", err);
-  }
+  triggerModal("align", process.env.MODAL_ALIGN_URL, {
+    project_id: projectId,
+    ...speakerArgs,
+  });
 
   return NextResponse.json({ status: "accepted" }, { status: 202 });
 }

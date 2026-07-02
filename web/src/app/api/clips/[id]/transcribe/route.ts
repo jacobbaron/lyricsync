@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { triggerModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -53,37 +54,13 @@ export async function POST(
     .eq("id", clip.project_id)
     .in("status", ["uploading", "transcribed", "stories_ready", "done", "error"]);
 
-  // Invoke Modal asynchronously — fire and don't await the response body.
-  // Modal's endpoint returns {"status":"accepted"} immediately and does the
-  // work in a spawned background container.
   const modalUrl = process.env.MODAL_TRANSCRIBE_URL;
-  const modalSecret = process.env.MODAL_WEBHOOK_SECRET;
-
-  if (!modalUrl || !modalSecret) {
-    // Dev/test: env not configured, just leave status as transcribing.
-    console.warn("MODAL_TRANSCRIBE_URL or MODAL_WEBHOOK_SECRET not set — skipping Modal call");
+  if (!modalUrl) {
+    console.warn("MODAL_TRANSCRIBE_URL not set — skipping Modal call");
     return NextResponse.json({ status: "accepted", modal: false }, { status: 202 });
   }
 
-  try {
-    const res = await fetch(modalUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": modalSecret,
-      },
-      body: JSON.stringify({ clip_id: clipId }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(`Modal returned ${res.status}: ${text}`);
-      // Don't fail the request — clip is already marked transcribing,
-      // an operator can retry via the DB or a future retry button.
-    }
-  } catch (err) {
-    console.error("Failed to reach Modal:", err);
-  }
+  triggerModal("transcribe", modalUrl, { clip_id: clipId });
 
   return NextResponse.json({ status: "accepted" }, { status: 202 });
 }

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
 import { deleteObjects } from "@/lib/r2/client";
+import { triggerModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -89,21 +90,7 @@ export async function POST(
     .eq("id", story.project_id)
     .in("status", ["transcribed", "done", "error"]);
 
-  // Fire Modal render endpoint (fire-and-forget)
-  const renderUrl = process.env.MODAL_RENDER_URL;
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (renderUrl && webhookSecret) {
-    fetch(renderUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": webhookSecret,
-      },
-      body: JSON.stringify({ story_id: storyId }),
-    }).catch((err) => console.error("[render] Modal trigger failed:", err));
-  } else {
-    console.warn("[render] MODAL_RENDER_URL not set — render not triggered");
-  }
+  triggerModal("render", process.env.MODAL_RENDER_URL, { story_id: storyId });
 
   return NextResponse.json({ status: "accepted" });
 }

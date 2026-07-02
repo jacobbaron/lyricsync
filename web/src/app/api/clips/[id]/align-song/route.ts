@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { triggerModal } from "@/lib/modal/trigger";
 
 export const runtime = "nodejs";
 
@@ -86,20 +87,9 @@ export async function POST(
     );
   }
 
-  const modalUrl = process.env.MODAL_MUSIC_ALIGN_URL;
-  const modalSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (modalUrl && modalSecret) {
-    fetch(modalUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": modalSecret,
-      },
-      body: JSON.stringify({ alignment_id: alignment.id }),
-    }).catch((err) => console.error("[align-song] Modal trigger failed:", err));
-  } else {
-    console.warn("[align-song] MODAL_MUSIC_ALIGN_URL not set — not triggered");
-  }
+  triggerModal("align-song", process.env.MODAL_MUSIC_ALIGN_URL, {
+    alignment_id: alignment.id,
+  });
 
   return NextResponse.json(
     { alignmentId: alignment.id, status: "accepted" },
