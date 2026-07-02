@@ -102,7 +102,7 @@ export async function proxyModal(
     body: JSON.stringify(body),
   });
   const payload = await upstream.json().catch(() => ({
-    detail: `${fallbackErrorLabel} returned a non-JSON response`,
+    error: `${fallbackErrorLabel} returned a non-JSON response`,
   }));
   return { payload, status: upstream.status };
 }
