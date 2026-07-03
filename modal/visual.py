@@ -119,6 +119,10 @@ def build_prompt(
       "transcript"  — like audio_aware, but the aligned transcript is supplied as
                       ground-truth text (`transcript_text`) so the model can relate
                       what is shown to what is said without mis-hearing words.
+      "unified"     — superset: transcript strategy (audio+visual, expression/tone
+                      on highlights) plus editorial's suggested_clips. When
+                      `transcript_text` is None, degrades gracefully to audio_aware
+                      behaviour (still listens to audio, no ground-truth text).
 
     Gemini ingests the audio track of an uploaded video by default, so "default"
     only *asks* it to ignore speech; "audio_aware"/"transcript" lean into it.
@@ -142,9 +146,9 @@ def build_prompt(
             '{"summary": "1-3 sentence visual description of what is on screen"}\n'
         )
 
-    editorial = strategy == "editorial"
-    audio = strategy in ("audio_aware", "transcript")
-    with_transcript = strategy == "transcript"
+    editorial = strategy in ("editorial", "unified")
+    audio = strategy in ("audio_aware", "transcript", "unified")
+    with_transcript = strategy in ("transcript", "unified")
 
     # Intro framing differs by whether we want a pure-visual or audio+visual read.
     if audio:

@@ -6,9 +6,9 @@ export const runtime = "nodejs";
 // ── POST /api/clips/[id]/analyze ──────────────────────────────────────────
 // VIS-01 (dev): kicks off a Gemini visual-analysis run for a clip.
 //
-// Optional body: { "variant": "flash" | "flash_lowres" | "pro" | "editorial" }
-//   Defaults to "flash". Each call creates a new visual_analyses row, so the
-//   same clip can be analyzed under several variants and compared.
+// Optional body: { "variant": "flash" | "flash_lowres" | "editorial" | ... }
+//   Defaults to "v2" (unified). Each call creates a new visual_analyses row, so
+//   the same clip can be analyzed under several variants and compared.
 //
 // Returns the created analysis id; poll GET /api/clips/[id]/visual for results.
 //
@@ -26,6 +26,9 @@ const VARIANTS = [
   // PERCEPTION T3: with_transcript grounded on the clip's QC + camera-motion
   // signals (see modal/app.py VISUAL_VARIANTS).
   "grounded",
+  // Unified v2: superset (transcript + editorial suggested_clips). The new
+  // canonical variant; default when no variant param is provided.
+  "v2",
 ] as const;
 type Variant = (typeof VARIANTS)[number];
 
@@ -41,8 +44,8 @@ export async function POST(
   }
   const { supabase } = auth;
 
-  // Optional variant from body; default to "flash".
-  let variant: Variant = "flash";
+  // Optional variant from body; default to "v2" (unified).
+  let variant: Variant = "v2";
   try {
     const body = await request.json();
     if (body?.variant != null) {
