@@ -7,8 +7,6 @@ on:
       - "web/**"
   pull_request:
     branches: [main]
-    paths:
-      - "web/**"
 
 jobs:
   lint-and-build:
