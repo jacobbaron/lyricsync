@@ -1551,6 +1551,19 @@ VISUAL_VARIANTS: dict[str, dict] = {
         "needs_transcript": True,
         "use_signals": True,
     },
+    # Unified v2 — the superset variant that replaces all prior canonical passes.
+    # Combines with_transcript (audio+visual, expression/tone on highlights) and
+    # editorial (suggested_clips). Degrades gracefully when no aligned transcript
+    # exists (audio_aware behaviour). No deterministic-signal grounding.
+    # On completion, stores summary to clips.visual_description.
+    "v2": {
+        "model": "gemini-3.5-flash",
+        "strategy": "unified",
+        "media_resolution": "MEDIA_RESOLUTION_HIGH",
+        "fps": 3,
+        "needs_transcript": True,
+        "store_summary": True,
+    },
     # Disabled — gemini-2.5-pro / 3.x pro tiers are ~10x flash and gave only
     # marginally better selection in testing. Re-enable here if you want the
     # quality ceiling back.
@@ -1568,7 +1581,7 @@ DEFAULT_VISUAL_VARIANT = "flash"
 # clip after alignment (it needs the aligned transcript as ground truth);
 # _generate_worker prefers this variant's track when building the perception
 # document, falling back to the newest completed analysis of any variant.
-CANONICAL_VISUAL_VARIANT = "with_transcript"
+CANONICAL_VISUAL_VARIANT = "v2"
 
 
 def _set_analysis(sb, analysis_id: str, **fields) -> None:
