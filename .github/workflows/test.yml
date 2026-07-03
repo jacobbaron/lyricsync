@@ -9,10 +9,6 @@ on:
       - "pyproject.toml"
   pull_request:
     branches: [main]
-    paths:
-      - "modal/**"
-      - "tests/**"
-      - "pyproject.toml"
   workflow_dispatch:
 
 jobs:
