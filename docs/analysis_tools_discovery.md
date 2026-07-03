@@ -98,13 +98,13 @@ Not backfillable state — these run per request and cache by params:
 ### 3.1 Consolidate to ONE canonical LLM tool: `analyze`
 
 Merge everything the variants do into a single pass — essentially
-`grounded` + `editorial` + `store_summary`:
+`with_transcript` + `editorial` + `store_summary`:
 
 - **Model/config:** gemini flash, high media resolution, 3 fps (current
   canonical config).
 - **Inputs:** video + audio always; aligned transcript when available
-  (degrade gracefully to audio-only when not — covers pre-transcription runs);
-  T1/T2 signal grounding block when available.
+  (degrade gracefully to audio-only when not — covers pre-transcription runs).
+  No signal grounding (see `grounded` deprecation below).
 - **Output (superset schema):** `summary` (→ stored on
   `clips.visual_description`), `segments`, `highlights` (with
   `expression`/`tone`), and `suggested_clips`.
@@ -128,17 +128,13 @@ supersede.
 | `editorial` | **fold in** | `suggested_clips` becomes part of the unified output |
 | `audio_aware` | **fold in** | unified tool degrades to this when no transcript exists |
 | `context` | **fold in** | summary comes free from the unified run |
-| `with_transcript` + `grounded` | **become** the unified tool | |
+| `grounded` | **delete** | A/B'd on 4 clips (2026-07-02): mild segment-boundary gains, equivalent highlights, and the quality signal over-flags handheld footage ("shake" on 60–100% of clip duration) so grounding it adds noise. Decision: not worth the T1/T2-before-LLM ordering dependency. |
+| `with_transcript` | **becomes** the unified tool | |
 
 Migration: keep old rows readable (readers already fall back to "newest done
 analysis of any variant"); remove the variants from the API enum + OpenAPI;
 map old names to the unified tool for one deprecation window (202 + warning
 header) rather than 400ing existing scripts.
-
-Open A/B question to settle first: is `grounded` measurably better than
-`with_transcript`? (Only 1 grounded run exists.) If yes, grounding requires
-T1/T2 to run *before* the LLM pass — the backfill orchestrator (3.4) should
-sequence quality+motion → analyze.
 
 ### 3.3 Discoverability for agents
 
@@ -165,7 +161,7 @@ sequence quality+motion → analyze.
 1. **Run on ingest, not just align:** after upload, kick the deterministic
    signals (quality, motion, embed, detect — none need a transcript) and an
    audio-only unified analysis; after align, re-run the unified analysis with
-   transcript grounding (supersedes the audio-only one).
+   the transcript supplied (supersedes the audio-only one).
 2. **Sweeper (Modal cron, e.g. every 30 min):**
    - `analyzing`/`processing` rows older than a timeout (LLM: 30 min; signals:
      15 min) → mark `error` with `timeout` reason.
@@ -182,11 +178,10 @@ sequence quality+motion → analyze.
 
 ## 4. Suggested sequencing
 
-1. Settle grounded-vs-ungrounded A/B (needs a handful of T1/T2 backfills — cheap).
-2. Ship the unified `analyze` variant + fold-ins; flip API default; deprecate old variants.
-3. Sweeper + attempts counter (unsticks the 17 stuck rows immediately; drives backfill).
-4. Discoverability: coverage endpoint + inline results in clip/project GETs + OpenAPI backfill.
-5. Library-wide backfill via the sweeper; verify with the coverage endpoint.
+1. Ship the unified `analyze` variant + fold-ins; flip API default; deprecate old variants.
+2. Sweeper + attempts counter (unsticks the 17 stuck rows immediately; drives backfill).
+3. Discoverability: coverage endpoint + inline results in clip/project GETs + OpenAPI backfill.
+4. Library-wide backfill via the sweeper; verify with the coverage endpoint.
 
 ## 5. Open questions
 
