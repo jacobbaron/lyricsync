@@ -180,13 +180,15 @@ export const SignedUrlResponse = z
   })
   .openapi("SignedUrlResponse");
 
-// ── search (SEARCH S1 #83) ──────────────────────────────────────────────────
-// GET /api/search?q=&limit= — cross-project library keyword search. This
-// documents the S1 MVP shape currently on main (web/src/app/api/search/route.ts).
-// Sibling [SEARCH] tickets (S2 FTS #119, S3 semantic #120, S5 hybrid ranking
-// #122, S6 richer results #123, S7 filters/facets #124) will add params/fields
-// on top of this; covering those is explicit follow-up once those PRs land —
-// this backfill documents only what's live on main today (S9 #126).
+// ── search (SEARCH S1 #83, consolidated S2+S3+S6+S7) ────────────────────────
+// GET /api/search — cross-project library search. Documents the consolidated
+// shape from the search-consolidated-s2-s3-s6-s7 branch
+// (web/src/app/api/search/route.ts), which reconciles four tickets built in
+// parallel against the S1 MVP: the Postgres FTS index (S2 #119), library-wide
+// semantic search (S3 #120), result enrichment — duration/highlighted
+// snippets/thumbnails (S6 #123), and filters/facets (S7 #124). See
+// docs/cross_project_search.md for the full narrative. Hybrid ranking (S5
+// #122) fusing keyword + semantic scores is still a follow-up.
 export const SearchQuery = z
   .object({
     q: z.string().min(1).openapi({
@@ -203,11 +205,72 @@ export const SearchQuery = z
       .openapi({
         description: "Max hits to return (default 20, capped at 50).",
       }),
+    mode: z
+      .enum(["keyword", "semantic"])
+      .default("keyword")
+      .optional()
+      .openapi({
+        description:
+          "\"keyword\" (default) ranks via Postgres full-text search " +
+          "(search_library_fts, S2 #119). \"semantic\" (S3 #120) embeds `q` " +
+          "and cosine-searches clip_embeddings instead.",
+      }),
+    pooled: z
+      .enum(["0", "1"])
+      .default("0")
+      .optional()
+      .openapi({
+        description:
+          "Semantic mode only: \"1\" to also match whole-clip pooled vectors " +
+          "(default: frames only).",
+      }),
+    thumbnails: z
+      .enum(["0", "1"])
+      .default("0")
+      .optional()
+      .openapi({
+        description:
+          "\"1\" to include a signed `thumbnail_url` per result (S6 #123). " +
+          "Opt-in — costs one Modal frame-extraction call per result.",
+      }),
+    project: z
+      .array(z.string())
+      .optional()
+      .openapi({
+        description:
+          "Restrict to one/several projects (S7 #124); repeatable or " +
+          "comma-separated. Each token matches a project id or " +
+          "case-insensitive name. Omit for all of the caller's projects.",
+      }),
+    kind: z
+      .enum(["speech", "visual", "both"])
+      .default("both")
+      .optional()
+      .openapi({
+        description:
+          "\"speech\" restricts to transcript matches; \"visual\" restricts " +
+          "to visual_description/highlight (and, in semantic mode, embedding) " +
+          "matches (S7 #124).",
+      }),
+    min_duration: z.coerce.number().min(0).optional().openapi({
+      description: "Minimum clip length in seconds (S7 #124).",
+    }),
+    max_duration: z.coerce.number().min(0).optional().openapi({
+      description: "Maximum clip length in seconds (S7 #124).",
+    }),
+    since: z.string().optional().openapi({
+      description:
+        "ISO date/timestamp lower bound on clip recorded_at (falling back " +
+        "to created_at) (S7 #124).",
+    }),
+    until: z.string().optional().openapi({
+      description: "ISO date/timestamp upper bound, same field as `since` (S7 #124).",
+    }),
   })
   .openapi("SearchQuery");
 
 export const SearchHitKind = z
-  .enum(["transcript", "visual_description", "highlight"])
+  .enum(["transcript", "visual_description", "highlight", "embedding"])
   .openapi("SearchHitKind");
 
 export const SearchHit = z
@@ -220,6 +283,11 @@ export const SearchHit = z
     project: z.string().nullable().openapi({ description: "Owning project name." }),
     project_id: z.string().uuid(),
     filename: z.string().nullable(),
+    duration: z.number().nullable().openapi({
+      description:
+        "clips.duration_secs (S6 #123) — validate/clamp a proposed src_end " +
+        "without a follow-up lookup.",
+    }),
     kind: SearchHitKind,
     timestamp: z.number().nullable().openapi({
       description:
@@ -227,16 +295,48 @@ export const SearchHit = z
         "match, e.g. kind=visual_description). Use as `src_start` (pick a small " +
         "window around it for `src_end`).",
     }),
-    snippet: z.string(),
-    score: z.number(),
+    snippet: z.string().openapi({
+      description:
+        "Keyword mode: Postgres ts_headline output, matched terms already " +
+        "wrapped in **markers** (stemmed matches included). Semantic mode: a " +
+        "synthetic \"frame @ Xs (semantic match)\" / \"whole-clip semantic " +
+        "match\" placeholder (there's no textual match to highlight).",
+    }),
+    thumbnail_url: z.string().url().nullable().optional().openapi({
+      description:
+        "Signed frame URL at `timestamp` (S6 #123), only present when " +
+        "`?thumbnails=1` was requested. null on a per-thumbnail failure.",
+    }),
+    score: z.number().openapi({
+      description:
+        "Keyword mode: ts_rank_cd. Semantic mode: raw cosine similarity in " +
+        "[0, 1]. Not on the same scale across modes — not fused (S5 #122).",
+    }),
   })
   .openapi("SearchHit");
+
+export const SearchFacets = z
+  .object({
+    by_project: z.record(z.number().int()).openapi({
+      description: "Hit count per project name (or project_id if unnamed).",
+    }),
+    by_kind: z.record(z.number().int()).openapi({
+      description: "Hit count per SearchHitKind value.",
+    }),
+  })
+  .openapi("SearchFacets");
 
 export const SearchResponse = z
   .object({
     query: z.string(),
-    terms: z.array(z.string()),
+    terms: z.array(z.string()).openapi({
+      description: "Tokenized query terms (keyword mode only; always [] in semantic mode).",
+    }),
     count: z.number().int(),
     results: z.array(SearchHit),
+    facets: SearchFacets.openapi({
+      description:
+        "Counted over the full filtered candidate set, before slicing to `limit` (S7 #124).",
+    }),
   })
   .openapi("SearchResponse");

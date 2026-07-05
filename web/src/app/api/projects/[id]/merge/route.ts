@@ -1,6 +1,7 @@
 import { after, NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
 import { getObjectText, putObjectJson } from "@/lib/r2/client";
+import { windowTranscript } from "@/lib/search/transcriptWindows";
 
 export const runtime = "nodejs";
 
@@ -153,6 +154,51 @@ export async function POST(
     // Upload merged.json
     const mergedKey = `projects/${projectId}/merged.json`;
     await putObjectJson(mergedKey, { words: allWords });
+
+    // SEARCH S2 (#119): refresh the FTS transcript-window docs for every
+    // merged clip, so newly-built/rebuilt transcripts are searchable via
+    // /api/search without a manual reindex (clips.visual_description and
+    // visual_analyses highlights index themselves via generated tsvector
+    // columns — this is the one source that lives in R2, so it needs an
+    // explicit hook here). Best-effort per clip: one clip's failure doesn't
+    // block the merge or the other clips' refresh.
+    for (const { clip, words } of wordLists) {
+      try {
+        const windows = windowTranscript(
+          words.map((w) => ({ text: w.word, local_start: w.start })),
+        );
+        await supabase
+          .from("clip_search_docs")
+          .delete()
+          .eq("clip_id", clip.id)
+          .eq("kind", "transcript");
+        if (windows.length > 0) {
+          const { error: docsError } = await supabase
+            .from("clip_search_docs")
+            .insert(
+              windows.map((w) => ({
+                clip_id: clip.id,
+                project_id: projectId,
+                kind: "transcript",
+                window_idx: w.window_idx,
+                source_text: w.source_text,
+                timestamp: w.timestamp,
+              })),
+            );
+          if (docsError) {
+            console.error(
+              `[merge] search-doc insert failed for clip ${clip.id} (non-fatal):`,
+              docsError.message,
+            );
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[merge] search-doc refresh failed for clip ${clip.id} (non-fatal):`,
+          err,
+        );
+      }
+    }
 
     // Mark all transcribed clips as aligned and project as transcribed
     await supabase
