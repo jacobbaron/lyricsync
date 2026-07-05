@@ -14,8 +14,32 @@ export const runtime = "nodejs";
 // docs/cross_project_search.md.
 //
 // Query params:
-//   q      — the search text (required)
-//   limit  — max hits (default 20, capped at 50)
+//   q             — the search text (required)
+//   limit         — max hits (default 20, capped at 50)
+//   project       — restrict to one/several projects; repeatable
+//                   (?project=a&project=b) or comma-separated (?project=a,b).
+//                   Each token matches a project id (uuid) OR project name
+//                   (case-insensitive). Omit for all of the caller's projects.
+//                   Unresolvable tokens simply match nothing (no error).
+//   kind          — "speech" | "visual" | "both" (default "both").
+//                   "speech" restricts hits to transcript matches (response
+//                   kind: "transcript"); "visual" restricts to
+//                   visual_description/highlight matches (response kind:
+//                   "visual_description" | "highlight").
+//   min_duration  — minimum clip length in seconds (clips.duration_secs).
+//                   Clips with unknown duration are excluded when set.
+//   max_duration  — maximum clip length in seconds. Same null-handling.
+//   since / until — ISO date/timestamp bounds on clip recording/creation
+//                   time (clips.recorded_at, falling back to
+//                   clips.created_at when recorded_at is null). Clips with
+//                   neither are excluded when set.
+//
+// SEARCH S7 (#124): filters + facets on top of S1. Filters are applied as a
+// pass over the clip list (clipPassesFilters) and over per-clip candidate
+// generation (kind gating), both BEFORE scoring — so this composes with
+// whatever scoring backend S2 (FTS) / S3 (semantic) / S5 (hybrid) land with:
+// swap the scoring/candidate-generation in the middle, keep this filter pass
+// as-is, or lift clipPassesFilters into the new candidate source.
 //
 // Ranking is deliberately naive keyword matching (no index / embeddings yet);
 // the FTS index (S2), semantic search (S3), and hybrid ranking (S5) are the
@@ -26,6 +50,83 @@ interface ClipRow {
   project_id: string;
   filename: string | null;
   visual_description: string | null;
+  duration_secs: number | null;
+  recorded_at: string | null;
+  created_at: string | null;
+}
+
+type KindFilter = "speech" | "visual" | "both";
+
+interface ClipFilters {
+  projectIds: Set<string> | null; // null = no project filter (all projects)
+  minDuration: number | null;
+  maxDuration: number | null;
+  since: Date | null;
+  until: Date | null;
+}
+
+// Collect a query param that may be repeated (?k=a&k=b) and/or
+// comma-separated (?k=a,b) into a flat, trimmed, non-empty token list.
+function collectListParam(url: URL, name: string): string[] {
+  const out: string[] = [];
+  for (const raw of url.searchParams.getAll(name)) {
+    for (const part of raw.split(",")) {
+      const t = part.trim();
+      if (t) out.push(t);
+    }
+  }
+  return out;
+}
+
+type ParamResult<T> = { value: T } | { error: string };
+
+function parseKindFilter(raw: string | null): ParamResult<KindFilter> {
+  if (raw === null || raw.trim() === "") return { value: "both" };
+  const v = raw.trim().toLowerCase();
+  if (v === "speech" || v === "visual" || v === "both") return { value: v };
+  return { error: `kind must be one of "speech", "visual", "both" (got "${raw}")` };
+}
+
+function parseNonNegNumberParam(raw: string | null, name: string): ParamResult<number | null> {
+  if (raw === null || raw.trim() === "") return { value: null };
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    return { error: `${name} must be a non-negative number (got "${raw}")` };
+  }
+  return { value: n };
+}
+
+function parseDateParam(raw: string | null, name: string): ParamResult<Date | null> {
+  if (raw === null || raw.trim() === "") return { value: null };
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) {
+    return { error: `${name} must be a valid date/timestamp (got "${raw}")` };
+  }
+  return { value: d };
+}
+
+// The filter pass: clip-level facts only (project, duration, recorded/created
+// date). Applied to the fetched clip list BEFORE candidate generation/scoring
+// — independent of q/terms so it composes with any future scoring backend.
+function clipPassesFilters(clip: ClipRow, filters: ClipFilters): boolean {
+  if (filters.projectIds && !filters.projectIds.has(clip.project_id)) return false;
+
+  if (filters.minDuration !== null || filters.maxDuration !== null) {
+    if (clip.duration_secs == null) return false;
+    if (filters.minDuration !== null && clip.duration_secs < filters.minDuration) return false;
+    if (filters.maxDuration !== null && clip.duration_secs > filters.maxDuration) return false;
+  }
+
+  if (filters.since !== null || filters.until !== null) {
+    const dateStr = clip.recorded_at ?? clip.created_at;
+    if (!dateStr) return false;
+    const d = new Date(dateStr);
+    if (Number.isNaN(d.getTime())) return false;
+    if (filters.since !== null && d < filters.since) return false;
+    if (filters.until !== null && d > filters.until) return false;
+  }
+
+  return true;
 }
 
 interface MergedWord {
@@ -185,13 +286,53 @@ export async function GET(request: Request) {
   }
   const phrase = q.toLowerCase();
 
+  // ── Filter params (S7 #124) ────────────────────────────────────────────
+  const kindParsed = parseKindFilter(url.searchParams.get("kind"));
+  if ("error" in kindParsed) return NextResponse.json({ error: kindParsed.error }, { status: 400 });
+  const kindFilter = kindParsed.value;
+
+  const minDurationParsed = parseNonNegNumberParam(
+    url.searchParams.get("min_duration"),
+    "min_duration",
+  );
+  if ("error" in minDurationParsed) {
+    return NextResponse.json({ error: minDurationParsed.error }, { status: 400 });
+  }
+  const maxDurationParsed = parseNonNegNumberParam(
+    url.searchParams.get("max_duration"),
+    "max_duration",
+  );
+  if ("error" in maxDurationParsed) {
+    return NextResponse.json({ error: maxDurationParsed.error }, { status: 400 });
+  }
+  if (
+    minDurationParsed.value !== null &&
+    maxDurationParsed.value !== null &&
+    minDurationParsed.value > maxDurationParsed.value
+  ) {
+    return NextResponse.json(
+      { error: "min_duration must be <= max_duration" },
+      { status: 400 },
+    );
+  }
+
+  const sinceParsed = parseDateParam(url.searchParams.get("since"), "since");
+  if ("error" in sinceParsed) return NextResponse.json({ error: sinceParsed.error }, { status: 400 });
+  const untilParsed = parseDateParam(url.searchParams.get("until"), "until");
+  if ("error" in untilParsed) return NextResponse.json({ error: untilParsed.error }, { status: 400 });
+  if (sinceParsed.value !== null && untilParsed.value !== null && sinceParsed.value > untilParsed.value) {
+    return NextResponse.json({ error: "since must be <= until" }, { status: 400 });
+  }
+
+  const projectTokens = collectListParam(url, "project");
+
   // Clips + project names (RLS → only the caller's, across ALL projects).
   // Paginated so libraries larger than the PostgREST row cap aren't truncated.
   const [clipRes, projRes] = await Promise.all([
     fetchAllRows<ClipRow>((from, to) =>
       supabase
         .from("clips")
-        .select("id, project_id, filename, visual_description")
+        .select("id, project_id, filename, visual_description, duration_secs, recorded_at, created_at")
         .range(from, to),
     ),
     fetchAllRows<{ id: string; name: string }>((from, to) =>
@@ -201,13 +342,42 @@ export async function GET(request: Request) {
   if (clipRes.error) return NextResponse.json({ error: clipRes.error }, { status: 500 });
   if (projRes.error) return NextResponse.json({ error: projRes.error }, { status: 500 });
 
-  const clips = clipRes.rows;
   const projectName = new Map<string, string>(
     projRes.rows.map((p) => [p.id, p.name]),
   );
 
+  // Resolve `project` tokens (id or case-insensitive name) → project_ids.
+  // Unresolvable tokens just don't match anything (no error) — narrowing to
+  // zero results is a valid, if unhelpful, answer to a bad filter value.
+  let projectFilterIds: Set<string> | null = null;
+  if (projectTokens.length > 0) {
+    const idSet = new Set(projRes.rows.map((p) => p.id));
+    const nameToId = new Map(projRes.rows.map((p) => [p.name.toLowerCase(), p.id]));
+    const resolved = new Set<string>();
+    for (const tok of projectTokens) {
+      if (idSet.has(tok)) resolved.add(tok);
+      const byName = nameToId.get(tok.toLowerCase());
+      if (byName) resolved.add(byName);
+    }
+    projectFilterIds = resolved;
+  }
+
+  const clipFilters: ClipFilters = {
+    projectIds: projectFilterIds,
+    minDuration: minDurationParsed.value,
+    maxDuration: maxDurationParsed.value,
+    since: sinceParsed.value,
+    until: untilParsed.value,
+  };
+
+  // Filter pass over clips — BEFORE candidate generation/scoring (see file
+  // header). `kind` is gated later per-candidate since it's about which
+  // analysis source produced the hit, not a clip-level fact.
+  const clips = clipRes.rows.filter((c) => clipPassesFilters(c, clipFilters));
+
+  const emptyFacets = { by_project: {}, by_kind: {} };
   if (clips.length === 0) {
-    return NextResponse.json({ query: q, terms, count: 0, results: [] });
+    return NextResponse.json({ query: q, terms, count: 0, results: [], facets: emptyFacets });
   }
 
   // (project_id, filename) → clip_id, to attribute transcript words to a clip
@@ -262,32 +432,43 @@ export async function GET(request: Request) {
   );
 
   // Best-scoring candidate per clip → one hit per clip.
+  // `kind` filter gates which candidate kinds are even generated for a clip:
+  // "speech" → transcript only, "visual" → visual_description + highlight
+  // only, "both" (default) → all. This runs before scoring, same as the
+  // clip-level filter pass above.
+  const wantSpeech = kindFilter !== "visual";
+  const wantVisual = kindFilter !== "speech";
+
   const hits: SearchHit[] = [];
   for (const clip of clips) {
     const candidates: Candidate[] = [];
 
-    const tc = transcriptCandidate(wordsByClip.get(clip.id) ?? [], terms, phrase);
-    if (tc) candidates.push(tc);
-
-    if (clip.visual_description) {
-      candidates.push({
-        kind: "visual_description",
-        text: clip.visual_description,
-        timestamp: null,
-        snippet: clip.visual_description.trim(),
-      });
+    if (wantSpeech) {
+      const tc = transcriptCandidate(wordsByClip.get(clip.id) ?? [], terms, phrase);
+      if (tc) candidates.push(tc);
     }
 
-    for (const h of highlightsByClip.get(clip.id) ?? []) {
-      const desc = h.description;
-      if (!desc) continue;
-      const t = typeof h.time === "string" ? Number(h.time) : h.time;
-      candidates.push({
-        kind: "highlight",
-        text: desc,
-        timestamp: typeof t === "number" && Number.isFinite(t) ? t : null,
-        snippet: desc.trim(),
-      });
+    if (wantVisual) {
+      if (clip.visual_description) {
+        candidates.push({
+          kind: "visual_description",
+          text: clip.visual_description,
+          timestamp: null,
+          snippet: clip.visual_description.trim(),
+        });
+      }
+
+      for (const h of highlightsByClip.get(clip.id) ?? []) {
+        const desc = h.description;
+        if (!desc) continue;
+        const t = typeof h.time === "string" ? Number(h.time) : h.time;
+        candidates.push({
+          kind: "highlight",
+          text: desc,
+          timestamp: typeof t === "number" && Number.isFinite(t) ? t : null,
+          snippet: desc.trim(),
+        });
+      }
     }
 
     let best: { cand: Candidate; score: number } | null = null;
@@ -310,7 +491,24 @@ export async function GET(request: Request) {
   }
 
   hits.sort((a, b) => b.score - a.score);
+
+  // Facets: counted over the full filtered/scored candidate set (`hits`),
+  // BEFORE slicing to `limit` — no extra DB round-trips, just a tally over
+  // data already in memory. by_project is keyed by project name (falling
+  // back to project_id when a project has no name), matching the `project`
+  // field already on each hit; by_kind is keyed by the same `kind` vocabulary
+  // returned per-hit ("transcript" | "visual_description" | "highlight").
+  const facets = {
+    by_project: {} as Record<string, number>,
+    by_kind: {} as Record<string, number>,
+  };
+  for (const h of hits) {
+    const projectKey = h.project ?? h.project_id;
+    facets.by_project[projectKey] = (facets.by_project[projectKey] ?? 0) + 1;
+    facets.by_kind[h.kind] = (facets.by_kind[h.kind] ?? 0) + 1;
+  }
+
   const results = hits.slice(0, limit);
 
-  return NextResponse.json({ query: q, terms, count: results.length, results });
+  return NextResponse.json({ query: q, terms, count: results.length, results, facets });
 }
