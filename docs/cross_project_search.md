@@ -8,17 +8,20 @@ timeline reference any clip by `clip_id`; search is how you *get* those
 `clip_id`s.
 
 Tracked in the `[SEARCH]` epic (#128). This note describes **S1 (#83)** — the
-keyword-search MVP — and what the later tickets add.
+keyword-search MVP — plus **S6 (#123)**'s result enrichment, and what the
+remaining tickets add.
 
 ## Surface
 
-`GET /api/search?q=<text>&limit=20` — API-key callable (`Authorization: Bearer
-lsk_…`) or browser session. Not scoped to a project; it searches everything the
-caller owns (RLS-enforced).
+`GET /api/search?q=<text>&limit=20&thumbnails=1` — API-key callable
+(`Authorization: Bearer lsk_…`) or browser session. Not scoped to a project; it
+searches everything the caller owns (RLS-enforced).
 
 Query params:
 - `q` — the search text (required).
 - `limit` — max hits (default 20, capped 50).
+- `thumbnails` — `1` to include a signed `thumbnail_url` per result (S6,
+  opt-in — see below).
 
 Response:
 
@@ -33,9 +36,11 @@ Response:
       "project": "Studio day 2",
       "project_id": "1a2b…-uuid",
       "filename": "IMG_2427.mov",
+      "duration": 42.3,
       "kind": "highlight",
       "timestamp": 195.0,
-      "snippet": "soft affectionate laugh as he's called perfect",
+      "snippet": "soft affectionate **laugh** as he's called perfect",
+      "thumbnail_url": "https://...signed...",
       "score": 21
     }
   ]
@@ -45,6 +50,30 @@ Response:
 Each hit is **one clip** (its best-matching moment). `clip_id` + `timestamp`
 (clip-local seconds) drop straight into a cross-project timeline item
 (`clip_id`, `src_start`/`src_end`) or an overlay `in`/`out` — no extra lookup.
+`duration` (`clips.duration_secs`) is included so a caller can validate/clamp a
+proposed `src_end` without a follow-up lookup.
+
+## Result enrichment (S6 — #123)
+
+- **Highlighted snippets**: matched query terms are wrapped inline in
+  `**term**` (case-insensitive, word-boundary aware — `cat` won't match inside
+  `category`). This is a dependency-free stand-in for Postgres `ts_headline`;
+  swap it for real `ts_headline` once **S2 (#119)**'s FTS index merges (as of
+  this writing it hadn't, so `route.ts` still does its own tokenizing/scoring
+  rather than querying an index).
+- **`duration`**: `clips.duration_secs`, added to every hit.
+- **`thumbnail_url`** (optional, gated behind `?thumbnails=1`): a signed frame
+  URL at the hit's `timestamp`, produced by calling the `/api/clips/{id}/frames`
+  perception tool **in-process** (same `callPerception`/`clip_inspections`
+  cache helpers that route uses — no extra HTTP hop) rather than doing an HTTP
+  round-trip to our own API. For `timestamp: null` hits (whole-clip
+  `visual_description` matches) it uses a representative frame at `t=0` instead
+  of omitting the thumbnail. It's opt-in and only computed for the page of
+  results actually returned (post `limit`) because each thumbnail is a Modal
+  frame-extraction call — cached, but a cache miss is a real ffmpeg run, so
+  requesting it for every hit by default would meaningfully slow the endpoint.
+  A per-thumbnail failure is swallowed (`thumbnail_url: null`) rather than
+  failing the whole search.
 
 ## What's indexed (MVP)
 
@@ -90,11 +119,15 @@ transcripts (more occurrences) and does no stemming or synonymy — see Deferred
   the intra-project `search_clip_embeddings` RPC / `docs/embeddings_search.md`) —
   **S3 (#120)**, with embedding coverage/backfill in **S4 (#121)**.
 - **Hybrid ranking** fusing keyword + semantic — **S5 (#122)**.
-- **Richer results** (`ts_headline` snippets, thumbnail URLs) — **S6 (#123)**;
-  **filters/facets** (project, kind, duration, date) — **S7 (#124)**.
+- **Filters/facets** (project, kind, duration, date) — **S7 (#124)**.
 - **Editor search UI** — **S8 (#125)**; **OpenAPI + agent tool** — **S9 (#126)**;
   **eval harness** — **S10 (#127)**.
 
+Result enrichment (`duration`, highlighted snippets, `thumbnail_url`) shipped in
+**S6 (#123)** — see "Result enrichment" above; it's the marker-based
+highlighting stand-in until S2's FTS index lands, at which point swap in real
+`ts_headline`.
+
 The MVP endpoint's response shape is forward-compatible: the later tickets add
-fields (thumbnail, per-source `sources[]`, facet counts) and ranking channels
-without changing `{clip_id, project, timestamp, snippet}`.
+fields (per-source `sources[]`, facet counts) and ranking channels without
+changing `{clip_id, project, timestamp, snippet}`.

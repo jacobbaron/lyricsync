@@ -1,6 +1,13 @@
 import { NextResponse } from "next/server";
 import { resolveAuth } from "@/lib/auth/resolve";
-import { getObjectText } from "@/lib/r2/client";
+import { getObjectText, presignDownload } from "@/lib/r2/client";
+import {
+  cacheKey,
+  callPerception,
+  readCache,
+  writeCache,
+} from "@/lib/perception/modal";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
@@ -13,9 +20,29 @@ export const runtime = "nodejs";
 // cross-project cut (clip_id + clip-local timestamp). See
 // docs/cross_project_search.md.
 //
+// SEARCH S6 (#123): result enrichment on top of the S1 shape — every hit is
+// additionally self-describing and cut-ready:
+//   - `duration` (clips.duration_secs) so a caller can validate/clip src_end
+//     without a follow-up lookup.
+//   - `snippet` now highlights the matched query terms inline by wrapping them
+//     in `**term**` (markdown-bold-style markers, case-insensitive, word-
+//     boundary aware). This is an in-process stand-in for `ts_headline` — S2
+//     (#119)'s FTS index hadn't merged at S6-authoring time; swap to real
+//     `ts_headline` once it lands (tracked in docs/cross_project_search.md).
+//   - `thumbnail_url` (optional): a signed frame URL at the hit's timestamp,
+//     via the existing /api/clips/{id}/frames perception tool called
+//     in-process (shares its Modal call + clip_inspections cache — no extra
+//     HTTP hop). Gated behind `?thumbnails=1` because it's an extra Modal
+//     round-trip per result; omitted by default to keep the endpoint cheap.
+//     For `timestamp: null` hits (whole-clip visual_description matches) it
+//     uses a representative frame at t=0 rather than omitting the thumbnail.
+//
 // Query params:
-//   q      — the search text (required)
-//   limit  — max hits (default 20, capped at 50)
+//   q          — the search text (required)
+//   limit      — max hits (default 20, capped at 50)
+//   thumbnails — "1" to include a signed thumbnail_url per result (opt-in;
+//                costs one Modal frame-extraction call per result, subject to
+//                the same clip_inspections cache as /api/clips/{id}/frames)
 //
 // Ranking is deliberately naive keyword matching (no index / embeddings yet);
 // the FTS index (S2), semantic search (S3), and hybrid ranking (S5) are the
@@ -26,6 +53,7 @@ interface ClipRow {
   project_id: string;
   filename: string | null;
   visual_description: string | null;
+  duration_secs: number | null;
 }
 
 interface MergedWord {
@@ -77,9 +105,11 @@ interface SearchHit {
   project: string | null;
   project_id: string;
   filename: string | null;
+  duration: number | null;
   kind: HitKind;
   timestamp: number | null;
   snippet: string;
+  thumbnail_url?: string | null;
   score: number;
 }
 
@@ -118,6 +148,67 @@ function scoreText(text: string, terms: string[], phrase: string): number {
   let score = matchedTerms * 10 + occurrences;
   if (phrase.includes(" ") && text.toLowerCase().includes(phrase)) score += 50;
   return score;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Wrap query-term matches in a snippet with `**markers**` — a dependency-free
+// stand-in for Postgres `ts_headline` (S2 (#119), not yet merged at S6-authoring
+// time). Case-insensitive; boundary-aware via lookaround (rather than \b) so
+// terms containing `'` — normalizeToken() keeps inner apostrophes — get correct
+// boundaries, and so "cat" doesn't match inside "category". Longest-term-first
+// alternation avoids a short term's match "eating" a longer one's boundary.
+function highlightSnippet(snippet: string, terms: string[]): string {
+  if (!snippet || terms.length === 0) return snippet;
+  const sorted = Array.from(new Set(terms))
+    .filter((t) => t.length > 0)
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp);
+  if (sorted.length === 0) return snippet;
+  const re = new RegExp(`(?<![a-zA-Z0-9'])(${sorted.join("|")})(?![a-zA-Z0-9'])`, "gi");
+  return snippet.replace(re, "**$1**");
+}
+
+const THUMBNAIL_TTL = 3600;
+
+// Signed thumbnail URL for a hit, reusing the /api/clips/{id}/frames perception
+// tool IN-PROCESS (same callPerception/cache helpers that route uses) rather
+// than an HTTP round-trip to our own API. `timestamp: null` hits (whole-clip
+// visual_description matches) get a representative frame at t=0 instead of no
+// thumbnail. Best-effort: a Modal/ffmpeg failure here must not fail the search.
+async function getThumbnailUrl(
+  supabase: SupabaseClient,
+  clipId: string,
+  timestamp: number | null,
+): Promise<string | null> {
+  const t = Math.max(0, timestamp ?? 0);
+  const params = { t, n: 1, interval: 1 };
+  const key = cacheKey(clipId, "frames", params);
+
+  try {
+    const cached = await readCache(supabase, key);
+    if (cached?.frames) {
+      const items = cached.frames as { t: number; key: string }[];
+      const first = items[0];
+      return first ? await presignDownload(first.key, THUMBNAIL_TTL) : null;
+    }
+
+    const modalResult = await callPerception<{ frames: { t: number; key: string }[] }>(
+      "frames",
+      { clip_id: clipId, t, n: 1, interval: 1 },
+    );
+    await writeCache(supabase, clipId, "frames", key, params, {
+      frames: modalResult.frames,
+    });
+    const first = modalResult.frames[0];
+    return first ? await presignDownload(first.key, THUMBNAIL_TTL) : null;
+  } catch {
+    // Best-effort only — a Modal/ffmpeg failure on a thumbnail must not fail
+    // the whole search response (PerceptionError or otherwise).
+    return null;
+  }
 }
 
 // Best transcript window for a clip: score every word, then center a ±5-word
@@ -179,6 +270,7 @@ export async function GET(request: Request) {
     Math.max(parseInt(url.searchParams.get("limit") ?? "20", 10) || 20, 1),
     50,
   );
+  const wantThumbnails = url.searchParams.get("thumbnails") === "1";
   const terms = Array.from(new Set(tokenize(q)));
   if (terms.length === 0) {
     return NextResponse.json({ error: "q has no searchable terms" }, { status: 400 });
@@ -191,7 +283,7 @@ export async function GET(request: Request) {
     fetchAllRows<ClipRow>((from, to) =>
       supabase
         .from("clips")
-        .select("id, project_id, filename, visual_description")
+        .select("id, project_id, filename, visual_description, duration_secs")
         .range(from, to),
     ),
     fetchAllRows<{ id: string; name: string }>((from, to) =>
@@ -302,15 +394,31 @@ export async function GET(request: Request) {
       project: projectName.get(clip.project_id) ?? null,
       project_id: clip.project_id,
       filename: clip.filename,
+      duration:
+        typeof clip.duration_secs === "number" && Number.isFinite(clip.duration_secs)
+          ? clip.duration_secs
+          : null,
       kind: best.cand.kind,
       timestamp: best.cand.timestamp,
-      snippet: best.cand.snippet,
+      snippet: highlightSnippet(best.cand.snippet, terms),
       score: best.score,
     });
   }
 
   hits.sort((a, b) => b.score - a.score);
   const results = hits.slice(0, limit);
+
+  // Thumbnails are opt-in (`?thumbnails=1`): each one is an extra Modal frame-
+  // extraction call (cached, but a cache miss is a real ffmpeg round-trip), so
+  // we only ever pay that cost for the page of results actually returned, and
+  // only when the caller asked for it.
+  if (wantThumbnails) {
+    await Promise.all(
+      results.map(async (hit) => {
+        hit.thumbnail_url = await getThumbnailUrl(supabase, hit.clip_id, hit.timestamp);
+      }),
+    );
+  }
 
   return NextResponse.json({ query: q, terms, count: results.length, results });
 }
