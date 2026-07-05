@@ -200,7 +200,11 @@ unchanged from S7's original design, just re-pointed at RPC rows carrying a
 
 `facets` (`by_project`, `by_kind`) are tallied over the full filtered
 candidate set for the request's mode, **before** slicing to `limit` — no
-extra DB round-trips, just a tally over data already fetched.
+extra DB round-trips, just a tally over data already fetched. Note: keyword
+mode facets count **clips** (one row per clip, post-dedup) while semantic mode
+facets count **hits** (a clip can contribute multiple embedding rows, one per
+matched frame) — by design, per "Semantic mode" above — so facet totals aren't
+directly comparable across modes.
 
 ## Backfill status (transcript FTS docs)
 

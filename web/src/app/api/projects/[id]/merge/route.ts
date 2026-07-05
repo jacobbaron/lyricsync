@@ -167,11 +167,18 @@ export async function POST(
         const windows = windowTranscript(
           words.map((w) => ({ text: w.word, local_start: w.start })),
         );
-        await supabase
+        const { error: delError } = await supabase
           .from("clip_search_docs")
           .delete()
           .eq("clip_id", clip.id)
           .eq("kind", "transcript");
+        if (delError) {
+          console.error(
+            `[merge] search-doc delete failed for clip ${clip.id} (non-fatal):`,
+            delError.message,
+          );
+          continue;
+        }
         if (windows.length > 0) {
           const { error: docsError } = await supabase
             .from("clip_search_docs")
