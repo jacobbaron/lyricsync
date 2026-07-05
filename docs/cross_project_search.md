@@ -8,16 +8,19 @@ timeline reference any clip by `clip_id`; search is how you *get* those
 `clip_id`s.
 
 Tracked in the `[SEARCH]` epic (#128). This note describes **S1 (#83)** — the
-keyword-search MVP — and what the later tickets add.
+keyword-search MVP — and **S3 (#120)** — library-wide semantic (vector)
+search — and what the later tickets add.
 
 ## Surface
 
-`GET /api/search?q=<text>&limit=20` — API-key callable (`Authorization: Bearer
-lsk_…`) or browser session. Not scoped to a project; it searches everything the
-caller owns (RLS-enforced).
+`GET /api/search?q=<text>&limit=20&mode=keyword|semantic` — API-key callable
+(`Authorization: Bearer lsk_…`) or browser session. Not scoped to a project; it
+searches everything the caller owns (RLS-enforced).
 
 Query params:
 - `q` — the search text (required).
+- `mode` — `keyword` (default, described below) or `semantic` (S3, #120 — see
+  below).
 - `limit` — max hits (default 20, capped 50).
 
 Response:
@@ -82,13 +85,42 @@ This is intentionally simple: correct, dependency-free, and good enough to
 verify the cross-project discovery loop end-to-end. It biases toward long
 transcripts (more occurrences) and does no stemming or synonymy — see Deferred.
 
+## Semantic mode (S3, #120)
+
+`?mode=semantic` matches by **meaning** instead of keyword overlap: it embeds
+`q` via the same Modal `embed_text` endpoint / CLIP model the intra-project
+`GET /api/projects/[id]/search` route uses (`docs/embeddings_search.md`), then
+cosine-searches `clip_embeddings` through `search_clip_embeddings_global` — the
+cross-project generalization of `search_clip_embeddings` (same query shape,
+just without the `project_id` filter; scoped instead by the caller's RLS via
+`SECURITY INVOKER`, mirroring how this route's keyword mode scopes `clips` /
+`projects`).
+
+Extra query params in this mode:
+- `pooled` — `1` to also match whole-clip pooled vectors (default: frames
+  only) — same knob as the intra-project route.
+
+Hits are mapped into the same `{clip_id, project, project_id, filename, kind,
+timestamp, snippet, score}` shape as keyword mode: `kind: "embedding"`,
+`timestamp` is the matched frame's `t` (`null` for a pooled hit), and `score`
+is raw cosine similarity in `[0, 1]` — **not** on the same scale as the
+keyword-mode score; the two modes aren't fused yet (that's hybrid ranking,
+S5 #122). Unlike keyword mode, semantic mode does not collapse to one hit per
+clip — multiple frames of the same clip can each appear, same as the
+intra-project route.
+
+**Known limitation:** recall depends entirely on embedding coverage. Most
+clips in the library are not yet embedded — auto-embed/backfill is **S4
+(#121)**, not done — so semantic mode currently only surfaces clips that have
+already been run through `POST /api/clips/{id}/embed`. This is expected, not a
+bug.
+
 ## Deferred (later `[SEARCH]` tickets)
 
 - **Postgres full-text index** (tsvector/GIN + `ts_rank`) over the same text, so
   ranking is principled and scans don't grow with the library — **S2 (#119)**.
-- **Semantic / vector search** over CLIP embeddings, library-wide (generalize
-  the intra-project `search_clip_embeddings` RPC / `docs/embeddings_search.md`) —
-  **S3 (#120)**, with embedding coverage/backfill in **S4 (#121)**.
+- **Embedding coverage/backfill** so semantic mode has near-complete recall —
+  **S4 (#121)**.
 - **Hybrid ranking** fusing keyword + semantic — **S5 (#122)**.
 - **Richer results** (`ts_headline` snippets, thumbnail URLs) — **S6 (#123)**;
   **filters/facets** (project, kind, duration, date) — **S7 (#124)**.

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { resolveAuth } from "@/lib/auth/resolve";
 import { getObjectText } from "@/lib/r2/client";
 
@@ -13,13 +14,26 @@ export const runtime = "nodejs";
 // cross-project cut (clip_id + clip-local timestamp). See
 // docs/cross_project_search.md.
 //
+// SEARCH S3 (#120): `mode=semantic` reuses this same surface for library-wide
+// *vector* search over CLIP embeddings (PERCEPTION T4, #87 — same table/model
+// as the intra-project GET /api/projects/[id]/search, see
+// docs/embeddings_search.md), generalized to drop the single-project scope
+// via the search_clip_embeddings_global RPC (RLS/SECURITY INVOKER-scoped, so
+// results never cross owners). Coverage is currently whatever clips already
+// have embeddings — most of the library is unembedded until S4 (#121,
+// auto-embed/backfill) ships, so don't expect exhaustive recall yet.
+//
 // Query params:
 //   q      — the search text (required)
 //   limit  — max hits (default 20, capped at 50)
+//   mode   — "keyword" (default) or "semantic". Semantic mode additionally
+//            accepts:
+//     pooled — "1" to also match whole-clip pooled vectors (default: frames
+//              only) — mirrors the intra-project route's `pooled` param.
 //
-// Ranking is deliberately naive keyword matching (no index / embeddings yet);
-// the FTS index (S2), semantic search (S3), and hybrid ranking (S5) are the
-// follow-ups. API-key callable (Authorization: Bearer lsk_...).
+// Ranking is deliberately naive keyword matching in the default mode (no FTS
+// index yet — S2, #119); hybrid fusion of keyword + semantic is S5 (#122).
+// API-key callable (Authorization: Bearer lsk_...).
 
 interface ClipRow {
   id: string;
@@ -63,7 +77,7 @@ async function fetchAllRows<T>(
   return { rows, error: null };
 }
 
-type HitKind = "transcript" | "visual_description" | "highlight";
+type HitKind = "transcript" | "visual_description" | "highlight" | "embedding";
 
 interface Candidate {
   kind: HitKind;
@@ -160,6 +174,136 @@ function transcriptCandidate(
   };
 }
 
+interface EmbeddingHitRow {
+  clip_id: string;
+  project_id: string;
+  t: number | null;
+  score: number;
+}
+
+// mode=semantic: library-wide vector search over clip_embeddings (SEARCH S3,
+// #120). Embeds `q` via the same Modal embed_text endpoint the intra-project
+// GET /api/projects/[id]/search route uses, then cosine-searches through the
+// search_clip_embeddings_global RPC — the cross-project generalization of
+// search_clip_embeddings (PERCEPTION T4, #87), scoped by the caller's RLS
+// (SECURITY INVOKER) rather than a project id. Results are mapped into this
+// route's usual { clip_id, project, project_id, filename, kind, timestamp,
+// snippet, score } shape so callers don't need mode-specific parsing.
+async function semanticSearch(
+  supabase: SupabaseClient,
+  q: string,
+  limit: number,
+  framesOnly: boolean,
+): Promise<NextResponse> {
+  const embedTextUrl =
+    process.env.MODAL_EMBED_TEXT_URL ??
+    "https://jacobbaron--lyricsync-embed-text.modal.run";
+  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    return NextResponse.json(
+      { error: "MODAL_WEBHOOK_SECRET not configured" },
+      { status: 503 },
+    );
+  }
+
+  let embedding: number[];
+  try {
+    const res = await fetch(embedTextUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-webhook-secret": webhookSecret,
+      },
+      body: JSON.stringify({ text: q }),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      console.error(`[search] embed_text returned ${res.status}: ${detail}`);
+      return NextResponse.json(
+        { error: `Query embedding failed (${res.status})` },
+        { status: 502 },
+      );
+    }
+    const payload = (await res.json()) as { embedding?: number[] };
+    if (!Array.isArray(payload.embedding)) {
+      return NextResponse.json(
+        { error: "Query embedding service returned no vector" },
+        { status: 502 },
+      );
+    }
+    embedding = payload.embedding;
+  } catch (err) {
+    console.error("[search] query embedding request failed:", err);
+    return NextResponse.json(
+      { error: "Query embedding request failed" },
+      { status: 502 },
+    );
+  }
+
+  // pgvector text literal for the RPC's ::vector cast (same convention as the
+  // intra-project route).
+  const queryLiteral = `[${embedding.join(",")}]`;
+
+  const { data: rpcResults, error } = await supabase.rpc(
+    "search_clip_embeddings_global",
+    {
+      p_query: queryLiteral,
+      p_match_count: limit,
+      p_frames_only: framesOnly,
+    },
+  );
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  const rows = (rpcResults ?? []) as EmbeddingHitRow[];
+  if (rows.length === 0) {
+    return NextResponse.json({ query: q, terms: [], count: 0, results: [] });
+  }
+
+  // The RPC only returns ids — look up filenames/project names for the
+  // shared response shape (mirrors how the keyword path attaches names).
+  const clipIds = Array.from(new Set(rows.map((r) => r.clip_id)));
+  const projectIds = Array.from(new Set(rows.map((r) => r.project_id)));
+
+  const [clipRes, projRes] = await Promise.all([
+    supabase.from("clips").select("id, filename").in("id", clipIds),
+    supabase.from("projects").select("id, name").in("id", projectIds),
+  ]);
+  if (clipRes.error) {
+    return NextResponse.json({ error: clipRes.error.message }, { status: 500 });
+  }
+  if (projRes.error) {
+    return NextResponse.json({ error: projRes.error.message }, { status: 500 });
+  }
+
+  const filenameByClip = new Map<string, string | null>(
+    (clipRes.data ?? []).map((c: { id: string; filename: string | null }) => [
+      c.id,
+      c.filename,
+    ]),
+  );
+  const projectNameById = new Map<string, string>(
+    (projRes.data ?? []).map((p: { id: string; name: string }) => [p.id, p.name]),
+  );
+
+  const results: SearchHit[] = rows.map((r) => ({
+    clip_id: r.clip_id,
+    project: projectNameById.get(r.project_id) ?? null,
+    project_id: r.project_id,
+    filename: filenameByClip.get(r.clip_id) ?? null,
+    kind: "embedding",
+    timestamp: r.t,
+    snippet:
+      r.t != null
+        ? `frame @ ${r.t.toFixed(1)}s (semantic match)`
+        : "whole-clip semantic match",
+    score: r.score,
+  }));
+
+  return NextResponse.json({ query: q, terms: [], count: results.length, results });
+}
+
 export async function GET(request: Request) {
   const auth = await resolveAuth(request);
   if (!auth) {
@@ -179,6 +323,13 @@ export async function GET(request: Request) {
     Math.max(parseInt(url.searchParams.get("limit") ?? "20", 10) || 20, 1),
     50,
   );
+
+  const mode = (url.searchParams.get("mode") ?? "keyword").toLowerCase();
+  if (mode === "semantic") {
+    const framesOnly = url.searchParams.get("pooled") !== "1";
+    return semanticSearch(supabase, q, limit, framesOnly);
+  }
+
   const terms = Array.from(new Set(tokenize(q)));
   if (terms.length === 0) {
     return NextResponse.json({ error: "q has no searchable terms" }, { status: 400 });
