@@ -1483,74 +1483,16 @@ analyze_image = (
 #                      catch fleeting expressions. None leaves the default.
 #   needs_transcript — download the clip's aligned transcript and feed it to the
 #                      prompt as ground-truth speech.
+#
+# A2 (#110): the A/B-era variants (context, flash, flash_lowres, editorial,
+# audio_aware, with_transcript, grounded, pro) were retired once the unified
+# `v2` tool shipped in A1 (#109) — `v2` folds in editorial's suggested_clips,
+# audio_aware's audio+visual read, and context's stored summary, and degrades
+# gracefully to audio-only when no transcript exists. Only `v2` remains here.
+# Historical rows under the old variant names stay readable (the API maps those
+# names to `v2` for a deprecation window; the fallback below re-runs them as v2
+# if ever re-processed).
 VISUAL_VARIANTS: dict[str, dict] = {
-    # Cheapest pass: a coarse 1-3 sentence visual note (summary only, low media
-    # resolution) to store on the clip as transcript-side context. store_summary
-    # writes result.summary into clips.visual_description.
-    "context": {
-        "model": "gemini-3.5-flash",
-        "strategy": "context",
-        "media_resolution": "MEDIA_RESOLUTION_LOW",
-        "fps": None,
-        "needs_transcript": False,
-        "store_summary": True,
-    },
-    # The chosen default: cheap, fast, descriptions + highlight beats.
-    "flash": {
-        "model": "gemini-3.5-flash",
-        "strategy": "default",
-        "media_resolution": None,
-        "fps": None,
-        "needs_transcript": False,
-    },
-    # Same model/prompt at low media resolution — cheaper in tokens; use to
-    # judge how much visual detail we actually lose.
-    "flash_lowres": {
-        "model": "gemini-3.5-flash",
-        "strategy": "default",
-        "media_resolution": "MEDIA_RESOLUTION_LOW",
-        "fps": None,
-        "needs_transcript": False,
-    },
-    # Editorial prompt — also returns ready-to-render suggested_clips.
-    "editorial": {
-        "model": "gemini-3.5-flash",
-        "strategy": "editorial",
-        "media_resolution": None,
-        "fps": None,
-        "needs_transcript": False,
-    },
-    # Audio + visual: lean into Gemini hearing the audio. High media resolution
-    # and denser frame sampling for detailed facial-expression + vocal-tone reads.
-    "audio_aware": {
-        "model": "gemini-3.5-flash",
-        "strategy": "audio_aware",
-        "media_resolution": "MEDIA_RESOLUTION_HIGH",
-        "fps": 3,
-        "needs_transcript": False,
-    },
-    # Like audio_aware, but the aligned transcript is supplied as ground-truth
-    # text so the model relates visuals to speech without mis-hearing words.
-    "with_transcript": {
-        "model": "gemini-3.5-flash",
-        "strategy": "transcript",
-        "media_resolution": "MEDIA_RESOLUTION_HIGH",
-        "fps": 3,
-        "needs_transcript": True,
-    },
-    # PERCEPTION T3: same as with_transcript, but also grounded on the cheap
-    # deterministic signals (T1 quality + T2 camera_motion) — the prompt gets a
-    # ground-truth block of when the camera moves / where the cuts are / which
-    # spans are unusable. Run alongside with_transcript to A/B grounded vs
-    # ungrounded before making grounding the default.
-    "grounded": {
-        "model": "gemini-3.5-flash",
-        "strategy": "transcript",
-        "media_resolution": "MEDIA_RESOLUTION_HIGH",
-        "fps": 3,
-        "needs_transcript": True,
-        "use_signals": True,
-    },
     # Unified v2 — the superset variant that replaces all prior canonical passes.
     # Combines with_transcript (audio+visual, expression/tone on highlights) and
     # editorial (suggested_clips). Degrades gracefully when no aligned transcript
@@ -1564,18 +1506,8 @@ VISUAL_VARIANTS: dict[str, dict] = {
         "needs_transcript": True,
         "store_summary": True,
     },
-    # Disabled — gemini-2.5-pro / 3.x pro tiers are ~10x flash and gave only
-    # marginally better selection in testing. Re-enable here if you want the
-    # quality ceiling back.
-    # "pro": {
-    #     "model": "gemini-3.1-pro-preview",
-    #     "strategy": "default",
-    #     "media_resolution": None,
-    #     "fps": None,
-    #     "needs_transcript": False,
-    # },
 }
-DEFAULT_VISUAL_VARIANT = "flash"
+DEFAULT_VISUAL_VARIANT = "v2"
 
 # The variant that feeds story generation (roadmap 1.1). Auto-run for every
 # clip after alignment (it needs the aligned transcript as ground truth);

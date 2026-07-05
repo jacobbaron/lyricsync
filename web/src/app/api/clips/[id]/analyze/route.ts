@@ -4,33 +4,35 @@ import { resolveAuth } from "@/lib/auth/resolve";
 export const runtime = "nodejs";
 
 // ── POST /api/clips/[id]/analyze ──────────────────────────────────────────
-// VIS-01 (dev): kicks off a Gemini visual-analysis run for a clip.
+// Kicks off the canonical Gemini visual-analysis run for a clip.
 //
-// Optional body: { "variant": "flash" | "flash_lowres" | "editorial" | ... }
-//   Defaults to "v2" (unified). Each call creates a new visual_analyses row, so
-//   the same clip can be analyzed under several variants and compared.
+// Optional body: { "variant": "v2" }
+//   Defaults to "v2" (the unified analysis) — the only supported variant. The
+//   A/B-era variant names still map to "v2" for a deprecation window (see
+//   DEPRECATED_VARIANTS) so existing scripts keep working; the response then
+//   carries a `Warning` header. Each call creates a new visual_analyses row.
 //
 // Returns the created analysis id; poll GET /api/clips/[id]/visual for results.
 //
 // API-key callable (Authorization: Bearer lsk_...) like the render endpoints,
 // so the whole upload → analyze → inspect → crop → render loop is scriptable.
 
-// Keep in sync with VISUAL_VARIANTS in modal/app.py. "pro" is disabled there.
-const VARIANTS = [
+// The one supported variant. Keep in sync with VISUAL_VARIANTS in modal/app.py.
+const CANONICAL_VARIANT = "v2";
+
+// A2 (#110): retired A/B-era variants. Still accepted so existing scripts don't
+// 400, but they're transparently mapped to the unified CANONICAL_VARIANT and the
+// response gets a deprecation `Warning` header. Remove after the migration window.
+const DEPRECATED_VARIANTS = new Set([
   "context",
   "flash",
   "flash_lowres",
+  "pro",
   "editorial",
   "audio_aware",
   "with_transcript",
-  // PERCEPTION T3: with_transcript grounded on the clip's QC + camera-motion
-  // signals (see modal/app.py VISUAL_VARIANTS).
   "grounded",
-  // Unified v2: superset (transcript + editorial suggested_clips). The new
-  // canonical variant; default when no variant param is provided.
-  "v2",
-] as const;
-type Variant = (typeof VARIANTS)[number];
+]);
 
 export async function POST(
   request: Request,
@@ -44,18 +46,25 @@ export async function POST(
   }
   const { supabase } = auth;
 
-  // Optional variant from body; default to "v2" (unified).
-  let variant: Variant = "v2";
+  // Optional variant from body; default to the canonical unified analysis.
+  // Deprecated A/B-era names are accepted but mapped to the canonical variant
+  // (and flagged with a Warning header) rather than rejected.
+  const variant = CANONICAL_VARIANT;
+  let deprecatedVariant: string | null = null;
   try {
     const body = await request.json();
     if (body?.variant != null) {
-      if (!VARIANTS.includes(body.variant)) {
+      const requested = String(body.variant);
+      if (requested === CANONICAL_VARIANT) {
+        // canonical — nothing to do
+      } else if (DEPRECATED_VARIANTS.has(requested)) {
+        deprecatedVariant = requested;
+      } else {
         return NextResponse.json(
-          { error: `variant must be one of: ${VARIANTS.join(", ")}` },
+          { error: `variant must be "${CANONICAL_VARIANT}"` },
           { status: 400 },
         );
       }
-      variant = body.variant;
     }
   } catch {
     // No body — fine, use the default variant.
@@ -132,8 +141,14 @@ export async function POST(
     });
   }
 
+  const headers: Record<string, string> = {};
+  if (deprecatedVariant) {
+    // RFC 7234 warn-code 299 ("miscellaneous persistent warning").
+    headers["Warning"] = `299 - "variant '${deprecatedVariant}' is deprecated; mapped to '${CANONICAL_VARIANT}'"`;
+  }
+
   return NextResponse.json(
     { id: analysis.id, variant, status: "analyzing" },
-    { status: 202 },
+    { status: 202, headers },
   );
 }

@@ -170,7 +170,7 @@ export async function POST(
     // (roadmap 1.1). The UI pipeline merges here on Vercel and never touches
     // Modal's align worker, so this is where the perception chain must start.
     // Best-effort: a failure here must not fail the merge.
-    const CANONICAL_VARIANT = "with_transcript";
+    const CANONICAL_VARIANT = "v2";
     const analyzeUrl =
       process.env.MODAL_ANALYZE_URL ??
       "https://jacobbaron--lyricsync-analyze-visuals.modal.run";
