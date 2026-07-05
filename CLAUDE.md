@@ -241,6 +241,87 @@ local_start/end, source, …}]}`. Filter by `source` (filename); `local_*` are
 times within that clip — use them directly for range `start`/`end` and overlay
 `in`/`out`.
 
+## Cross-project search → cut (query→cut workflow)
+
+Full loop for "find me a clip about X anywhere in my library and cut it in" —
+no project name needed. `GET /api/search` is documented in the OpenAPI spec
+(`web/src/app/api/openapi.json` → `SearchQuery`/`SearchResponse`, `tags:
+["search"]`) alongside the perception tools; see `docs/cross_project_search.md`
+for the full response shape and ranking notes.
+
+1. **Search** the whole library (all projects, RLS-scoped to the caller):
+   `GET /api/search?q=<verbal query>&limit=20` →
+   `{query, terms, count, results:[{clip_id, project, project_id, filename,
+   kind, timestamp, snippet, score}]}`. One hit per clip — its best-matching
+   moment.
+2. **Take** a hit's `clip_id` + `timestamp` directly — no extra lookup. `kind`
+   tells you what matched (`transcript` word, whole-clip
+   `visual_description`, or a timestamped `highlight` beat); `timestamp` is
+   clip-local seconds (null only for a whole-clip `visual_description` match).
+3. **Insert cross-project**: `POST /api/stories/[id]/edit` with an
+   `insert_clip` op carrying that `clip_id` (the hit's `project_id` need not be
+   the story's home project — this is exactly the Tier 1 cross-project
+   reference in `docs/cross_project_editing.md`):
+   ```json
+   {"ops": [{"op": "insert_clip", "index": 1,
+             "clip_id": "<hit.clip_id>",
+             "source": "<hit.filename> (label only)",
+             "src_start": <hit.timestamp - 3>, "src_end": <hit.timestamp + 3>}]}
+   ```
+   Pick a `src_start`/`src_end` window around `timestamp` (a few seconds either
+   side, or tighten to the transcript line's exact bounds — see Transcripts
+   above).
+4. **Render**: `POST /api/stories/[id]/render {}` (empty body re-renders the
+   current `timeline_json`) → poll `GET /api/stories/[id]/signed-url` for the
+   `download_url`.
+
+### Worked example (real query against the live prod library, 2026-07-05)
+
+`GET /api/search?q=ceiling&limit=5` against this project's live API returned,
+top hit:
+
+```json
+{"clip_id": "253defde-dd5b-4d2b-9674-72d6d1b73b62",
+ "project": "Hanging panels", "project_id": "934327ab-eab5-4f01-9026-b8f941dededd",
+ "filename": "IMG_6662.mp4", "kind": "transcript", "timestamp": 16.02,
+ "snippet": "decided i think it's the ceiling oh you've decided yeah whoa",
+ "score": 15}
+```
+
+That was turned into a cross-project timeline item and actually rendered, into
+a **different** project ("Testing panels", `dc4a436d-…`) that has never
+contained this clip:
+
+```json
+{"op": "insert_clip", "index": 1,
+ "clip_id": "253defde-dd5b-4d2b-9674-72d6d1b73b62",
+ "source": "IMG_6662.mov (Hanging panels, cross-project via search)",
+ "src_start": 13.0, "src_end": 19.0}
+```
+
+`POST /api/stories/[id]/edit` returned the timeline with both items (one local
+clip from "Testing panels", one foreign clip resolved purely by `clip_id`);
+`POST /api/stories/[id]/render {}` rendered it and `GET
+/api/stories/[id]/signed-url` served a working `output.mp4` (a 2-clip, ~11s
+cut) — proving the full query → discover → cut loop end to end without ever
+naming the source project.
+
+### Agent tool wiring (blocked on #81)
+
+The perception tools (`GET /api/clips/{id}/frames`, `POST
+/api/clips/{id}/describe`, `GET /api/clips/{id}/contact-sheet`) are not yet
+registered as Anthropic-SDK tool definitions inside the in-product
+`generate_stories` loop (`modal/app.py`) — that wiring is tracked in #81 and is
+still open as of this writing; `generate_stories` currently only exposes a
+single `propose_stories` tool. Once #81 lands and that tool-calling mechanism
+exists, add a `search_library` tool alongside `look_at_frames` /
+`describe_range` / `contact_sheet` there, calling `GET /api/search` the same
+way this doc's steps 1–2 do, so a generation round can discover foreign clips
+mid-run instead of only quoting from its own project's transcript. Until then,
+this query→cut loop is available to any agent driving the REST API directly
+(as this section documents), just not to the automated `generate_stories`
+worker.
+
 ## Making cuts — editorial workflow (don't edit blind)
 
 **#1 rule: a cut is audio + picture, but you only get the audio (transcript)

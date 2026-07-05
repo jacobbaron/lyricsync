@@ -32,6 +32,8 @@ import {
   EditBody,
   EditResponse,
   SignedUrlResponse,
+  SearchQuery,
+  SearchResponse,
 } from "./existing";
 
 // Builds the OpenAPI 3.1 document from the registered Zod schemas. Single
@@ -249,6 +251,26 @@ export function buildOpenApiDocument() {
     responses: {
       200: { description: "URLs", content: json(SignedUrlResponse) },
       409: { description: "Not ready", content: json(ErrorResponse) },
+      ...errors,
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/api/search",
+    summary: "Cross-project library keyword search",
+    description:
+      "SEARCH S1 (#83): find clips across ALL of the caller's projects from a " +
+      "verbal query, over transcripts / clip visual descriptions / visual-" +
+      "analysis highlights (naive keyword scoring, no index yet). Each hit's " +
+      "{clip_id, timestamp} drops directly into a cross-project timeline item " +
+      "(clip_id + src_start) — see docs/cross_project_search.md and the " +
+      "query→cut playbook in CLAUDE.md.",
+    tags: ["search"],
+    security,
+    request: { query: SearchQuery },
+    responses: {
+      200: { description: "Ranked hits", content: json(SearchResponse) },
       ...errors,
     },
   });
