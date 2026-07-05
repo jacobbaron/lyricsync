@@ -25,6 +25,9 @@ env/
 # Claude Code local overrides (personal settings, not for repo)
 .claude/settings.local.json
 
+# Claude Code agent worktrees (transient per-agent checkouts, not for repo)
+.claude/worktrees/
+
 # Shorten POC output
 shorten/out/
 
