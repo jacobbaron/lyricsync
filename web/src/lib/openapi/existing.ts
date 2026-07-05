@@ -21,16 +21,15 @@ export { ErrorResponse };
 export const AnalyzeBody = z
   .object({
     variant: z
-      .enum([
-        "context",
-        "flash",
-        "flash_lowres",
-        "editorial",
-        "audio_aware",
-        "with_transcript",
-      ])
-      .default("flash")
-      .openapi({ description: "Visual-analysis variant (model + prompt strategy)." }),
+      .enum(["v2"])
+      .default("v2")
+      .openapi({
+        description:
+          "Visual-analysis variant. Only the unified \"v2\" analysis is supported. " +
+          "The retired A/B-era names (context, flash, flash_lowres, pro, editorial, " +
+          "audio_aware, with_transcript, grounded) are still accepted for a deprecation " +
+          "window: they are mapped to \"v2\" and the response carries a `Warning` header.",
+      }),
   })
   .openapi("AnalyzeBody");
 
