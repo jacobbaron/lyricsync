@@ -59,7 +59,9 @@ All text we **already have**, no new tables or embeddings:
 The route fans out: one `clips` query (RLS → all projects), one `projects`
 query for names, one `visual_analyses` query (`status = 'done'`, `result` only —
 never the large `debug` blob), and one R2 read of each referenced project's
-`merged.json` (best-effort; a missing/unbuilt transcript is skipped). Transcript
+`merged.json` (best-effort; a missing/unbuilt transcript is skipped). Each DB
+query is paginated (`.range()` in a loop) so a library larger than PostgREST's
+~1000-row response cap isn't silently truncated. Transcript
 words are attributed to a clip by `(project_id, filename)`, so filename
 collisions across projects can't cross-attribute.
 

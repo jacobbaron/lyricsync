@@ -42,6 +42,27 @@ interface Highlight {
   tone?: string;
 }
 
+// PostgREST caps a single response at ~1000 rows, so every select must be
+// paginated or larger libraries are silently truncated. Fetch all pages.
+const PAGE_SIZE = 1000;
+
+async function fetchAllRows<T>(
+  query: (
+    from: number,
+    to: number,
+  ) => PromiseLike<{ data: unknown[] | null; error: { message: string } | null }>,
+): Promise<{ rows: T[]; error: string | null }> {
+  const rows: T[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await query(from, from + PAGE_SIZE - 1);
+    if (error) return { rows, error: error.message };
+    const batch = (data ?? []) as T[];
+    rows.push(...batch);
+    if (batch.length < PAGE_SIZE) break;
+  }
+  return { rows, error: null };
+}
+
 type HitKind = "transcript" | "visual_description" | "highlight";
 
 interface Candidate {
@@ -165,17 +186,24 @@ export async function GET(request: Request) {
   const phrase = q.toLowerCase();
 
   // Clips + project names (RLS → only the caller's, across ALL projects).
-  const [{ data: clipData, error: clipErr }, { data: projData, error: projErr }] =
-    await Promise.all([
-      supabase.from("clips").select("id, project_id, filename, visual_description"),
-      supabase.from("projects").select("id, name"),
-    ]);
-  if (clipErr) return NextResponse.json({ error: clipErr.message }, { status: 500 });
-  if (projErr) return NextResponse.json({ error: projErr.message }, { status: 500 });
+  // Paginated so libraries larger than the PostgREST row cap aren't truncated.
+  const [clipRes, projRes] = await Promise.all([
+    fetchAllRows<ClipRow>((from, to) =>
+      supabase
+        .from("clips")
+        .select("id, project_id, filename, visual_description")
+        .range(from, to),
+    ),
+    fetchAllRows<{ id: string; name: string }>((from, to) =>
+      supabase.from("projects").select("id, name").range(from, to),
+    ),
+  ]);
+  if (clipRes.error) return NextResponse.json({ error: clipRes.error }, { status: 500 });
+  if (projRes.error) return NextResponse.json({ error: projRes.error }, { status: 500 });
 
-  const clips = (clipData ?? []) as ClipRow[];
+  const clips = clipRes.rows;
   const projectName = new Map<string, string>(
-    ((projData ?? []) as Array<{ id: string; name: string }>).map((p) => [p.id, p.name]),
+    projRes.rows.map((p) => [p.id, p.name]),
   );
 
   if (clips.length === 0) {
@@ -190,15 +218,19 @@ export async function GET(request: Request) {
   }
 
   // Highlights: newest `done` analysis per clip that carries highlights.
-  const { data: vaData, error: vaErr } = await supabase
-    .from("visual_analyses")
-    .select("clip_id, result, created_at")
-    .eq("status", "done")
-    .order("created_at", { ascending: false });
-  if (vaErr) return NextResponse.json({ error: vaErr.message }, { status: 500 });
+  // Paginated (multiple variants per clip can exceed the row cap on their own).
+  const vaRes = await fetchAllRows<{ clip_id: string; result: unknown }>((from, to) =>
+    supabase
+      .from("visual_analyses")
+      .select("clip_id, result, created_at")
+      .eq("status", "done")
+      .order("created_at", { ascending: false })
+      .range(from, to),
+  );
+  if (vaRes.error) return NextResponse.json({ error: vaRes.error }, { status: 500 });
 
   const highlightsByClip = new Map<string, Highlight[]>();
-  for (const row of (vaData ?? []) as Array<{ clip_id: string; result: unknown }>) {
+  for (const row of vaRes.rows) {
     if (highlightsByClip.has(row.clip_id)) continue; // newest wins (ordered desc)
     const result = row.result as { highlights?: unknown } | null;
     const hs = result?.highlights;
