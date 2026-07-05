@@ -179,3 +179,64 @@ export const SignedUrlResponse = z
     download_url: z.string().url(),
   })
   .openapi("SignedUrlResponse");
+
+// ── search (SEARCH S1 #83) ──────────────────────────────────────────────────
+// GET /api/search?q=&limit= — cross-project library keyword search. This
+// documents the S1 MVP shape currently on main (web/src/app/api/search/route.ts).
+// Sibling [SEARCH] tickets (S2 FTS #119, S3 semantic #120, S5 hybrid ranking
+// #122, S6 richer results #123, S7 filters/facets #124) will add params/fields
+// on top of this; covering those is explicit follow-up once those PRs land —
+// this backfill documents only what's live on main today (S9 #126).
+export const SearchQuery = z
+  .object({
+    q: z.string().min(1).openapi({
+      description: "Search text (required). Tokenized into lowercased terms.",
+      example: "ceiling",
+    }),
+    limit: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .default(20)
+      .optional()
+      .openapi({
+        description: "Max hits to return (default 20, capped at 50).",
+      }),
+  })
+  .openapi("SearchQuery");
+
+export const SearchHitKind = z
+  .enum(["transcript", "visual_description", "highlight"])
+  .openapi("SearchHitKind");
+
+export const SearchHit = z
+  .object({
+    clip_id: z.string().uuid().openapi({
+      description:
+        "Global clip id. Use directly as a cross-project timeline video " +
+        "item's `clip_id` (see docs/cross_project_editing.md).",
+    }),
+    project: z.string().nullable().openapi({ description: "Owning project name." }),
+    project_id: z.string().uuid(),
+    filename: z.string().nullable(),
+    kind: SearchHitKind,
+    timestamp: z.number().nullable().openapi({
+      description:
+        "Clip-local seconds for the best-matching moment (null for a whole-clip " +
+        "match, e.g. kind=visual_description). Use as `src_start` (pick a small " +
+        "window around it for `src_end`).",
+    }),
+    snippet: z.string(),
+    score: z.number(),
+  })
+  .openapi("SearchHit");
+
+export const SearchResponse = z
+  .object({
+    query: z.string(),
+    terms: z.array(z.string()),
+    count: z.number().int(),
+    results: z.array(SearchHit),
+  })
+  .openapi("SearchResponse");
