@@ -8,26 +8,33 @@ timeline reference any clip by `clip_id`; search is how you *get* those
 `clip_id`s.
 
 Tracked in the `[SEARCH]` epic (#128). **S1 (#83)** shipped the keyword-search
-MVP (naive in-memory scan). Four more tickets — **S2 (#119)** Postgres FTS,
-**S3 (#120)** semantic search, **S6 (#123)** result enrichment, and **S7
-(#124)** filters/facets — were built in parallel against that MVP and are
-**consolidated into one route** here (branch
-`search-consolidated-s2-s3-s6-s7`); this note describes the result, not each
+MVP (naive in-memory scan). Five more tickets — **S2 (#119)** Postgres FTS,
+**S3 (#120)** semantic search, **S6 (#123)** result enrichment, **S7 (#124)**
+filters/facets, and **S5 (#122)** hybrid RRF ranking — were built against that
+MVP and are **consolidated into one route** here
+(`web/src/app/api/search/route.ts`); this note describes the result, not each
 ticket's original standalone diff.
+
+⚠️ **Behavior change (S5 #122):** the default `mode` changed from `keyword` to
+`hybrid`. A caller that never passed `mode` used to get pure keyword-ranked
+results; it now gets hybrid-fused results (see below). Pass `mode=keyword`
+explicitly to keep the exact old behavior.
 
 ## Surface
 
-`GET /api/search?q=<text>&limit=20&mode=keyword|semantic&thumbnails=1&project=…&kind=…&min_duration=…&max_duration=…&since=…&until=…`
+`GET /api/search?q=<text>&limit=20&mode=hybrid|keyword|semantic&thumbnails=1&project=…&kind=…&min_duration=…&max_duration=…&since=…&until=…`
 — API-key callable (`Authorization: Bearer lsk_…`) or browser session. Not
 scoped to a project; it searches everything the caller owns (RLS-enforced).
 
 Query params:
 - `q` — the search text (required).
 - `limit` — max hits (default 20, capped 50).
-- `mode` — `keyword` (default) or `semantic` (S3, #120 — see below). Any other
-  value is treated as `keyword`.
-- `pooled` — semantic mode only: `1` to also match whole-clip pooled vectors
-  (default: frames only).
+- `mode` — `hybrid` (**default**, S5 #122), `keyword` (S2, #119), or
+  `semantic` (S3, #120 — see below). Any other/unrecognized value — including
+  no `mode` param at all — is treated as `hybrid`.
+- `pooled` — semantic channel only (applies to `mode=semantic` and hybrid's
+  semantic channel): `1` to also match whole-clip pooled vectors (default:
+  frames only).
 - `thumbnails` — `1` to include a signed `thumbnail_url` per result (S6,
   opt-in — see "Result enrichment" below).
 - `project` — restrict to one/several projects (S7); repeatable
@@ -37,9 +44,10 @@ Query params:
   error).
 - `kind` — `speech` | `visual` | `both` (default `both`, S7). `speech`
   restricts to transcript matches; `visual` restricts to
-  visual_description/highlight matches. In semantic mode, embedding hits count
-  as `visual` (they're all image-side vectors) — `kind=speech` short-circuits
-  to an empty result without an embed call.
+  visual_description/highlight matches. In semantic mode (and hybrid's
+  semantic channel), embedding hits count as `visual` (they're all image-side
+  vectors) — `kind=speech` short-circuits that channel to an empty result
+  without an embed call.
 - `min_duration` / `max_duration` — clip length bounds in seconds
   (`clips.duration_secs`, S7). Clips with unknown duration are excluded when
   either is set.
@@ -47,7 +55,7 @@ Query params:
   (falling back to `clips.created_at` when null, S7). Clips with neither are
   excluded when either is set.
 
-Response:
+Response (hybrid, the default):
 
 ```json
 {
@@ -65,23 +73,32 @@ Response:
       "timestamp": 195.0,
       "snippet": "soft affectionate **laugh** as he's called perfect",
       "thumbnail_url": "https://...signed... (only when ?thumbnails=1)",
-      "score": 21
+      "score": 0.0317,
+      "sources": ["keyword", "semantic"]
     }
   ],
   "facets": {
     "by_project": { "Studio day 2": 2 },
     "by_kind": { "highlight": 2 }
-  }
+  },
+  "mode": "hybrid"
 }
 ```
 
-Each hit is **one clip** (its best-matching moment). `clip_id` + `timestamp`
-(clip-local seconds) drop straight into a cross-project timeline item
-(`clip_id`, `src_start`/`src_end`) or an overlay `in`/`out` — no extra lookup.
-`duration` (`clips.duration_secs`) lets a caller validate/clamp a proposed
-`src_end` without a follow-up lookup. `facets` is counted over the full
-filtered candidate set, **before** slicing to `limit`, so it reflects "what's
-out there" even when only a page of it is returned.
+Each hit is **one clip** (its best-matching moment) — in `mode=semantic`
+alone, multiple frame hits per clip are still allowed (see "Semantic mode"
+below); every other mode, including hybrid, is one-hit-per-clip. `clip_id` +
+`timestamp` (clip-local seconds) drop straight into a cross-project timeline
+item (`clip_id`, `src_start`/`src_end`) or an overlay `in`/`out` — no extra
+lookup. `duration` (`clips.duration_secs`) lets a caller validate/clamp a
+proposed `src_end` without a follow-up lookup. `sources` (S5 #122) says which
+channel(s) produced the hit — `["keyword", "semantic"]` when a clip matched
+both, a single-element array otherwise. `facets` is counted over the full
+filtered (and, in hybrid, fused/deduped) candidate set, **before** slicing to
+`limit`, so it reflects "what's out there" even when only a page of it is
+returned. `mode` echoes which mode actually served the request. `warnings`
+(hybrid only, omitted when everything worked) reports a degraded semantic
+channel — see "Hybrid ranking" below.
 
 ## What's indexed — keyword mode (S1 MVP → S2 FTS)
 
@@ -140,10 +157,10 @@ shape, minus the `project_id` filter; scoped instead by the caller's RLS via
 Hits are mapped into the same response shape as keyword mode: `kind:
 "embedding"`, `timestamp` is the matched frame's `t` (`null` for a pooled
 hit), and `score` is raw cosine similarity in `[0, 1]` — **not** on the same
-scale as the keyword-mode score; the two modes aren't fused yet (that's hybrid
-ranking, S5 #122). Unlike keyword mode, semantic mode does not collapse to one
-hit per clip — multiple frames of the same clip can each appear, same as the
-intra-project route.
+scale as the keyword-mode score (hybrid mode, below, is what fuses the two).
+Unlike keyword mode (and unlike hybrid mode), semantic mode *alone* does not
+collapse to one hit per clip — multiple frames of the same clip can each
+appear, same as the intra-project route.
 
 Semantic mode gets the same S6/S7 treatment as keyword mode: `duration` and
 opt-in `thumbnail_url`, and `project`/`min_duration`/`max_duration`/`since`/
@@ -156,7 +173,76 @@ hit is implicitly visual.
 clips in the library are not yet embedded — auto-embed/backfill is **S4
 (#121)**, not done — so semantic mode currently only surfaces clips that have
 already been run through `POST /api/clips/{id}/embed`. This is expected, not a
-bug.
+bug — hybrid mode below degrades gracefully to keyword-only results for
+clips (or entire libraries) that aren't embedded yet.
+
+## Hybrid ranking (S5, #122)
+
+`mode=hybrid` — **the default** — fuses the keyword and semantic channels
+into one ranked, deduped list, so a single query surfaces the best clip
+whether the match is lexical (exact/stemmed word) or conceptual (semantically
+related but no shared words).
+
+**Fusion: Reciprocal Rank Fusion (RRF), k=60.** Both channels run in parallel
+(`Promise.all` — they're independent network calls: one Postgres RPC, one
+Modal embed + Postgres RPC). Each channel's candidates are grouped to one
+best-scoring row per `clip_id` (keyword mode already does this; semantic
+mode's raw output is additionally grouped here, keeping only each clip's
+best-scoring frame, in RPC order — the RPC returns rows best-similarity-first,
+so the first occurrence per `clip_id` is already its best frame). Every clip
+across the two ranked lists then gets a fused score:
+
+```
+score = Σ over channels the clip appears in of  1 / (60 + rank_in_that_channel)
+```
+
+(`rank` is 1-based within that channel's own list.) RRF was picked over a
+weighted score blend because keyword scores (`ts_rank_cd`) and semantic scores
+(cosine similarity) live on entirely different, non-comparable scales — RRF
+sidesteps that by fusing on *rank* instead of raw score, needs no per-corpus
+tuning, and is the standard, robust default for this exact two-channel-fusion
+problem. `k=60` is the typical RRF constant (it damps the influence of any
+single top rank without a query-specific tuning pass); no evidence from
+testing this ticket suggested a different constant was warranted.
+
+**Dedup key: `clip_id` alone.** The ticket's "same clip/timestamp" dedup
+question doesn't have a clean answer at the timestamp level: keyword hits
+carry clip-local timestamps from transcript windows / highlight beats / `null`
+(whole-clip `visual_description` matches), while semantic hits carry
+per-frame float timestamps from a completely different clock (frame sampling
+interval) that will essentially never exactly equal a keyword hit's timestamp
+for what a human would call "the same moment." Rather than build fuzzy
+timestamp-overlap matching (a real project of its own, easy to get subtly
+wrong), hybrid mode dedupes at the `clip_id` level — the same granularity
+keyword mode (and the MVP before it) already uses for "one hit per clip." A
+clip found by both channels gets `sources: ["keyword", "semantic"]`; the
+display fields (`kind`/`timestamp`/`snippet`) come from **whichever channel
+ranked the clip better** (lower rank number) — "the best-ranked
+representative" — rather than trying to merge two different timestamps into
+one.
+
+**Failure handling: degrade, don't fail.** Before S5, keyword mode (the old
+default) never depended on Modal — it's pure Postgres. Making hybrid the new
+default means every default search now costs one extra network round-trip
+(the embed call) and a new failure mode (Modal down / misconfigured). Rather
+than let that regress the reliability of what's now the default search
+endpoint, hybrid mode catches a failing semantic channel, logs it
+server-side, and falls back to keyword-only ranking (RRF over a single list —
+mathematically equivalent to the plain keyword ranking, since `1/(60+rank)` is
+monotonic in `rank`) — the response still succeeds, with a `warnings` field
+naming the degradation. A **failing keyword channel** (bad query / DB error),
+by contrast, still fails the whole hybrid request — those are the same
+conditions that already 400/500'd under the pre-S5 keyword-only default, so
+hybrid's behavior for them is unchanged.
+
+**Performance note:** hybrid's extra Modal round-trip (embedding the query)
+is the one real cost of the new default. The file doesn't have infrastructure
+for canceling one channel early if the other returns faster, and both calls
+are already independent, so a simple `Promise.all` is the whole
+"parallelization" story here — no further engineering was justified for this
+ticket. In informal testing this added on the order of a few hundred
+milliseconds versus keyword-only, dominated by the Modal cold-start/embed
+call; see the PR for concrete numbers.
 
 ## Result enrichment (S6, #123)
 
@@ -179,32 +265,40 @@ bug.
 
 ## Filters and facets (S7, #124)
 
-Filters compose with **both** ranking modes:
+Filters compose with **all three** ranking modes:
 
 - `project` (id or name, repeatable/comma-separated), `min_duration`/
   `max_duration`, `since`/`until` are clip-level facts, applied identically in
-  both modes against a single up-front `clips`/`projects` fetch shared by both
-  code paths (avoids a second round-trip per mode).
+  every mode against a single up-front `clips`/`projects` fetch shared by all
+  code paths (avoids a second round-trip per mode). Hybrid applies them
+  per-channel (before fusion), same as if you'd run each channel solo.
 - `kind` gates which *source* a hit may come from rather than excluding a
-  clip outright: in keyword mode it filters which `search_library_fts()` rows
-  are eligible before grouping to "best row per clip"; in semantic mode it's
-  binary (`speech` → nothing, `visual`/`both` → normal semantic search).
+  clip outright: in keyword mode (and hybrid's keyword channel) it filters
+  which `search_library_fts()` rows are eligible before grouping to "best row
+  per clip"; in semantic mode (and hybrid's semantic channel) it's binary
+  (`speech` → nothing, `visual`/`both` → normal semantic search).
 
-Both modes originally generated their own in-memory candidate list (S1's naive
-scan); S7's filter pass was written against that shape. Consolidating S2's FTS
-RPC and S3's embedding RPC meant adapting the *same* filter pass
-(`clipPassesFilters` in `route.ts`) to run against each RPC's grouped output
-instead — the filter logic itself (project/duration/date predicates) is
-unchanged from S7's original design, just re-pointed at RPC rows carrying a
-`clip_id` rather than at S1's raw clip objects.
+Keyword and semantic modes originally generated their own in-memory candidate
+list (S1's naive scan); S7's filter pass was written against that shape.
+Consolidating S2's FTS RPC and S3's embedding RPC meant adapting the *same*
+filter pass (`clipPassesFilters` in `route.ts`) to run against each RPC's
+grouped output instead — the filter logic itself (project/duration/date
+predicates) is unchanged from S7's original design, just re-pointed at RPC
+rows carrying a `clip_id` rather than at S1's raw clip objects. S5's hybrid
+mode reuses the exact same filter pass a third time (via the shared
+`keywordCandidates()`/`semanticCandidates()` helpers each mode calls) — no
+new filter logic was needed.
 
 `facets` (`by_project`, `by_kind`) are tallied over the full filtered
 candidate set for the request's mode, **before** slicing to `limit` — no
 extra DB round-trips, just a tally over data already fetched. Note: keyword
-mode facets count **clips** (one row per clip, post-dedup) while semantic mode
-facets count **hits** (a clip can contribute multiple embedding rows, one per
-matched frame) — by design, per "Semantic mode" above — so facet totals aren't
-directly comparable across modes.
+mode and hybrid mode facets count **clips** (one row per clip, post-dedup —
+hybrid's `by_kind` reflects each clip's best-ranked-representative channel,
+so `embedding` shows up there too when a clip's semantic hit outranked its
+keyword hit) while semantic mode *alone* facets count **hits** (a clip can
+contribute multiple embedding rows, one per matched frame) — by design, per
+"Semantic mode" above — so semantic-mode facet totals aren't directly
+comparable to the other two modes'.
 
 ## Backfill status (transcript FTS docs)
 
@@ -222,15 +316,18 @@ migration's `ALTER TABLE ADD COLUMN` runs).
 
 ## Deferred (later `[SEARCH]` tickets)
 
-- **Embedding coverage/backfill** so semantic mode has near-complete recall —
-  **S4 (#121)**.
-- **Hybrid ranking** fusing keyword + semantic — **S5 (#122)**.
+- **Embedding coverage/backfill** so semantic mode (and hybrid's semantic
+  channel) have near-complete recall — **S4 (#121)**, still not done as of
+  S5; hybrid degrades gracefully in the meantime (see "Hybrid ranking"
+  above), it just can't fuse in what isn't embedded yet.
 - **Editor search UI** — **S8 (#125)**; **OpenAPI + agent tool** — **S9
   (#126)**, already documenting this consolidated shape (`SearchQuery`/
-  `SearchResponse` in `web/src/lib/openapi/existing.ts`); **eval harness** —
-  **S10 (#127)**.
+  `SearchResponse` in `web/src/lib/openapi/existing.ts`, updated for S5 to add
+  the `hybrid` mode, `sources`, and `mode`/`warnings` response fields);
+  **eval harness** — **S10 (#127)**, not built yet — S5 was verified manually
+  (see the PR description for the lexical-only and concept-only test cases)
+  rather than against a formal precision@k comparison.
 
-The response shape is forward-compatible: `S5` will add a fused ranking
-channel without changing the existing fields; further tickets may add facet
+The response shape remains forward-compatible: further tickets may add facet
 dimensions or result fields without breaking `{clip_id, project, project_id,
-filename, kind, timestamp, snippet, score}`.
+filename, kind, timestamp, snippet, score, sources}`.

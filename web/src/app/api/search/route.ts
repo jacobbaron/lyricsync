@@ -15,17 +15,18 @@ export const runtime = "nodejs";
 // Cross-project library discovery. Finds clips across ALL of the caller's
 // projects from a verbal query and returns hits as
 // { clip_id, project, project_id, filename, duration, kind, timestamp,
-//   snippet, thumbnail_url?, score } that drop straight into a cross-project
-// cut (clip_id + clip-local timestamp). See docs/cross_project_search.md.
+//   snippet, thumbnail_url?, score, sources[] } that drop straight into a
+// cross-project cut (clip_id + clip-local timestamp). See
+// docs/cross_project_search.md.
 //
-// This route is the consolidation of four [SEARCH] epic (#128) tickets that
+// This route is the consolidation of five [SEARCH] epic (#128) tickets that
 // were built in parallel against the S1 (#83) MVP and are reconciled here:
 //
-//   - S2 (#119): replaced the naive in-memory keyword scan with a Postgres
-//     full-text index. `mode=keyword` (default) calls search_library_fts()
-//     (see supabase/migrations/20260705231100_add_clip_search_docs.sql),
-//     which ranks with ts_rank_cd over websearch_to_tsquery(q) across three
-//     sources (clip_search_docs transcript windows, clips.visual_description,
+//   - S2 (#119): a Postgres full-text index. `mode=keyword` calls
+//     search_library_fts() (see
+//     supabase/migrations/20260705231100_add_clip_search_docs.sql), which
+//     ranks with ts_rank_cd over websearch_to_tsquery(q) across three sources
+//     (clip_search_docs transcript windows, clips.visual_description,
 //     visual_analyses highlights) and returns an already ts_headline-marked
 //     `snippet` (see below).
 //   - S3 (#120): `mode=semantic` — library-wide vector search over
@@ -36,6 +37,15 @@ export const runtime = "nodejs";
 //   - S7 (#124): filters (`project`, `kind`, `min_duration`/`max_duration`,
 //     `since`/`until`) and a `facets` field summarizing the (filtered,
 //     pre-`limit`) candidate set.
+//   - S5 (#122): `mode=hybrid` — now the DEFAULT — fuses the S2 keyword
+//     channel and the S3 semantic channel with Reciprocal Rank Fusion (RRF,
+//     k=60) into one ranked, deduped (one hit per clip_id) list. See
+//     "Hybrid ranking (S5 #122)" below.
+//
+// ⚠️ BEHAVIOR CHANGE: the default mode used to be keyword-only; it is now
+// hybrid. `mode=keyword` and `mode=semantic` still force the old single-
+// channel behavior exactly (unchanged code paths) — pass one of those
+// explicitly to opt out of hybrid.
 //
 // Reconciliation notes:
 //   - S6 shipped JS-side `**term**` marker highlighting as an explicit
@@ -58,15 +68,47 @@ export const runtime = "nodejs";
 //     the single up-front clips/projects fetch (added for S7's filters) for
 //     filename/project-name/duration/date lookups instead of doing its own
 //     second round-trip, and gets S6's duration/thumbnail treatment too.
+//   - S5's hybrid mode does NOT reimplement ranking: it factors the keyword
+//     RPC+grouping logic out into `keywordCandidates()` and the semantic
+//     embed+RPC+filter logic out into `semanticCandidates()`, calls both
+//     (Promise.all — they're independent network calls, see hybridSearch()),
+//     and fuses the two already-ranked, already-filtered per-clip lists with
+//     RRF. `mode=keyword`/`mode=semantic` call the very same two helpers, so
+//     there is exactly one implementation of each channel's ranking, used by
+//     both its solo mode and hybrid.
+//
+// Hybrid ranking (S5 #122):
+//   `mode=hybrid` (the default) runs the keyword and semantic channels in
+//   parallel, groups each to one best-scoring row per clip_id (semantic mode
+//   alone does NOT do this — it can return multiple frames per clip — but
+//   hybrid fusion needs one representative per clip to fuse against the
+//   keyword channel's already-one-per-clip shape), then fuses by Reciprocal
+//   Rank Fusion: score = Σ 1/(k + rank) over every channel the clip appears
+//   in (rank is 1-based within that channel's own ranked list), k=60 (the
+//   standard RRF constant — no query-specific tuning was needed to satisfy
+//   the acceptance criteria below). A clip appearing in both channels sums
+//   both contributions and gets `sources: ["keyword", "semantic"]`;  a
+//   clip appearing in only one gets a single-element `sources`. The hit's
+//   display fields (kind/timestamp/snippet) come from whichever channel
+//   ranked the clip better (lower rank number) — "the best-ranked
+//   representative" per the ticket. If the semantic channel errors (Modal
+//   down, embed service misconfigured) hybrid degrades to keyword-only
+//   ranking rather than failing the now-default search endpoint; a
+//   `warnings` field on the response reports the degradation.
 //
 // Query params:
 //   q             — the search text (required)
 //   limit         — max hits (default 20, capped at 50)
-//   mode          — "keyword" (default) or "semantic" (S3, #120). Any other
-//                   value is treated as "keyword" (matches S3's shipped
-//                   behavior — unrecognized modes aren't a 400).
-//   pooled        — semantic mode only: "1" to also match whole-clip pooled
-//                   vectors (default: frames only).
+//   mode          — "hybrid" (default, S5 #122) fuses keyword + semantic via
+//                   RRF; "keyword" (S2, #119) or "semantic" (S3, #120) force
+//                   a single channel. Any other/unrecognized value (including
+//                   no `mode` param at all) is treated as "hybrid" — mirrors
+//                   the pre-S5 convention that an unrecognized mode fell back
+//                   to whatever the default was, and the default is now
+//                   hybrid instead of keyword.
+//   pooled        — semantic mode only (also applies to hybrid's semantic
+//                   channel): "1" to also match whole-clip pooled vectors
+//                   (default: frames only).
 //   thumbnails    — "1" to include a signed thumbnail_url per result (S6,
 //                   opt-in — costs one Modal frame-extraction call per
 //                   result, subject to the same clip_inspections cache as
@@ -79,10 +121,10 @@ export const runtime = "nodejs";
 //   kind          — "speech" | "visual" | "both" (default "both"). "speech"
 //                   restricts keyword-mode hits to transcript matches;
 //                   "visual" restricts to visual_description/highlight
-//                   matches. In semantic mode, embedding hits are treated as
-//                   "visual" (they're all image-side vectors) — "speech"
-//                   short-circuits to an empty result set without an embed
-//                   call.
+//                   matches. In semantic mode (and hybrid's semantic
+//                   channel), embedding hits are treated as "visual" (they're
+//                   all image-side vectors) — "speech" short-circuits that
+//                   channel to an empty result set without an embed call.
 //   min_duration  — minimum clip length in seconds (clips.duration_secs).
 //                   Clips with unknown duration are excluded when set.
 //   max_duration  — maximum clip length in seconds. Same null-handling.
@@ -130,6 +172,16 @@ const CANDIDATE_POOL_LIMIT = 1000;
 type HitKind = "transcript" | "visual_description" | "highlight" | "embedding";
 type FtsHitKind = "transcript" | "visual_description" | "highlight";
 
+// ── S5 (#122): hybrid ranking ────────────────────────────────────────────────
+// Which channel(s) contributed a hit. A hybrid hit found by both channels
+// carries both; a keyword-mode or semantic-mode (solo) hit always carries
+// exactly its one channel, kept for response-shape consistency across modes.
+type HitSource = "keyword" | "semantic";
+
+// Standard RRF constant (no query-specific tuning needed — see file-header
+// "Hybrid ranking" note for why k=60 and not a weighted blend).
+const RRF_K = 60;
+
 interface FtsRow {
   clip_id: string;
   kind: FtsHitKind;
@@ -165,14 +217,13 @@ interface SearchHit {
   snippet: string;
   thumbnail_url?: string | null;
   score: number;
+  sources: HitSource[];
 }
 
 interface Facets {
   by_project: Record<string, number>;
   by_kind: Record<string, number>;
 }
-
-const EMPTY_FACETS: Facets = { by_project: {}, by_kind: {} };
 
 // Lowercase, strip surrounding punctuation, keep inner alphanumerics/'.
 // Only used to populate the response's informational `terms` field —
@@ -322,31 +373,40 @@ async function enrichThumbnails(supabase: SupabaseClient, results: SearchHit[]):
   );
 }
 
-// ── S3 (#120): mode=semantic ─────────────────────────────────────────────────
+// ── S3 (#120): semantic channel ──────────────────────────────────────────────
 //
 // Library-wide vector search over clip_embeddings. Embeds `q` via the same
 // Modal embed_text endpoint the intra-project GET /api/projects/[id]/search
 // route uses, then cosine-searches through search_clip_embeddings_global —
 // the cross-project generalization of search_clip_embeddings (PERCEPTION T4,
 // #87), scoped by the caller's RLS (SECURITY INVOKER) rather than a project
-// id. `clipById`/`projectName` (built once from the shared up-front fetch)
-// supply filename/project-name/duration/date without a second round-trip.
-async function semanticSearch(
+// id. Factored out of the `mode=semantic` response builder so S5's hybrid
+// mode can call the exact same channel logic (see hybridSearch below) instead
+// of re-implementing it.
+//
+// Returns `{ rows }` (possibly empty — a `kind=speech` short-circuit or zero
+// embedding matches are both success, not failure) or `{ error, status }` for
+// a hard failure (missing config / embed call / RPC). Rows are pre-filtered
+// (S7) but NOT deduped to one-per-clip — semantic mode alone intentionally
+// allows multiple frame hits per clip; callers that need one-per-clip (hybrid
+// fusion) group these themselves.
+type SemanticCandidatesResult =
+  | { rows: EmbeddingRow[] }
+  | { error: string; status: number };
+
+async function semanticCandidates(
   supabase: SupabaseClient,
   q: string,
-  limit: number,
   framesOnly: boolean,
-  wantThumbnails: boolean,
   clipById: Map<string, ClipMetaRow>,
-  projectName: Map<string, string>,
   filters: ClipFilters,
   kindFilter: KindFilter,
-): Promise<NextResponse> {
+): Promise<SemanticCandidatesResult> {
   // Embedding hits are all image-side vectors — there is no "speech" source
   // in semantic mode. Short-circuit before the embed call rather than
   // returning zero results the expensive way.
   if (kindFilter === "speech") {
-    return NextResponse.json({ query: q, terms: [], count: 0, results: [], facets: EMPTY_FACETS });
+    return { rows: [] };
   }
 
   const embedTextUrl =
@@ -354,10 +414,7 @@ async function semanticSearch(
     "https://jacobbaron--lyricsync-embed-text.modal.run";
   const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
   if (!webhookSecret) {
-    return NextResponse.json(
-      { error: "MODAL_WEBHOOK_SECRET not configured" },
-      { status: 503 },
-    );
+    return { error: "MODAL_WEBHOOK_SECRET not configured", status: 503 };
   }
 
   let embedding: number[];
@@ -373,25 +430,16 @@ async function semanticSearch(
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
       console.error(`[search] embed_text returned ${res.status}: ${detail}`);
-      return NextResponse.json(
-        { error: `Query embedding failed (${res.status})` },
-        { status: 502 },
-      );
+      return { error: `Query embedding failed (${res.status})`, status: 502 };
     }
     const payload = (await res.json()) as { embedding?: number[] };
     if (!Array.isArray(payload.embedding)) {
-      return NextResponse.json(
-        { error: "Query embedding service returned no vector" },
-        { status: 502 },
-      );
+      return { error: "Query embedding service returned no vector", status: 502 };
     }
     embedding = payload.embedding;
   } catch (err) {
     console.error("[search] query embedding request failed:", err);
-    return NextResponse.json(
-      { error: "Query embedding request failed" },
-      { status: 502 },
-    );
+    return { error: "Query embedding request failed", status: 502 };
   }
 
   // pgvector text literal for the RPC's ::vector cast (same convention as the
@@ -407,7 +455,7 @@ async function semanticSearch(
     },
   );
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return { error: error.message, status: 500 };
   }
 
   const rows = (rpcResults ?? []) as EmbeddingRow[];
@@ -421,6 +469,53 @@ async function semanticSearch(
     return clipPassesFilters(clip, filters);
   });
 
+  return { rows: filtered };
+}
+
+function semanticHitFromRow(
+  r: EmbeddingRow,
+  clip: ClipMetaRow,
+  projectName: Map<string, string>,
+  score: number,
+  sources: HitSource[],
+): SearchHit {
+  return {
+    clip_id: r.clip_id,
+    project: projectName.get(r.project_id) ?? null,
+    project_id: r.project_id,
+    filename: clip.filename,
+    duration: normalizeDuration(clip.duration_secs),
+    kind: "embedding",
+    timestamp: r.t,
+    snippet:
+      r.t != null
+        ? `frame @ ${r.t.toFixed(1)}s (semantic match)`
+        : "whole-clip semantic match",
+    score,
+    sources,
+  };
+}
+
+// `mode=semantic` response builder — thin wrapper around semanticCandidates()
+// that formats its rows into the route's response shape. Multiple frame hits
+// per clip are preserved (not deduped) — see semanticCandidates' doc comment.
+async function semanticSearch(
+  supabase: SupabaseClient,
+  q: string,
+  limit: number,
+  framesOnly: boolean,
+  wantThumbnails: boolean,
+  clipById: Map<string, ClipMetaRow>,
+  projectName: Map<string, string>,
+  filters: ClipFilters,
+  kindFilter: KindFilter,
+): Promise<NextResponse> {
+  const candidates = await semanticCandidates(supabase, q, framesOnly, clipById, filters, kindFilter);
+  if ("error" in candidates) {
+    return NextResponse.json({ error: candidates.error }, { status: candidates.status });
+  }
+  const { rows: filtered } = candidates;
+
   const facets: Facets = { by_project: {}, by_kind: {} };
   for (const r of filtered) {
     const clip = clipById.get(r.clip_id)!;
@@ -431,32 +526,242 @@ async function semanticSearch(
 
   const top = filtered.slice(0, limit);
   if (top.length === 0) {
-    return NextResponse.json({ query: q, terms: [], count: 0, results: [], facets });
+    return NextResponse.json({ query: q, terms: [], count: 0, results: [], facets, mode: "semantic" });
   }
 
-  const results: SearchHit[] = top.map((r) => {
-    const clip = clipById.get(r.clip_id)!;
-    return {
-      clip_id: r.clip_id,
-      project: projectName.get(r.project_id) ?? null,
-      project_id: r.project_id,
-      filename: clip.filename,
-      duration: normalizeDuration(clip.duration_secs),
-      kind: "embedding",
-      timestamp: r.t,
-      snippet:
-        r.t != null
-          ? `frame @ ${r.t.toFixed(1)}s (semantic match)`
-          : "whole-clip semantic match",
-      score: r.score,
-    };
+  const results: SearchHit[] = top.map((r) =>
+    semanticHitFromRow(r, clipById.get(r.clip_id)!, projectName, r.score, ["semantic"]),
+  );
+
+  if (wantThumbnails) {
+    await enrichThumbnails(supabase, results);
+  }
+
+  return NextResponse.json({ query: q, terms: [], count: results.length, results, facets, mode: "semantic" });
+}
+
+// ── S2 (#119): keyword channel ───────────────────────────────────────────────
+//
+// Factored out of the `mode=keyword` response builder (below, in GET) so S5's
+// hybrid mode can call the exact same channel logic. Returns the FTS RPC's
+// rows grouped to one best-scoring row per clip_id (S7 filters + `kind` gate
+// already applied), sorted by score desc — or `{ error, status }` on a hard
+// failure (empty tokenized query / RPC error).
+type KeywordCandidatesResult =
+  | { terms: string[]; ranked: FtsRow[] }
+  | { error: string; status: number };
+
+async function keywordCandidates(
+  supabase: SupabaseClient,
+  q: string,
+  clipById: Map<string, ClipMetaRow>,
+  filters: ClipFilters,
+  kindFilter: KindFilter,
+): Promise<KeywordCandidatesResult> {
+  const terms = Array.from(new Set(tokenize(q)));
+  if (terms.length === 0) {
+    return { error: "q has no searchable terms", status: 400 };
+  }
+
+  const { data: rows, error: rpcError } = await supabase.rpc("search_library_fts", {
+    p_query: q,
+    p_limit: CANDIDATE_POOL_LIMIT,
+  });
+  if (rpcError) {
+    return { error: rpcError.message, status: 500 };
+  }
+  const ftsRows = (rows ?? []) as FtsRow[];
+
+  // `kind` gates which FTS row kinds are even eligible — mirrors S7's
+  // original "gate candidate generation, not exclude the clip" design, now
+  // applied to the RPC's output instead of in-process candidate generation.
+  const wantSpeech = kindFilter !== "visual";
+  const wantVisual = kindFilter !== "speech";
+  function kindAllowed(k: FtsHitKind): boolean {
+    if (k === "transcript") return wantSpeech;
+    return wantVisual; // visual_description | highlight
+  }
+
+  // Best-scoring eligible row per clip → one hit per clip (mirrors the S1
+  // MVP's per-clip "best candidate wins" behavior), with the S7 clip-level
+  // filters (project/duration/date) applied at grouping time so both the
+  // facets and the sliced `results` reflect the same filtered candidate set.
+  const bestByClip = new Map<string, FtsRow>();
+  for (const row of ftsRows) {
+    if (!kindAllowed(row.kind)) continue;
+    const clip = clipById.get(row.clip_id);
+    if (!clip) continue; // RLS or a race (clip deleted) — drop rather than 500.
+    if (!clipPassesFilters(clip, filters)) continue;
+    const current = bestByClip.get(row.clip_id);
+    if (!current || row.score > current.score) bestByClip.set(row.clip_id, row);
+  }
+
+  const ranked = Array.from(bestByClip.values()).sort((a, b) => b.score - a.score);
+  return { terms, ranked };
+}
+
+function keywordHitFromRow(
+  row: FtsRow,
+  clip: ClipMetaRow,
+  projectName: Map<string, string>,
+  score: number,
+  sources: HitSource[],
+): SearchHit {
+  return {
+    clip_id: row.clip_id,
+    project: projectName.get(clip.project_id) ?? null,
+    project_id: clip.project_id,
+    filename: clip.filename,
+    duration: normalizeDuration(clip.duration_secs),
+    kind: row.kind,
+    timestamp: row.timestamp,
+    snippet: (row.snippet ?? "").trim(),
+    score,
+    sources,
+  };
+}
+
+// ── S5 (#122): mode=hybrid (default) — RRF fusion ────────────────────────────
+//
+// Runs both channels in parallel (they're independent async calls — a simple
+// Promise.all is enough, no need for more elaborate scheduling) and fuses
+// with Reciprocal Rank Fusion. See the file-header "Hybrid ranking" note for
+// the full design rationale (RRF choice/k, dedup key, representative-hit
+// tie-break, semantic-failure degradation).
+async function hybridSearch(
+  supabase: SupabaseClient,
+  q: string,
+  limit: number,
+  framesOnly: boolean,
+  wantThumbnails: boolean,
+  clipById: Map<string, ClipMetaRow>,
+  projectName: Map<string, string>,
+  filters: ClipFilters,
+  kindFilter: KindFilter,
+): Promise<NextResponse> {
+  const [kwResult, semResult] = await Promise.all([
+    keywordCandidates(supabase, q, clipById, filters, kindFilter),
+    semanticCandidates(supabase, q, framesOnly, clipById, filters, kindFilter),
+  ]);
+
+  // The keyword channel failing (bad query / DB error) is a hard failure for
+  // hybrid too — matches the pre-S5 default's behavior for the same inputs
+  // (it was keyword-only, so these exact conditions already 400/500'd).
+  if ("error" in kwResult) {
+    return NextResponse.json({ error: kwResult.error }, { status: kwResult.status });
+  }
+  const { terms, ranked: keywordRanked } = kwResult;
+
+  // The semantic channel failing (Modal down, misconfigured) must NOT take
+  // down what is now the default search endpoint — degrade to keyword-only
+  // ranking and report it via `warnings` instead of erroring the request.
+  const semanticRanked: EmbeddingRow[] = [];
+  let semanticWarning: string | null = null;
+  if ("error" in semResult) {
+    console.error(
+      `[search] hybrid: semantic channel unavailable (${semResult.status}): ${semResult.error}`,
+    );
+    semanticWarning = semResult.error;
+  } else {
+    // Group to one (best) row per clip for fusion purposes. semantic mode
+    // alone allows multiple frames per clip, but hybrid's dedup key is
+    // clip_id (see file header) — rows arrive pre-sorted best-first by the
+    // RPC (order by embedding <=> query, i.e. best cosine similarity first),
+    // so the first occurrence per clip_id is already its best frame.
+    const seen = new Set<string>();
+    for (const row of semResult.rows) {
+      if (seen.has(row.clip_id)) continue;
+      seen.add(row.clip_id);
+      semanticRanked.push(row);
+    }
+  }
+
+  const kwRankById = new Map<string, number>();
+  keywordRanked.forEach((row, i) => kwRankById.set(row.clip_id, i + 1)); // 1-based rank
+  const semRankById = new Map<string, number>();
+  semanticRanked.forEach((row, i) => semRankById.set(row.clip_id, i + 1));
+
+  const kwByClip = new Map(keywordRanked.map((r) => [r.clip_id, r]));
+  const semByClip = new Map(semanticRanked.map((r) => [r.clip_id, r]));
+
+  const allClipIds = new Set<string>([...kwRankById.keys(), ...semRankById.keys()]);
+
+  interface Fused {
+    clip_id: string;
+    score: number;
+    sources: HitSource[];
+    useKeyword: boolean; // which channel's row supplies the display fields
+  }
+  const fused: Fused[] = [];
+  for (const clipId of allClipIds) {
+    const kwRank = kwRankById.get(clipId) ?? null;
+    const semRank = semRankById.get(clipId) ?? null;
+
+    let score = 0;
+    const sources: HitSource[] = [];
+    if (kwRank !== null) {
+      score += 1 / (RRF_K + kwRank);
+      sources.push("keyword");
+    }
+    if (semRank !== null) {
+      score += 1 / (RRF_K + semRank);
+      sources.push("semantic");
+    }
+
+    // "Keeping the best-ranked representative" (lower rank number = better).
+    const useKeyword = kwRank !== null && (semRank === null || kwRank <= semRank);
+    fused.push({ clip_id: clipId, score, sources, useKeyword });
+  }
+
+  fused.sort((a, b) => b.score - a.score);
+
+  // Facets over the full fused, deduped (one row per clip_id), filtered
+  // candidate set, before slicing to `limit` — same "tally what's in memory"
+  // approach as the solo modes, just over the fused set instead of a single
+  // channel's.
+  const facets: Facets = { by_project: {}, by_kind: {} };
+  for (const f of fused) {
+    const clip = clipById.get(f.clip_id);
+    if (!clip) continue;
+    const projectKey = projectName.get(clip.project_id) ?? clip.project_id;
+    facets.by_project[projectKey] = (facets.by_project[projectKey] ?? 0) + 1;
+    const kind: HitKind = f.useKeyword ? kwByClip.get(f.clip_id)!.kind : "embedding";
+    facets.by_kind[kind] = (facets.by_kind[kind] ?? 0) + 1;
+  }
+
+  const top = fused.slice(0, limit);
+  const results: SearchHit[] = top.map((f) => {
+    const clip = clipById.get(f.clip_id)!;
+    if (f.useKeyword) {
+      return keywordHitFromRow(kwByClip.get(f.clip_id)!, clip, projectName, f.score, f.sources);
+    }
+    return semanticHitFromRow(semByClip.get(f.clip_id)!, clip, projectName, f.score, f.sources);
   });
 
   if (wantThumbnails) {
     await enrichThumbnails(supabase, results);
   }
 
-  return NextResponse.json({ query: q, terms: [], count: results.length, results, facets });
+  const body: {
+    query: string;
+    terms: string[];
+    count: number;
+    results: SearchHit[];
+    facets: Facets;
+    mode: "hybrid";
+    warnings?: string[];
+  } = {
+    query: q,
+    terms,
+    count: results.length,
+    results,
+    facets,
+    mode: "hybrid",
+  };
+  if (semanticWarning) {
+    body.warnings = [`semantic channel unavailable, degraded to keyword-only ranking: ${semanticWarning}`];
+  }
+  return NextResponse.json(body);
 }
 
 export async function GET(request: Request) {
@@ -478,8 +783,14 @@ export async function GET(request: Request) {
     Math.max(parseInt(url.searchParams.get("limit") ?? "20", 10) || 20, 1),
     50,
   );
-  const mode = (url.searchParams.get("mode") ?? "keyword").toLowerCase();
+  // S5 (#122): default is now "hybrid" (was "keyword"). Any unrecognized
+  // value — including no `mode` param at all — falls back to "hybrid",
+  // mirroring the pre-S5 convention that an unrecognized mode fell back to
+  // whatever the default was.
+  const rawMode = (url.searchParams.get("mode") ?? "hybrid").toLowerCase();
+  const mode = rawMode === "keyword" || rawMode === "semantic" ? rawMode : "hybrid";
   const wantThumbnails = url.searchParams.get("thumbnails") === "1";
+  const framesOnly = url.searchParams.get("pooled") !== "1";
 
   // ── Filter params (S7 #124) — validated for both modes ────────────────────
   const kindParsed = parseKindFilter(url.searchParams.get("kind"));
@@ -567,7 +878,6 @@ export async function GET(request: Request) {
   };
 
   if (mode === "semantic") {
-    const framesOnly = url.searchParams.get("pooled") !== "1";
     return semanticSearch(
       supabase,
       q,
@@ -581,46 +891,28 @@ export async function GET(request: Request) {
     );
   }
 
-  // ── Default: keyword mode via search_library_fts() (S2 #119) ──────────────
-  const terms = Array.from(new Set(tokenize(q)));
-  if (terms.length === 0) {
-    return NextResponse.json({ error: "q has no searchable terms" }, { status: 400 });
+  if (mode === "hybrid") {
+    return hybridSearch(
+      supabase,
+      q,
+      limit,
+      framesOnly,
+      wantThumbnails,
+      clipById,
+      projectName,
+      clipFilters,
+      kindFilter,
+    );
   }
 
-  const { data: rows, error: rpcError } = await supabase.rpc("search_library_fts", {
-    p_query: q,
-    p_limit: CANDIDATE_POOL_LIMIT,
-  });
-  if (rpcError) {
-    return NextResponse.json({ error: rpcError.message }, { status: 500 });
+  // ── mode === "keyword": search_library_fts() (S2 #119) ────────────────────
+  // This is the exact same code path the pre-S5 default used — explicit
+  // `mode=keyword` is a byte-for-byte behavior override, not a new mode.
+  const kwResult = await keywordCandidates(supabase, q, clipById, clipFilters, kindFilter);
+  if ("error" in kwResult) {
+    return NextResponse.json({ error: kwResult.error }, { status: kwResult.status });
   }
-  const ftsRows = (rows ?? []) as FtsRow[];
-
-  // `kind` gates which FTS row kinds are even eligible — mirrors S7's
-  // original "gate candidate generation, not exclude the clip" design, now
-  // applied to the RPC's output instead of in-process candidate generation.
-  const wantSpeech = kindFilter !== "visual";
-  const wantVisual = kindFilter !== "speech";
-  function kindAllowed(k: FtsHitKind): boolean {
-    if (k === "transcript") return wantSpeech;
-    return wantVisual; // visual_description | highlight
-  }
-
-  // Best-scoring eligible row per clip → one hit per clip (mirrors the S1
-  // MVP's per-clip "best candidate wins" behavior), with the S7 clip-level
-  // filters (project/duration/date) applied at grouping time so both the
-  // facets and the sliced `results` reflect the same filtered candidate set.
-  const bestByClip = new Map<string, FtsRow>();
-  for (const row of ftsRows) {
-    if (!kindAllowed(row.kind)) continue;
-    const clip = clipById.get(row.clip_id);
-    if (!clip) continue; // RLS or a race (clip deleted) — drop rather than 500.
-    if (!clipPassesFilters(clip, clipFilters)) continue;
-    const current = bestByClip.get(row.clip_id);
-    if (!current || row.score > current.score) bestByClip.set(row.clip_id, row);
-  }
-
-  const ranked = Array.from(bestByClip.values()).sort((a, b) => b.score - a.score);
+  const { terms, ranked } = kwResult;
 
   // Facets: counted over the full filtered candidate set, BEFORE slicing to
   // `limit` — no extra DB round-trips, just a tally over data already in
@@ -637,27 +929,16 @@ export async function GET(request: Request) {
 
   const top = ranked.slice(0, limit);
   if (top.length === 0) {
-    return NextResponse.json({ query: q, terms, count: 0, results: [], facets });
+    return NextResponse.json({ query: q, terms, count: 0, results: [], facets, mode: "keyword" });
   }
 
-  const results: SearchHit[] = top.map((row) => {
-    const clip = clipById.get(row.clip_id)!;
-    return {
-      clip_id: row.clip_id,
-      project: projectName.get(clip.project_id) ?? null,
-      project_id: clip.project_id,
-      filename: clip.filename,
-      duration: normalizeDuration(clip.duration_secs),
-      kind: row.kind,
-      timestamp: row.timestamp,
-      snippet: (row.snippet ?? "").trim(),
-      score: row.score,
-    };
-  });
+  const results: SearchHit[] = top.map((row) =>
+    keywordHitFromRow(row, clipById.get(row.clip_id)!, projectName, row.score, ["keyword"]),
+  );
 
   if (wantThumbnails) {
     await enrichThumbnails(supabase, results);
   }
 
-  return NextResponse.json({ query: q, terms, count: results.length, results, facets });
+  return NextResponse.json({ query: q, terms, count: results.length, results, facets, mode: "keyword" });
 }
