@@ -2947,7 +2947,8 @@ detection_image_open = _mount_detection_helpers(
     _detection_base
     # Default PyPI wheels (CUDA build) — the OWLv2 worker runs on a GPU.
     .pip_install("torch==2.4.1", "torchvision==0.19.1")
-    .pip_install("transformers>=4.44,<5", "pillow>=10")
+    # scipy: Owlv2ImageProcessor's post-processing requires it at runtime.
+    .pip_install("transformers>=4.44,<5", "pillow>=10", "scipy>=1.11")
     # Bake OWLv2 into the HF cache; the offline env vars then pin it so the
     # (network-restricted) runtime never phones home.
     .run_commands(
