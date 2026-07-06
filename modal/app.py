@@ -2901,7 +2901,8 @@ DETECT_MAX_LABELS = 60                # cap prompt classes per open-vocab run
 
 detection_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "libgl1", "libglib2.0-0")  # libgl1 for opencv/ultralytics
+    # git: pip installs YOLO-World's CLIP text encoder from a git+ URL below.
+    .apt_install("ffmpeg", "libgl1", "libglib2.0-0", "git")  # libgl1 for opencv/ultralytics
     .pip_install(
         "torch==2.4.1",
         "torchvision==0.19.1",
