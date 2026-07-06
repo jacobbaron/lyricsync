@@ -3,6 +3,7 @@ export const dynamic = "force-dynamic";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { StoryViewer } from "./StoryViewer";
+import { LibrarySearch } from "./LibrarySearch";
 
 interface Props {
   params: Promise<{ id: string }>;
@@ -51,6 +52,8 @@ export default async function StoryPage({ params }: Props) {
         </h1>
 
         <StoryViewer storyId={storyId} initialStory={story} />
+
+        <LibrarySearch storyId={storyId} />
       </div>
     </main>
   );
