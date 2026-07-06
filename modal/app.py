@@ -2903,36 +2903,60 @@ DETECT_CONF = 0.25
 DETECT_OPEN_CONF = 0.1                # OWLv2 scores run low; 0.1 balances recall vs noise
 DETECT_MAX_LABELS = 60                # cap prompt classes per open-vocab run
 
-detection_image = (
+# Closed-set (CPU) and open-vocab (GPU) run on separate images so the CPU
+# worker — which T5 ingest/backfill hits at library scale — never ships the
+# ~2 GB of CUDA torch libraries only the GPU OWLv2 worker uses.
+_detection_base = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "libgl1", "libglib2.0-0")  # libgl1 for opencv/ultralytics
-    # Default PyPI wheels (CUDA build): the open-vocab worker runs OWLv2 on a
-    # GPU; the closed worker just uses the same wheels on CPU.
-    .pip_install("torch==2.4.1", "torchvision==0.19.1")
     .pip_install(
         "fastapi[standard]>=0.115",
         "boto3>=1.34",
         "supabase>=2.10",
-        "ultralytics>=8.2,<9",     # closed-set YOLOv8n (COCO)
-        "transformers>=4.44,<5",   # open-vocab OWLv2
-        "pillow>=10",
         "numpy>=1.26",
     )
-    # Bake both detectors' weights into the image so the worker never downloads
-    # at runtime. ultralytics fetches to CWD (/root); OWLv2 caches under the HF
-    # cache — which the offline env vars below then pin so runtime never phones
-    # home from the (network-restricted) container.
+)
+
+
+def _mount_detection_helpers(img):
+    """Mount the local helper modules every detection function imports (added
+    last: local files bust the image cache)."""
+    return (
+        img.add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+        .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
+        .add_local_file(Path(__file__).parent / "detection.py", "/root/detection.py")
+    )
+
+
+detection_image = _mount_detection_helpers(
+    _detection_base
+    # CPU-only torch wheels (closed-set YOLOv8n never touches a GPU).
+    .pip_install(
+        "torch==2.4.1", "torchvision==0.19.1",
+        index_url="https://download.pytorch.org/whl/cpu",
+    )
+    .pip_install("ultralytics>=8.2,<9")  # closed-set YOLOv8n (COCO)
+    # Bake weights so the worker never downloads at runtime (ultralytics
+    # fetches to CWD; /root is the container CWD).
     .run_commands(
         "cd /root && python -c \"from ultralytics import YOLO; YOLO('yolov8n.pt')\"",
+    )
+)
+
+detection_image_open = _mount_detection_helpers(
+    _detection_base
+    # Default PyPI wheels (CUDA build) — the OWLv2 worker runs on a GPU.
+    .pip_install("torch==2.4.1", "torchvision==0.19.1")
+    .pip_install("transformers>=4.44,<5", "pillow>=10")
+    # Bake OWLv2 into the HF cache; the offline env vars then pin it so the
+    # (network-restricted) runtime never phones home.
+    .run_commands(
         "python -c \""
         "from transformers import Owlv2Processor, Owlv2ForObjectDetection; "
         f"Owlv2Processor.from_pretrained('{DETECT_OPEN_HF_ID}'); "
         f"Owlv2ForObjectDetection.from_pretrained('{DETECT_OPEN_HF_ID}')\"",
     )
     .env({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
-    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
-    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
-    .add_local_file(Path(__file__).parent / "detection.py", "/root/detection.py")
 )
 
 _DETECT_MODEL_CACHE: dict = {}
@@ -3040,7 +3064,7 @@ def _detect_worker(signal_id: str) -> None:
     _run_detect(signal_id)
 
 
-@app.function(image=detection_image, secrets=secrets, timeout=1800, gpu="T4")
+@app.function(image=detection_image_open, secrets=secrets, timeout=1800, gpu="T4")
 def _detect_worker_open(signal_id: str) -> None:
     """Open-vocab (OWLv2) detection worker — GPU. See `_run_detect`."""
     _run_detect(signal_id)
