@@ -12,7 +12,7 @@ export const runtime = "nodejs";
 //
 // Body (all optional):
 //   mode    — "closed" (default) → YOLOv8n / COCO 80 classes
-//             "open"             → YOLO-World open-vocabulary
+//             "open"             → OWLv2 open-vocabulary (GPU-backed)
 //   labels  — string[]; open-vocab text prompts (e.g. ["insulation",
 //             "tape measure"]). Ignored for closed mode. When omitted in open
 //             mode the worker seeds a default list from the clip's
