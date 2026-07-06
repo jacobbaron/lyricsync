@@ -306,6 +306,61 @@ export async function POST(
       }
     }
 
+    // Kick off clip embedding (SEARCH S4, #121) for any transcribed/aligned
+    // clip that doesn't already have a run done or in flight — same
+    // auto-enqueue-on-ingest idea as the visual/audio analysis above, so
+    // semantic search (S3, #119/#120) has recall without a manual
+    // POST .../embed per clip. Standalone hook: #112 (perception-on-ingest)
+    // doesn't exist yet, so this lives here rather than in unified
+    // ingest-time machinery — fold it into #112 once it ships. Best-effort:
+    // a failure here must not fail the merge.
+    const embedUrl =
+      process.env.MODAL_EMBED_URL ??
+      "https://jacobbaron--lyricsync-embed-clip.modal.run";
+    if (webhookSecret) {
+      for (const clip of transcribedClips) {
+        try {
+          const { data: existingEmbed } = await supabase
+            .from("clip_signals")
+            .select("id")
+            .eq("clip_id", clip.id)
+            .eq("kind", "embedding")
+            .in("status", ["processing", "done"])
+            .limit(1);
+          if (existingEmbed && existingEmbed.length > 0) continue;
+
+          const { data: signal } = await supabase
+            .from("clip_signals")
+            .insert({ clip_id: clip.id, kind: "embedding", status: "processing" })
+            .select("id")
+            .single();
+          if (!signal) continue;
+
+          const signalId = signal.id;
+          after(async () => {
+            try {
+              const res = await fetch(embedUrl, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-webhook-secret": webhookSecret,
+                },
+                body: JSON.stringify({ signal_id: signalId }),
+              });
+              if (!res.ok) {
+                const text = await res.text().catch(() => "");
+                console.error(`[merge] embed trigger ${res.status}: ${text}`);
+              }
+            } catch (err) {
+              console.error("[merge] embed trigger failed:", err);
+            }
+          });
+        } catch (err) {
+          console.error("[merge] embed spawn failed (non-fatal):", err);
+        }
+      }
+    }
+
     return NextResponse.json({
       words: allWords.length,
       clips: transcribedClips.length,
