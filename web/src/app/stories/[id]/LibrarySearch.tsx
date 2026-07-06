@@ -230,20 +230,28 @@ export function LibrarySearch({ storyId }: Props) {
   }, []);
 
   // Load the story's current timeline once, so "added" clips can be
-  // reflected against a real base_revision (optimistic concurrency).
-  const loadTimeline = useCallback(async () => {
+  // reflected against a real base_revision (optimistic concurrency). Returns
+  // the freshly fetched state (or null on failure) so callers that need the
+  // just-fetched revision synchronously — e.g. the 409-retry path below —
+  // don't have to rely on `timeline` state, which only updates on the next
+  // render and would otherwise still read the stale value that just caused
+  // the conflict.
+  const loadTimeline = useCallback(async (): Promise<TimelineState | null> => {
     try {
       const res = await fetch(`/api/stories/${storyId}/timeline`);
-      if (!res.ok) return;
+      if (!res.ok) return null;
       const data = await res.json();
-      setTimeline({
+      const next: TimelineState = {
         revision: data.revision ?? 0,
         items: findVideoItems(data.timeline),
         initialized: data.timeline != null,
-      });
+      };
+      setTimeline(next);
+      return next;
     } catch {
       // Best-effort — add-to-timeline still works without a cached revision;
       // the edit endpoint just applies against whatever's current.
+      return null;
     }
   }, [storyId]);
 
@@ -263,6 +271,11 @@ export function LibrarySearch({ storyId }: Props) {
       return;
     }
     setLoading(true);
+    // AbortController guards against out-of-order responses: if the query or
+    // filters change again before this fetch resolves, the effect cleanup
+    // below aborts it, so a slower earlier response can never overwrite a
+    // faster later one.
+    const controller = new AbortController();
     debounceRef.current = setTimeout(async () => {
       const params = new URLSearchParams();
       params.set("q", q);
@@ -277,7 +290,9 @@ export function LibrarySearch({ storyId }: Props) {
       if (until.trim()) params.set("until", until.trim());
 
       try {
-        const res = await fetch(`/api/search?${params.toString()}`);
+        const res = await fetch(`/api/search?${params.toString()}`, {
+          signal: controller.signal,
+        });
         const data: SearchResponse = await res.json();
         if (!res.ok) {
           setSearchError(data.error ?? `Search failed (${res.status})`);
@@ -289,6 +304,7 @@ export function LibrarySearch({ storyId }: Props) {
         setResults(data.results ?? []);
         setSearchWarnings(data.warnings ?? []);
       } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
         setSearchError(err instanceof Error ? err.message : "Network error");
         setResults([]);
       } finally {
@@ -298,6 +314,7 @@ export function LibrarySearch({ storyId }: Props) {
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
+      controller.abort();
     };
   }, [query, mode, kindFilter, selectedProjects, minDuration, maxDuration, since, until]);
 
@@ -314,8 +331,20 @@ export function LibrarySearch({ storyId }: Props) {
   // path (POST /api/stories/[id]/edit — see docs/cross_project_editing.md
   // and docs/timeline_editing.md) rather than a new mechanism. On a 409
   // revision conflict, refetch the current revision and retry once.
+  //
+  // `revisionOverride` carries the freshly-fetched revision into the retry.
+  // It must NOT come from `timeline?.revision` in the closure: setTimeline
+  // inside loadTimeline() only takes effect on the *next* render, so the
+  // synchronous recursive call below would otherwise still read the same
+  // stale revision that just caused the 409 — a retry that can never
+  // actually recover. Passing loadTimeline()'s return value explicitly
+  // sidesteps that stale-closure trap.
   const addToTimeline = useCallback(
-    async (hit: SearchHit, attempt = 0): Promise<void> => {
+    async (
+      hit: SearchHit,
+      attempt = 0,
+      revisionOverride?: number | null,
+    ): Promise<void> => {
       const key = `${hit.clip_id}@${hit.timestamp ?? "whole"}`;
       setAddingId(key);
       setAddError(null);
@@ -329,20 +358,23 @@ export function LibrarySearch({ storyId }: Props) {
         src_end,
       };
 
+      const baseRevision =
+        revisionOverride !== undefined ? revisionOverride : (timeline?.revision ?? null);
+
       try {
         const res = await fetch(`/api/stories/${storyId}/edit`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ops: [op],
-            base_revision: timeline?.revision ?? null,
+            base_revision: baseRevision,
           }),
         });
         const data = await res.json();
 
         if (res.status === 409 && attempt === 0) {
-          await loadTimeline();
-          return addToTimeline(hit, attempt + 1);
+          const fresh = await loadTimeline();
+          return addToTimeline(hit, attempt + 1, fresh?.revision ?? null);
         }
         if (!res.ok) {
           setAddError(data.detail ?? data.error ?? `Add failed (${res.status})`);
