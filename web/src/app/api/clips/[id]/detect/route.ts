@@ -4,11 +4,19 @@ import { resolveAuth } from "@/lib/auth/resolve";
 export const runtime = "nodejs";
 
 // ── POST /api/clips/[id]/detect ─────────────────────────────────────────────
-// PERCEPTION T5: kicks off a closed-set object-detection run (YOLOv8n / COCO)
-// for a clip. Creates a clip_signals row (kind=detection) up front and fires
-// the Modal worker; poll GET /api/clips/[id]/signals?kind=detection — the
-// compact per-class inventory is in `result` and the full per-frame boxes are
-// in the presigned `sidecar_url` (detections.json).
+// PERCEPTION T5/T6: kicks off an object-detection run for a clip. Creates a
+// clip_signals row (kind=detection) up front and fires the Modal worker; poll
+// GET /api/clips/[id]/signals?kind=detection — the compact per-class inventory
+// is in `result` and the full per-frame boxes are in the presigned
+// `sidecar_url` (detections.json).
+//
+// Body (all optional):
+//   mode    — "closed" (default) → YOLOv8n / COCO 80 classes
+//             "open"             → YOLO-World open-vocabulary
+//   labels  — string[]; open-vocab text prompts (e.g. ["insulation",
+//             "tape measure"]). Ignored for closed mode. When omitted in open
+//             mode the worker seeds a default list from the clip's
+//             visual_description + a DIY glossary.
 //
 // API-key callable (Authorization: Bearer lsk_...).
 
@@ -23,6 +31,14 @@ export async function POST(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   const { supabase } = auth;
+
+  const body = await request.json().catch(() => ({}));
+  const mode = body?.mode === "open" ? "open" : "closed";
+  const rawLabels = Array.isArray(body?.labels) ? body.labels : [];
+  const labels = rawLabels
+    .filter((l: unknown): l is string => typeof l === "string")
+    .map((l: string) => l.trim())
+    .filter((l: string) => l.length > 0);
 
   const { data: clip } = await supabase
     .from("clips")
@@ -40,9 +56,12 @@ export async function POST(
     );
   }
 
+  const params =
+    mode === "open" ? { mode, labels } : { mode };
+
   const { data: signal, error } = await supabase
     .from("clip_signals")
-    .insert({ clip_id: clipId, kind: "detection", status: "processing" })
+    .insert({ clip_id: clipId, kind: "detection", status: "processing", params })
     .select("id")
     .single();
 
@@ -86,7 +105,7 @@ export async function POST(
   }
 
   return NextResponse.json(
-    { id: signal.id, kind: "detection", status: "processing" },
+    { id: signal.id, kind: "detection", status: "processing", mode, params },
     { status: 202 },
   );
 }

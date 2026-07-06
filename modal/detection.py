@@ -23,10 +23,66 @@ inventory + summary.
 
 from __future__ import annotations
 
+import re
+
 DETECTION_VERSION = 1
 
 DEFAULT_IOU_THRESHOLD = 0.3   # min IoU to link a box to an existing tracklet
 DEFAULT_MAX_GAP_FRAMES = 2    # keep a tracklet alive across this many missed frames
+
+# Open-vocab (T6) default prompt glossary — the DIY/workshop props that recur in
+# this footage and that COCO's 80 closed-set classes miss. Used only as a
+# fallback / seed when a run doesn't pass an explicit `labels` list.
+DIY_GLOSSARY = [
+    "insulation", "tape measure", "jigsaw", "circular saw", "drill",
+    "staple gun", "utility knife", "level", "stud finder", "caulk gun",
+    "MDF board", "plywood", "drywall", "2x4 lumber", "flatbed cart",
+    "shopping cart", "paint can", "paint roller", "paintbrush", "ladder",
+    "sawhorse", "clamp", "screw", "nail", "hammer", "screwdriver",
+    "wrench", "pliers", "safety glasses", "work gloves", "dust mask",
+    "extension cord", "shop vac", "bucket", "toolbox",
+]
+
+# Very small stoplist so `derive_open_labels` can pull plausible object words out
+# of a free-text visual_description without any NLP dependency.
+_STOPWORDS = frozenset("""
+a an the and or of to in on at with for from into over under near by is are was
+were be being been this that these those it its their his her they he she we you
+your our as but if then than so very more most some any each few many much all
+both then here there where when while during video clip shot scene frame footage
+person people man woman guy someone looking holding standing sitting wearing
+""".split())
+
+
+def derive_open_labels(
+    visual_description: str | None,
+    extra: list[str] | None = None,
+    max_labels: int = 30,
+) -> list[str]:
+    """Build a default open-vocab prompt list when a run passes no `labels`.
+
+    Seeds from candidate object words mined out of the clip's
+    `visual_description` (crude noun-ish tokens: alpha words ≥3 chars, minus a
+    small stoplist) plus the DIY glossary, de-duplicated, description words
+    first. This is only a fallback — callers should pass explicit `labels`.
+    """
+    seen: dict[str, None] = {}
+
+    def add(label: str) -> None:
+        norm = label.strip().lower()
+        if norm and norm not in seen and len(seen) < max_labels:
+            seen[norm] = None
+
+    for word in re.findall(r"[a-zA-Z][a-zA-Z\-']+", visual_description or ""):
+        w = word.lower()
+        if len(w) >= 3 and w not in _STOPWORDS:
+            add(w)
+    for label in extra or []:
+        add(label)
+    for label in DIY_GLOSSARY:
+        add(label)
+
+    return list(seen.keys())
 
 
 def iou(a: list[float], b: list[float]) -> float:
@@ -179,12 +235,20 @@ def build_inventory(
 
 def build_detection_result(
     frames: list[dict], tracklets: list[dict], fps_sampled: float, model: str,
+    mode: str = "closed", query: list[str] | None = None,
 ) -> dict:
-    """Compact result for the `clip_signals.result` column (inventory + summary)."""
+    """Compact result for the `clip_signals.result` column (inventory + summary).
+
+    `mode` ('closed' | 'open') and, for open-vocab runs, `query` (the text
+    label list the detector was asked for) are echoed back so a caller reading
+    the signal knows exactly what was searched — including queried labels that
+    matched nothing (absent from `inventory`).
+    """
     inventory = build_inventory(frames, tracklets, fps_sampled)
     classes = sorted(inventory, key=lambda c: inventory[c]["screen_time"], reverse=True)
-    return {
+    result = {
         "model": model,
+        "mode": mode,
         "inventory": inventory,
         "summary": {
             "classes": classes,
@@ -192,23 +256,31 @@ def build_detection_result(
             "n_frames": len(frames),
         },
     }
+    if query is not None:
+        result["query"] = query
+    return result
 
 
 def build_detection_doc(
     frames: list[dict], duration: float, fps_sampled: float, model: str,
     tracklets: list[dict] | None = None,
+    mode: str = "closed", query: list[str] | None = None,
 ) -> dict:
     """Assemble the full stored sidecar document (per-frame boxes + tracklets)."""
     if tracklets is None:
         tracklets = track_detections(frames)
     inventory = build_inventory(frames, tracklets, fps_sampled)
-    return {
+    doc = {
         "version": DETECTION_VERSION,
         "duration": round(float(duration), 3),
         "fps_sampled": fps_sampled,
         "model": model,
+        "mode": mode,
         "n_frames": len(frames),
         "frames": frames,
         "tracklets": [summarize_tracklet(tr) for tr in tracklets],
         "inventory": inventory,
     }
+    if query is not None:
+        doc["query"] = query
+    return doc

@@ -122,6 +122,9 @@ class TestBuildResultAndDoc:
         tracks = d.track_detections(frames)
         res = d.build_detection_result(frames, tracks, fps_sampled=2.0, model="yolov8n")
         assert res["model"] == "yolov8n"
+        # closed mode is the default and no query is echoed
+        assert res["mode"] == "closed"
+        assert "query" not in res
         # person has more screen time than chair → ranked first
         assert res["summary"]["classes"][0] == "person"
         assert res["summary"]["n_frames"] == 2
@@ -133,8 +136,54 @@ class TestBuildResultAndDoc:
         frames = [_frame(0.0, ("person", 0.9, [0, 0, 10, 20]))]
         doc = d.build_detection_doc(frames, duration=1.0, fps_sampled=2.0, model="yolov8n")
         assert doc["version"] == d.DETECTION_VERSION
+        assert doc["mode"] == "closed"
         assert doc["n_frames"] == 1
         assert doc["frames"] == frames
         tr = doc["tracklets"][0]
         assert tr["class"] == "person" and tr["n_frames"] == 1
         assert "mean_box" in tr and "boxes" not in tr  # summarized
+
+    def test_open_mode_echoes_mode_and_query(self):
+        # Open-vocab shaping is identical; only mode/query metadata differ, and
+        # a queried label that matched nothing is absent from inventory.
+        frames = [_frame(0.0, ("tape measure", 0.4, [0, 0, 10, 20]))]
+        tracks = d.track_detections(frames)
+        query = ["tape measure", "flatbed cart"]
+        res = d.build_detection_result(
+            frames, tracks, fps_sampled=2.0, model="yolov8s-world",
+            mode="open", query=query,
+        )
+        assert res["mode"] == "open"
+        assert res["query"] == query
+        assert "tape measure" in res["inventory"]
+        assert "flatbed cart" not in res["inventory"]  # queried, never seen
+        doc = d.build_detection_doc(
+            frames, duration=1.0, fps_sampled=2.0, model="yolov8s-world",
+            tracklets=tracks, mode="open", query=query,
+        )
+        assert doc["mode"] == "open" and doc["query"] == query
+
+
+class TestDeriveOpenLabels:
+    def test_seeds_from_description_then_glossary(self):
+        labels = d.derive_open_labels("A workshop bench with a jigsaw and MDF board")
+        # description nouns come first, lowercased + stopwords dropped
+        assert labels[0] == "workshop"
+        assert "bench" in labels and "jigsaw" in labels
+        assert "with" not in labels and "and" not in labels  # stopwords
+        # glossary is appended as a fallback seed
+        assert "tape measure" in labels
+
+    def test_dedupes_and_respects_cap(self):
+        labels = d.derive_open_labels("drill drill DRILL", max_labels=5)
+        assert labels.count("drill") == 1
+        assert len(labels) <= 5
+
+    def test_extra_labels_included_before_glossary(self):
+        labels = d.derive_open_labels(None, extra=["Rockwool insulation"])
+        assert "rockwool insulation" in labels
+
+    def test_empty_description_falls_back_to_glossary(self):
+        labels = d.derive_open_labels(None)
+        assert labels == [g.lower() for g in d.DIY_GLOSSARY][: len(labels)]
+        assert "insulation" in labels
