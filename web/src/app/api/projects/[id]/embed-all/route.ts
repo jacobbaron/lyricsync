@@ -109,6 +109,28 @@ export async function POST(
     });
   }
 
+  const embedUrl =
+    process.env.MODAL_EMBED_URL ??
+    "https://jacobbaron--lyricsync-embed-clip.modal.run";
+  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
+
+  // Guard signal creation on the secret being configured — a clip_signals row
+  // with no corresponding Modal dispatch is a permanent false-positive for the
+  // in-flight check above (nothing would ever flip it out of "processing"),
+  // silently and permanently excluding that clip from every future backfill
+  // call. Mirrors merge/route.ts, which only ever inserts a signal row inside
+  // the `if (webhookSecret)` guard.
+  if (!webhookSecret) {
+    console.warn(
+      "[embed-all] MODAL_WEBHOOK_SECRET not set — embeds not triggered",
+    );
+    return NextResponse.json({
+      enqueued: 0,
+      skipped,
+      already_done: alreadyDone,
+    });
+  }
+
   // Create the clip_signals rows synchronously (cheap DB writes) so the
   // summary below is accurate even while the deferred Modal spawns are still
   // trickling out below.
@@ -129,12 +151,7 @@ export async function POST(
     signalIds.push(signal.id);
   }
 
-  const embedUrl =
-    process.env.MODAL_EMBED_URL ??
-    "https://jacobbaron--lyricsync-embed-clip.modal.run";
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-
-  if (webhookSecret && signalIds.length > 0) {
+  if (signalIds.length > 0) {
     // One after() callback that walks the list sequentially — deliberately
     // NOT one after() per clip (that would fire every spawn concurrently,
     // exactly what we're avoiding for a library-wide backfill).
@@ -161,10 +178,6 @@ export async function POST(
         await sleep(SPAWN_DELAY_MS);
       }
     });
-  } else if (!webhookSecret) {
-    console.warn(
-      "[embed-all] MODAL_WEBHOOK_SECRET not set — embeds not triggered",
-    );
   }
 
   return NextResponse.json({
