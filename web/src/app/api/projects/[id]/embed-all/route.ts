@@ -99,7 +99,12 @@ export async function POST(
     (id) => !doneSet.has(id) && !inFlightSet.has(id),
   );
   const alreadyDone = doneSet.size;
-  const skipped = inFlightSet.size;
+  // Exclude clips that are in both sets (fully embedded but with a stale
+  // in-flight signal) so enqueued + skipped + already_done doesn't
+  // double-count them and exceed the actual clip count.
+  const skipped = clipIds.filter(
+    (id) => !doneSet.has(id) && inFlightSet.has(id),
+  ).length;
 
   if (toEmbed.length === 0) {
     return NextResponse.json({
