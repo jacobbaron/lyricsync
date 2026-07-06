@@ -2892,45 +2892,44 @@ async def embed_text(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 DETECT_MODEL = "yolov8n"              # COCO 80-class nano detector — fast on CPU
-DETECT_OPEN_MODEL = "yolov8s-world"   # open-vocab (YOLO-World) — arbitrary text prompts
+# Open-vocab (T6/T7): OWLv2 grounds arbitrary text prompts far better than
+# YOLO-World did on diffuse material props (e.g. "insulation"), at the cost of
+# needing a GPU to stay fast — hence the separate GPU worker below.
+DETECT_OPEN_MODEL = "owlv2-base-patch16-ensemble"
+DETECT_OPEN_HF_ID = "google/owlv2-base-patch16-ensemble"
 DETECT_SAMPLE_FPS = 2.0
 DETECT_MAX_FRAMES = 300
 DETECT_CONF = 0.25
-DETECT_OPEN_CONF = 0.05               # open-vocab scores run lower — keep recall up
+DETECT_OPEN_CONF = 0.1                # OWLv2 scores run low; 0.1 balances recall vs noise
 DETECT_MAX_LABELS = 60                # cap prompt classes per open-vocab run
 
 detection_image = (
     modal.Image.debian_slim(python_version="3.11")
-    # git: pip installs YOLO-World's CLIP text encoder from a git+ URL below.
-    .apt_install("ffmpeg", "libgl1", "libglib2.0-0", "git")  # libgl1 for opencv/ultralytics
-    .pip_install(
-        "torch==2.4.1",
-        "torchvision==0.19.1",
-        index_url="https://download.pytorch.org/whl/cpu",
-    )
+    .apt_install("ffmpeg", "libgl1", "libglib2.0-0")  # libgl1 for opencv/ultralytics
+    # Default PyPI wheels (CUDA build): the open-vocab worker runs OWLv2 on a
+    # GPU; the closed worker just uses the same wheels on CPU.
+    .pip_install("torch==2.4.1", "torchvision==0.19.1")
     .pip_install(
         "fastapi[standard]>=0.115",
         "boto3>=1.34",
         "supabase>=2.10",
-        "ultralytics>=8.2,<9",
+        "ultralytics>=8.2,<9",     # closed-set YOLOv8n (COCO)
+        "transformers>=4.44,<5",   # open-vocab OWLv2
+        "pillow>=10",
         "numpy>=1.26",
-        # YOLO-World's set_classes() encodes the text prompts with CLIP; pin it
-        # so the encoder is baked into the image instead of auto-installed on
-        # the first (network-restricted) run.
-        "clip @ git+https://github.com/ultralytics/CLIP.git",
-        "ftfy",
-        "regex",
     )
     # Bake both detectors' weights into the image so the worker never downloads
-    # at runtime (ultralytics fetches to CWD; /root is the container CWD). The
-    # set_classes() call also pre-fetches the CLIP text encoder used by
-    # open-vocab prompts.
+    # at runtime. ultralytics fetches to CWD (/root); OWLv2 caches under the HF
+    # cache — which the offline env vars below then pin so runtime never phones
+    # home from the (network-restricted) container.
     .run_commands(
         "cd /root && python -c \"from ultralytics import YOLO; YOLO('yolov8n.pt')\"",
-        "cd /root && python -c \""
-        "from ultralytics import YOLO; "
-        "m = YOLO('yolov8s-world.pt'); m.set_classes(['person'])\"",
+        "python -c \""
+        "from transformers import Owlv2Processor, Owlv2ForObjectDetection; "
+        f"Owlv2Processor.from_pretrained('{DETECT_OPEN_HF_ID}'); "
+        f"Owlv2ForObjectDetection.from_pretrained('{DETECT_OPEN_HF_ID}')\"",
     )
+    .env({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
     .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
     .add_local_file(Path(__file__).parent / "detection.py", "/root/detection.py")
@@ -2939,18 +2938,68 @@ detection_image = (
 _DETECT_MODEL_CACHE: dict = {}
 
 
-def _load_detect_model(mode: str = "closed"):
-    """Load (and cache) the detector for a run. `closed` → YOLOv8n/COCO;
-    `open` → YOLO-World (open-vocab, prompted per call via set_classes)."""
+def _load_detect_model():
+    """Load (and cache) the closed-set YOLOv8n/COCO detector."""
     from ultralytics import YOLO
 
-    key = "open" if mode == "open" else "closed"
-    m = _DETECT_MODEL_CACHE.get(key)
+    m = _DETECT_MODEL_CACHE.get("closed")
     if m is None:
-        weights = "/root/yolov8s-world.pt" if key == "open" else "/root/yolov8n.pt"
-        m = YOLO(weights)
-        _DETECT_MODEL_CACHE[key] = m
+        m = YOLO("/root/yolov8n.pt")
+        _DETECT_MODEL_CACHE["closed"] = m
     return m
+
+
+def _load_owlv2():
+    """Load (and cache) the open-vocab OWLv2 detector → (processor, model, device).
+
+    Runs on GPU when available (the `_detect_worker_open` function requests one),
+    else falls back to CPU."""
+    import torch
+    from transformers import Owlv2ForObjectDetection, Owlv2Processor
+
+    cached = _DETECT_MODEL_CACHE.get("open")
+    if cached is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        proc = Owlv2Processor.from_pretrained(DETECT_OPEN_HF_ID)
+        model = Owlv2ForObjectDetection.from_pretrained(DETECT_OPEN_HF_ID)
+        model = model.to(device).eval()
+        cached = (proc, model, device)
+        _DETECT_MODEL_CACHE["open"] = cached
+    return cached
+
+
+def _detect_open_frames(frame_paths, labels, conf) -> list[dict]:
+    """Run OWLv2 open-vocab detection per frame → the same per-frame detection
+    shape the closed path emits: [{"t", "detections":[{class, conf, box}]}].
+
+    Boxes come back in the sampled-frame pixel space (target_sizes = frame h,w),
+    matching the closed detector, so detection.py shaping is reused unchanged.
+    """
+    import torch
+    from PIL import Image
+
+    proc, model, device = _load_owlv2()
+    frames: list[dict] = []
+    for i, path in enumerate(frame_paths):
+        img = Image.open(path).convert("RGB")
+        inputs = proc(text=[labels], images=img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = model(**inputs)
+        target = torch.tensor([[img.height, img.width]], device=device)
+        res = proc.post_process_grounded_object_detection(
+            out, target_sizes=target, threshold=conf,
+        )[0]
+        dets = []
+        for box, score, lab in zip(
+            res["boxes"].tolist(), res["scores"].tolist(), res["labels"].tolist()
+        ):
+            dets.append({
+                "class": labels[int(lab)],
+                "conf": round(float(score), 3),
+                "box": [round(float(v), 1) for v in box],
+            })
+        frames.append({"t": round(i / DETECT_SAMPLE_FPS, 3), "detections": dets})
+    return frames
 
 
 @app.function(image=detection_image, secrets=secrets, timeout=60)
@@ -2970,19 +3019,41 @@ async def detect_objects(request: Request) -> JSONResponse:
     if not signal_id:
         raise HTTPException(status_code=400, detail="signal_id required")
 
-    await _detect_worker.spawn.aio(signal_id)
+    # Route open-vocab (OWLv2) runs to the GPU worker; closed-set (YOLOv8n)
+    # stays on the cheaper CPU worker. The mode lives on the pre-created row.
+    sb = _supabase()
+    row = (
+        sb.table("clip_signals").select("params")
+        .eq("id", signal_id).limit(1).execute()
+    )
+    params = (row.data[0].get("params") if row.data else None) or {}
+    if params.get("mode") == "open":
+        await _detect_worker_open.spawn.aio(signal_id)
+    else:
+        await _detect_worker.spawn.aio(signal_id)
     return JSONResponse({"status": "accepted"})
 
 
 @app.function(image=detection_image, secrets=secrets, timeout=1800)
 def _detect_worker(signal_id: str) -> None:
-    """Object-detection worker (PERCEPTION T5 closed-set + T6 open-vocab).
+    """Closed-set (YOLOv8n/COCO) detection worker — CPU. See `_run_detect`."""
+    _run_detect(signal_id)
+
+
+@app.function(image=detection_image, secrets=secrets, timeout=1800, gpu="T4")
+def _detect_worker_open(signal_id: str) -> None:
+    """Open-vocab (OWLv2) detection worker — GPU. See `_run_detect`."""
+    _run_detect(signal_id)
+
+
+def _run_detect(signal_id: str) -> None:
+    """Object-detection worker body (PERCEPTION T5 closed-set + T6/T7 open-vocab).
 
     1. Load the clip_signals row → clip (r2_key, duration) + run params.
     2. Download the clip, sample ~2 fps frames via ffmpeg (capped).
     3. Run the detector on each frame → per-frame boxes:
          - mode='closed' → YOLOv8n (COCO 80 classes).
-         - mode='open'   → YOLO-World prompted with a `labels` text list
+         - mode='open'   → OWLv2 prompted with a `labels` text list
            (falls back to a description-seeded DIY glossary).
     4. Hand the raw detections to detection.py for tracking + inventory
        (shape reused unchanged across both modes).
@@ -3053,41 +3124,38 @@ def _detect_worker(signal_id: str) -> None:
                 raise RuntimeError("no frames sampled from clip")
             step(f"sampled {len(frame_paths)} frames at {DETECT_SAMPLE_FPS} fps")
 
-            model = _load_detect_model(mode)
+            frames: list[dict] = []
             if mode == "open":
                 labels = req_labels or derive_open_labels(clip.get("visual_description"))
                 labels = labels[:DETECT_MAX_LABELS]
                 if not labels:
                     raise RuntimeError("open-vocab detection needs at least one label")
-                model.set_classes(labels)
                 model_name, conf, query = DETECT_OPEN_MODEL, DETECT_OPEN_CONF, labels
-                # After set_classes the model reports the prompt list as names,
-                # so the box class-index maps straight into `labels`.
-                names = {i: lbl for i, lbl in enumerate(labels)}
                 step(f"open-vocab prompts ({len(labels)}): {', '.join(labels)}")
+                frames = _detect_open_frames(frame_paths, labels, conf)
             else:
+                model = _load_detect_model()
                 model_name, conf, query = DETECT_MODEL, DETECT_CONF, None
                 names = model.names  # class-index → COCO name
-
-            results = model.predict(
-                [str(p) for p in frame_paths], conf=conf,
-                verbose=False, stream=False,
-            )
-
-            frames: list[dict] = []
-            for i, res in enumerate(results):
-                dets = []
-                boxes = getattr(res, "boxes", None)
-                if boxes is not None:
-                    for b in boxes:
-                        cls_idx = int(b.cls[0])
-                        xyxy = [round(float(v), 1) for v in b.xyxy[0].tolist()]
-                        dets.append({
-                            "class": names.get(cls_idx, str(cls_idx)),
-                            "conf": round(float(b.conf[0]), 3),
-                            "box": xyxy,
-                        })
-                frames.append({"t": round(i / DETECT_SAMPLE_FPS, 3), "detections": dets})
+                results = model.predict(
+                    [str(p) for p in frame_paths], conf=conf,
+                    verbose=False, stream=False,
+                )
+                for i, res in enumerate(results):
+                    dets = []
+                    boxes = getattr(res, "boxes", None)
+                    if boxes is not None:
+                        for b in boxes:
+                            cls_idx = int(b.cls[0])
+                            xyxy = [round(float(v), 1) for v in b.xyxy[0].tolist()]
+                            dets.append({
+                                "class": names.get(cls_idx, str(cls_idx)),
+                                "conf": round(float(b.conf[0]), 3),
+                                "box": xyxy,
+                            })
+                    frames.append(
+                        {"t": round(i / DETECT_SAMPLE_FPS, 3), "detections": dets}
+                    )
             step(f"ran {model_name} ({mode}) on {len(frames)} frames")
 
             tracklets = track_detections(frames)

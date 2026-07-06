@@ -150,7 +150,7 @@ class TestBuildResultAndDoc:
         tracks = d.track_detections(frames)
         query = ["tape measure", "flatbed cart"]
         res = d.build_detection_result(
-            frames, tracks, fps_sampled=2.0, model="yolov8s-world",
+            frames, tracks, fps_sampled=2.0, model="owlv2-base-patch16-ensemble",
             mode="open", query=query,
         )
         assert res["mode"] == "open"
@@ -158,7 +158,7 @@ class TestBuildResultAndDoc:
         assert "tape measure" in res["inventory"]
         assert "flatbed cart" not in res["inventory"]  # queried, never seen
         doc = d.build_detection_doc(
-            frames, duration=1.0, fps_sampled=2.0, model="yolov8s-world",
+            frames, duration=1.0, fps_sampled=2.0, model="owlv2-base-patch16-ensemble",
             tracklets=tracks, mode="open", query=query,
         )
         assert doc["mode"] == "open" and doc["query"] == query
