@@ -180,15 +180,18 @@ export const SignedUrlResponse = z
   })
   .openapi("SignedUrlResponse");
 
-// ── search (SEARCH S1 #83, consolidated S2+S3+S6+S7) ────────────────────────
+// ── search (SEARCH S1 #83, consolidated S2+S3+S6+S7, hybrid S5 #122) ───────
 // GET /api/search — cross-project library search. Documents the consolidated
-// shape from the search-consolidated-s2-s3-s6-s7 branch
-// (web/src/app/api/search/route.ts), which reconciles four tickets built in
-// parallel against the S1 MVP: the Postgres FTS index (S2 #119), library-wide
+// shape from web/src/app/api/search/route.ts, which reconciles five tickets
+// built against the S1 MVP: the Postgres FTS index (S2 #119), library-wide
 // semantic search (S3 #120), result enrichment — duration/highlighted
-// snippets/thumbnails (S6 #123), and filters/facets (S7 #124). See
-// docs/cross_project_search.md for the full narrative. Hybrid ranking (S5
-// #122) fusing keyword + semantic scores is still a follow-up.
+// snippets/thumbnails (S6 #123), filters/facets (S7 #124), and hybrid RRF
+// ranking (S5 #122). See docs/cross_project_search.md for the full narrative.
+//
+// ⚠️ BEHAVIOR CHANGE (S5 #122): the default `mode` changed from "keyword" to
+// "hybrid". Existing callers that relied on the implicit keyword default
+// (i.e. never passed `mode`) will now get hybrid-fused results instead —
+// pass `mode=keyword` explicitly to keep the old behavior byte-for-byte.
 export const SearchQuery = z
   .object({
     q: z.string().min(1).openapi({
@@ -206,14 +209,22 @@ export const SearchQuery = z
         description: "Max hits to return (default 20, capped at 50).",
       }),
     mode: z
-      .enum(["keyword", "semantic"])
-      .default("keyword")
+      .enum(["hybrid", "keyword", "semantic"])
+      .default("hybrid")
       .optional()
       .openapi({
         description:
-          "\"keyword\" (default) ranks via Postgres full-text search " +
-          "(search_library_fts, S2 #119). \"semantic\" (S3 #120) embeds `q` " +
-          "and cosine-searches clip_embeddings instead.",
+          "\"hybrid\" (default, S5 #122) fuses the keyword and semantic " +
+          "channels with Reciprocal Rank Fusion (k=60) into one ranked, " +
+          "deduped (one hit per clip_id) list; each hit's `sources` says " +
+          "which channel(s) it came from. \"keyword\" (S2 #119) ranks via " +
+          "Postgres full-text search (search_library_fts) only. \"semantic\" " +
+          "(S3 #120) embeds `q` and cosine-searches clip_embeddings only " +
+          "(and, unlike the other two modes, can return multiple hits per " +
+          "clip — one per matched frame). Any unrecognized value falls back " +
+          "to \"hybrid\". ⚠️ Prior to S5, the default (no `mode` param) was " +
+          "\"keyword\" — pass `mode=keyword` explicitly to keep that exact " +
+          "behavior.",
       }),
     pooled: z
       .enum(["0", "1"])
@@ -273,6 +284,10 @@ export const SearchHitKind = z
   .enum(["transcript", "visual_description", "highlight", "embedding"])
   .openapi("SearchHitKind");
 
+export const SearchHitSource = z
+  .enum(["keyword", "semantic"])
+  .openapi("SearchHitSource");
+
 export const SearchHit = z
   .object({
     clip_id: z.string().uuid().openapi({
@@ -310,7 +325,17 @@ export const SearchHit = z
     score: z.number().openapi({
       description:
         "Keyword mode: ts_rank_cd. Semantic mode: raw cosine similarity in " +
-        "[0, 1]. Not on the same scale across modes — not fused (S5 #122).",
+        "[0, 1]. Hybrid mode: the fused Reciprocal Rank Fusion score, " +
+        "Σ 1/(60 + rank) over the channel(s) the clip appeared in — not on " +
+        "the same scale as either channel's solo score.",
+    }),
+    sources: z.array(SearchHitSource).min(1).openapi({
+      description:
+        "Which channel(s) produced this hit (S5 #122). In `mode=keyword`/" +
+        "`mode=semantic` this is always the single requesting channel; in " +
+        "`mode=hybrid` a clip matched by both channels carries " +
+        "[\"keyword\", \"semantic\"] and its other fields (kind/timestamp/" +
+        "snippet) come from whichever channel ranked it better.",
     }),
   })
   .openapi("SearchHit");
@@ -330,13 +355,25 @@ export const SearchResponse = z
   .object({
     query: z.string(),
     terms: z.array(z.string()).openapi({
-      description: "Tokenized query terms (keyword mode only; always [] in semantic mode).",
+      description:
+        "Tokenized query terms (keyword and hybrid modes; always [] in " +
+        "semantic mode, since it doesn't tokenize `q`).",
     }),
     count: z.number().int(),
     results: z.array(SearchHit),
     facets: SearchFacets.openapi({
       description:
-        "Counted over the full filtered candidate set, before slicing to `limit` (S7 #124).",
+        "Counted over the full filtered (and, in hybrid mode, fused/deduped) " +
+        "candidate set, before slicing to `limit` (S7 #124).",
+    }),
+    mode: z.enum(["hybrid", "keyword", "semantic"]).openapi({
+      description: "Which mode actually served this request (S5 #122).",
+    }),
+    warnings: z.array(z.string()).optional().openapi({
+      description:
+        "Hybrid mode only: present when the semantic channel errored and " +
+        "the response degraded to keyword-only ranking rather than failing " +
+        "the request (S5 #122).",
     }),
   })
   .openapi("SearchResponse");

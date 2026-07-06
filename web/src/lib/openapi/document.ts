@@ -258,19 +258,25 @@ export function buildOpenApiDocument() {
   registry.registerPath({
     method: "get",
     path: "/api/search",
-    summary: "Cross-project library search (keyword + semantic, filters/facets)",
+    summary: "Cross-project library search (hybrid keyword+semantic ranking, filters/facets)",
     description:
       "Find clips across ALL of the caller's projects from a verbal query. " +
-      "Default mode ranks via Postgres full-text search over transcripts / " +
-      "clip visual descriptions / visual-analysis highlights (SEARCH S2 " +
-      "#119); `mode=semantic` (S3 #120) instead cosine-searches CLIP " +
-      "embeddings. Every hit additionally carries `duration` and an opt-in " +
-      "`thumbnail_url` (S6 #123); `project`/`kind`/`min_duration`/" +
-      "`max_duration`/`since`/`until` filters and a `facets` summary are " +
-      "available on both modes (S7 #124). Each hit's {clip_id, timestamp} " +
-      "drops directly into a cross-project timeline item (clip_id + " +
-      "src_start) — see docs/cross_project_search.md and the query→cut " +
-      "playbook in CLAUDE.md.",
+      "Default mode (`mode=hybrid`, S5 #122) fuses two channels with " +
+      "Reciprocal Rank Fusion into one ranked, deduped list: keyword " +
+      "(Postgres full-text search over transcripts / clip visual " +
+      "descriptions / visual-analysis highlights, SEARCH S2 #119) and " +
+      "semantic (S3 #120, cosine search over CLIP embeddings). Pass " +
+      "`mode=keyword` or `mode=semantic` to force a single channel — " +
+      "⚠️ BEHAVIOR CHANGE: prior to S5 the implicit default (no `mode` " +
+      "param) was keyword-only; it is now hybrid, so callers that depended " +
+      "on the old default should pass `mode=keyword` explicitly. Every hit " +
+      "carries `duration`, an opt-in `thumbnail_url` (S6 #123), and " +
+      "`sources` (which channel(s) matched, S5 #122); `project`/`kind`/" +
+      "`min_duration`/`max_duration`/`since`/`until` filters and a `facets` " +
+      "summary are available on all modes (S7 #124). Each hit's {clip_id, " +
+      "timestamp} drops directly into a cross-project timeline item " +
+      "(clip_id + src_start) — see docs/cross_project_search.md and the " +
+      "query→cut playbook in CLAUDE.md.",
     tags: ["search"],
     security,
     request: { query: SearchQuery },
