@@ -43,7 +43,7 @@ export async function GET(
 
   let query = supabase
     .from("clip_signals")
-    .select("id, kind, status, result, result_r2_key, error, created_at")
+    .select("id, kind, status, params, result, result_r2_key, error, created_at")
     .eq("clip_id", clipId)
     .order("created_at", { ascending: false });
 

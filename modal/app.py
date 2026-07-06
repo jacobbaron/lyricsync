@@ -2891,10 +2891,13 @@ async def embed_text(request: Request) -> JSONResponse:
 # per-frame boxes go to a detections.json sidecar in R2.
 # ---------------------------------------------------------------------------
 
-DETECT_MODEL = "yolov8n"          # COCO 80-class nano detector — fast on CPU
+DETECT_MODEL = "yolov8n"              # COCO 80-class nano detector — fast on CPU
+DETECT_OPEN_MODEL = "yolov8s-world"   # open-vocab (YOLO-World) — arbitrary text prompts
 DETECT_SAMPLE_FPS = 2.0
 DETECT_MAX_FRAMES = 300
 DETECT_CONF = 0.25
+DETECT_OPEN_CONF = 0.05               # open-vocab scores run lower — keep recall up
+DETECT_MAX_LABELS = 60                # cap prompt classes per open-vocab run
 
 detection_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -2910,11 +2913,22 @@ detection_image = (
         "supabase>=2.10",
         "ultralytics>=8.2,<9",
         "numpy>=1.26",
+        # YOLO-World's set_classes() encodes the text prompts with CLIP; pin it
+        # so the encoder is baked into the image instead of auto-installed on
+        # the first (network-restricted) run.
+        "clip @ git+https://github.com/ultralytics/CLIP.git",
+        "ftfy",
+        "regex",
     )
-    # Bake the COCO weights into the image so the worker never downloads at
-    # runtime (ultralytics fetches to CWD; /root is the container CWD).
+    # Bake both detectors' weights into the image so the worker never downloads
+    # at runtime (ultralytics fetches to CWD; /root is the container CWD). The
+    # set_classes() call also pre-fetches the CLIP text encoder used by
+    # open-vocab prompts.
     .run_commands(
-        "cd /root && python -c \"from ultralytics import YOLO; YOLO('yolov8n.pt')\""
+        "cd /root && python -c \"from ultralytics import YOLO; YOLO('yolov8n.pt')\"",
+        "cd /root && python -c \""
+        "from ultralytics import YOLO; "
+        "m = YOLO('yolov8s-world.pt'); m.set_classes(['person'])\"",
     )
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
     .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
@@ -2924,13 +2938,17 @@ detection_image = (
 _DETECT_MODEL_CACHE: dict = {}
 
 
-def _load_detect_model():
+def _load_detect_model(mode: str = "closed"):
+    """Load (and cache) the detector for a run. `closed` → YOLOv8n/COCO;
+    `open` → YOLO-World (open-vocab, prompted per call via set_classes)."""
     from ultralytics import YOLO
 
-    m = _DETECT_MODEL_CACHE.get("model")
+    key = "open" if mode == "open" else "closed"
+    m = _DETECT_MODEL_CACHE.get(key)
     if m is None:
-        m = YOLO("/root/yolov8n.pt")
-        _DETECT_MODEL_CACHE["model"] = m
+        weights = "/root/yolov8s-world.pt" if key == "open" else "/root/yolov8n.pt"
+        m = YOLO(weights)
+        _DETECT_MODEL_CACHE[key] = m
     return m
 
 
@@ -2957,17 +2975,26 @@ async def detect_objects(request: Request) -> JSONResponse:
 
 @app.function(image=detection_image, secrets=secrets, timeout=1800)
 def _detect_worker(signal_id: str) -> None:
-    """Object-detection worker (PERCEPTION T5, closed-set YOLO test bed).
+    """Object-detection worker (PERCEPTION T5 closed-set + T6 open-vocab).
 
-    1. Load the clip_signals row → clip (r2_key, duration).
+    1. Load the clip_signals row → clip (r2_key, duration) + run params.
     2. Download the clip, sample ~2 fps frames via ffmpeg (capped).
-    3. Run YOLOv8n (COCO 80 classes) on each frame → per-frame boxes.
-    4. Hand the raw detections to detection.py for tracking + inventory.
+    3. Run the detector on each frame → per-frame boxes:
+         - mode='closed' → YOLOv8n (COCO 80 classes).
+         - mode='open'   → YOLO-World prompted with a `labels` text list
+           (falls back to a description-seeded DIY glossary).
+    4. Hand the raw detections to detection.py for tracking + inventory
+       (shape reused unchanged across both modes).
     5. Write the full per-frame sidecar to R2 + a compact inventory on the row.
     """
     import traceback
 
-    from detection import build_detection_doc, build_detection_result, track_detections
+    from detection import (
+        build_detection_doc,
+        build_detection_result,
+        derive_open_labels,
+        track_detections,
+    )
 
     sb = _supabase()
     r2 = _r2()
@@ -2979,14 +3006,21 @@ def _detect_worker(signal_id: str) -> None:
         print(f"[detect:{signal_id}] {msg}")
         debug["steps"].append(msg)
 
-    row = sb.table("clip_signals").select("id, clip_id").eq("id", signal_id).limit(1).execute()
+    row = (
+        sb.table("clip_signals")
+        .select("id, clip_id, params")
+        .eq("id", signal_id).limit(1).execute()
+    )
     if not row.data:
         print(f"[detect] signal {signal_id} not found — skipping")
         return
     clip_id = row.data[0]["clip_id"]
+    params = row.data[0].get("params") or {}
+    mode = "open" if params.get("mode") == "open" else "closed"
+    req_labels = [str(x) for x in (params.get("labels") or []) if str(x).strip()]
 
     clip_row = sb.table("clips").select(
-        "id, r2_key, project_id, duration_secs"
+        "id, r2_key, project_id, duration_secs, visual_description"
     ).eq("id", clip_id).limit(1).execute()
     if not clip_row.data or not clip_row.data[0].get("r2_key"):
         _set_signal(sb, signal_id, status="error", error="clip not found or has no video")
@@ -3018,10 +3052,24 @@ def _detect_worker(signal_id: str) -> None:
                 raise RuntimeError("no frames sampled from clip")
             step(f"sampled {len(frame_paths)} frames at {DETECT_SAMPLE_FPS} fps")
 
-            model = _load_detect_model()
-            names = model.names  # class-index → COCO name
+            model = _load_detect_model(mode)
+            if mode == "open":
+                labels = req_labels or derive_open_labels(clip.get("visual_description"))
+                labels = labels[:DETECT_MAX_LABELS]
+                if not labels:
+                    raise RuntimeError("open-vocab detection needs at least one label")
+                model.set_classes(labels)
+                model_name, conf, query = DETECT_OPEN_MODEL, DETECT_OPEN_CONF, labels
+                # After set_classes the model reports the prompt list as names,
+                # so the box class-index maps straight into `labels`.
+                names = {i: lbl for i, lbl in enumerate(labels)}
+                step(f"open-vocab prompts ({len(labels)}): {', '.join(labels)}")
+            else:
+                model_name, conf, query = DETECT_MODEL, DETECT_CONF, None
+                names = model.names  # class-index → COCO name
+
             results = model.predict(
-                [str(p) for p in frame_paths], conf=DETECT_CONF,
+                [str(p) for p in frame_paths], conf=conf,
                 verbose=False, stream=False,
             )
 
@@ -3039,15 +3087,22 @@ def _detect_worker(signal_id: str) -> None:
                             "box": xyxy,
                         })
                 frames.append({"t": round(i / DETECT_SAMPLE_FPS, 3), "detections": dets})
-            step(f"ran {DETECT_MODEL} on {len(frames)} frames")
+            step(f"ran {model_name} ({mode}) on {len(frames)} frames")
 
             tracklets = track_detections(frames)
             doc = build_detection_doc(
-                frames, duration, DETECT_SAMPLE_FPS, DETECT_MODEL, tracklets
+                frames, duration, DETECT_SAMPLE_FPS, model_name, tracklets,
+                mode=mode, query=query,
             )
-            result = build_detection_result(frames, tracklets, DETECT_SAMPLE_FPS, DETECT_MODEL)
+            result = build_detection_result(
+                frames, tracklets, DETECT_SAMPLE_FPS, model_name,
+                mode=mode, query=query,
+            )
 
-            detect_key = f"projects/{project_id}/clips/{clip_id}/detections.json"
+            # Per-signal key: with two modes (closed vs open) a later run must
+            # not clobber an earlier signal's sidecar, whose result_r2_key still
+            # points here.
+            detect_key = f"projects/{project_id}/clips/{clip_id}/detections_{signal_id}.json"
             r2.put_object(
                 Bucket=bucket, Key=detect_key,
                 Body=json.dumps(doc).encode(), ContentType="application/json",
