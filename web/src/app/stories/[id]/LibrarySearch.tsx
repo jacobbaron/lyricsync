@@ -308,7 +308,10 @@ export function LibrarySearch({ storyId }: Props) {
         setSearchError(err instanceof Error ? err.message : "Network error");
         setResults([]);
       } finally {
-        setLoading(false);
+        // Don't clear loading on behalf of a superseded request — an aborted
+        // fetch's `finally` would otherwise flip loading back to false even
+        // though a newer request (from a later keystroke) is still pending.
+        if (!controller.signal.aborted) setLoading(false);
       }
     }, DEBOUNCE_MS);
 
