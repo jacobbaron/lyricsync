@@ -79,6 +79,7 @@ function fmtDuration(secs: number | null): string {
   if (secs < 60) return `${secs.toFixed(1)}s`;
   const m = Math.floor(secs / 60);
   const s = Math.round(secs % 60);
+  if (s === 60) return `${m + 1}m 0s`;
   return `${m}m ${s}s`;
 }
 
