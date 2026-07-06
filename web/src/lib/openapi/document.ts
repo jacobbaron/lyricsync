@@ -258,14 +258,19 @@ export function buildOpenApiDocument() {
   registry.registerPath({
     method: "get",
     path: "/api/search",
-    summary: "Cross-project library keyword search",
+    summary: "Cross-project library search (keyword + semantic, filters/facets)",
     description:
-      "SEARCH S1 (#83): find clips across ALL of the caller's projects from a " +
-      "verbal query, over transcripts / clip visual descriptions / visual-" +
-      "analysis highlights (naive keyword scoring, no index yet). Each hit's " +
-      "{clip_id, timestamp} drops directly into a cross-project timeline item " +
-      "(clip_id + src_start) — see docs/cross_project_search.md and the " +
-      "query→cut playbook in CLAUDE.md.",
+      "Find clips across ALL of the caller's projects from a verbal query. " +
+      "Default mode ranks via Postgres full-text search over transcripts / " +
+      "clip visual descriptions / visual-analysis highlights (SEARCH S2 " +
+      "#119); `mode=semantic` (S3 #120) instead cosine-searches CLIP " +
+      "embeddings. Every hit additionally carries `duration` and an opt-in " +
+      "`thumbnail_url` (S6 #123); `project`/`kind`/`min_duration`/" +
+      "`max_duration`/`since`/`until` filters and a `facets` summary are " +
+      "available on both modes (S7 #124). Each hit's {clip_id, timestamp} " +
+      "drops directly into a cross-project timeline item (clip_id + " +
+      "src_start) — see docs/cross_project_search.md and the query→cut " +
+      "playbook in CLAUDE.md.",
     tags: ["search"],
     security,
     request: { query: SearchQuery },

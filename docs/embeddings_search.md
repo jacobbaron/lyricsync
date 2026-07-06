@@ -69,5 +69,11 @@ GET /api/projects/{id}/search?q=…
 
 Near-duplicate/take clustering, B-roll↔narration matching, and re-embedding
 with a larger model are future consumers of this table — not in this ticket.
-Search is currently intra-project; a cross-project surface is tracked
-separately (#83).
+
+A cross-project surface now exists: `GET /api/search?mode=semantic` (SEARCH
+S3, #120, consolidated into `search-consolidated-s2-s3-s6-s7` alongside S2/S6/
+S7) reuses this same table/model via `search_clip_embeddings_global`, a
+project-agnostic sibling of `search_clip_embeddings` scoped by the caller's
+RLS instead of a project id — see `docs/cross_project_search.md`. Coverage is
+still whatever's been embedded via this route's `POST /api/clips/{id}/embed`;
+exhaustive backfill is S4 (#121), not done.
