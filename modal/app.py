@@ -3099,7 +3099,10 @@ def _detect_worker(signal_id: str) -> None:
                 mode=mode, query=query,
             )
 
-            detect_key = f"projects/{project_id}/clips/{clip_id}/detections.json"
+            # Per-signal key: with two modes (closed vs open) a later run must
+            # not clobber an earlier signal's sidecar, whose result_r2_key still
+            # points here.
+            detect_key = f"projects/{project_id}/clips/{clip_id}/detections_{signal_id}.json"
             r2.put_object(
                 Bucket=bucket, Key=detect_key,
                 Body=json.dumps(doc).encode(), ContentType="application/json",
