@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "backfill:search-docs": "node --experimental-strip-types scripts/backfill-search-docs.ts"
+    "backfill:search-docs": "node --experimental-strip-types scripts/backfill-search-docs.ts",
+    "eval:search": "node --experimental-strip-types scripts/search-eval.ts"
   },
   "dependencies": {
     "@asteasolutions/zod-to-openapi": "^7.3.4",

@@ -1,0 +1,97 @@
+[
+  {
+    "query": "panel",
+    "expected_clip_ids": [
+      "43ed41de-3881-419b-be4b-3c45a7d51a20",
+      "785d7f38-7111-4df6-bffb-46c3c01ff8e9"
+    ],
+    "notes": "Baseline lexical multi-project query. Hits span 'Testing panels', 'Hanging panels', and 'Home Depot' (acoustic-panel-build clips). Verified live: keyword mode returns 10 hits with both expected clips in the top 4."
+  },
+  {
+    "query": "ceiling",
+    "expected_clip_ids": [
+      "2acf994f-91e9-43be-9a36-2e2eeb82ddf5",
+      "088a3886-544f-4b25-87eb-7418c2795e10"
+    ],
+    "notes": "Lexical, spans 'Hanging ceiling panels' (transcript hit) and 'Working on the dumper' (a `highlight` hit: 'finishes a musical loop and smiles up at the ceiling'). Verified live: keyword mode returns 7 hits including both."
+  },
+  {
+    "query": "insulation",
+    "expected_clip_ids": ["c0a42f6d-2d29-4940-a034-aac20a7ec3d6"],
+    "notes": "Home Depot clip matched via clips.visual_description ('rolls of pink fiberglass insulation'). Verified live: keyword mode rank 2 of 3, semantic/hybrid also surface it."
+  },
+  {
+    "query": "dumper",
+    "expected_clip_ids": ["5c43c0b4-4c2a-4bcc-b70a-f930ec2075b5"],
+    "notes": "KEYWORD-SHOULD-WIN case. Exact repeated transcript word ('fix Dumper Dumper Dumper') in 'Working on the dumper'. Verified live: keyword mode hits rank 1 (score 0.30, clearly dominant); semantic mode does not surface this clip in its top 15 (the word 'dumper' isn't a visually distinctive concept), so hybrid relies on the keyword channel to carry it."
+  },
+  {
+    "query": "pink insulation rolls on a shelf",
+    "expected_clip_ids": ["c0a42f6d-2d29-4940-a034-aac20a7ec3d6"],
+    "notes": "SEMANTIC-SHOULD-WIN case. Verified live: keyword mode returns 0 results (no single doc's tsvector contains all of 'pink'+'insulation'+'rolls'+'shelf' together), semantic mode ranks this clip's frames #1, hybrid surfaces it at rank 1."
+  },
+  {
+    "query": "someone laughing",
+    "expected_clip_ids": ["29b292e3-edac-4daf-a63e-cb01934167c0"],
+    "notes": "SEMANTIC-SHOULD-WIN case (the ticket's own example query). Verified live: keyword mode returns 0 (no doc contains both 'someone' and 'laugh(ing)' together, even though 'laughing' alone hits 2 clips), semantic mode ranks this Hanging-panels clip (laughing at echo test) #1, hybrid keeps it at rank 1."
+  },
+  {
+    "query": "fluffy cat jumps on the bed",
+    "expected_clip_ids": [
+      "5c43c0b4-4c2a-4bcc-b70a-f930ec2075b5",
+      "2acf994f-91e9-43be-9a36-2e2eeb82ddf5"
+    ],
+    "notes": "SEMANTIC-SHOULD-WIN, multi-project. Verified live: keyword mode returns 0 (no doc has 'jumps' + 'bed' + 'cat' together), semantic mode ranks 'Working on the dumper' clip 5c43c0b4 (George the cat leaping onto the bed) very high, hybrid surfaces both 5c43c0b4 (Working on the dumper) and 2acf994f (Hanging ceiling panels, 'the cat jumps onto the bed') in its top 5."
+  },
+  {
+    "query": "cat",
+    "expected_clip_ids": [
+      "fc31b0cd-b3b0-4b05-aede-ef90deac18d0",
+      "227a803d-e448-47c9-b80b-f7a82d841c31",
+      "2acf994f-91e9-43be-9a36-2e2eeb82ddf5",
+      "5c43c0b4-4c2a-4bcc-b70a-f930ec2075b5"
+    ],
+    "notes": "ALL-MODES-AGREE sanity check, spans 3 projects (Home Depot, Hanging ceiling panels, Working on the dumper). Verified live: keyword mode returns exactly these 4 clips; semantic mode's top hits are the same 4 clips' frames; hybrid's top 5 is these 4 plus one extra. Good regression check that hybrid doesn't regress a case where keyword alone already does well."
+  },
+  {
+    "query": "clapping hands to test acoustics",
+    "expected_clip_ids": [
+      "253defde-dd5b-4d2b-9674-72d6d1b73b62",
+      "29b292e3-edac-4daf-a63e-cb01934167c0"
+    ],
+    "notes": "KEYWORD-favoring, both in 'Hanging panels'. Verified live: keyword mode hits both (rank 1-2 of 2); hybrid keeps both in its top 4."
+  },
+  {
+    "query": "cutting wood with a jigsaw on a deck",
+    "expected_clip_ids": ["53b28a52-fb69-4b21-80ca-4530ddb4b370"],
+    "notes": "KEYWORD-favoring, Home Depot deck-build clip. Verified live: keyword mode's single result is this clip (matched via visual_description); hybrid keeps it as its single result too."
+  },
+  {
+    "query": "measuring wood with a tape measure",
+    "expected_clip_ids": ["7432e468-9d87-4109-8d70-fa62745fbcd5"],
+    "notes": "KEYWORD-favoring, Home Depot. Verified live: keyword mode's single hit is this clip (rank 1); hybrid keeps it at rank 1 of 8 (semantic channel adds several near-duplicate 'measuring wood' frames from other Home Depot/test clips behind it)."
+  },
+  {
+    "query": "computer screen showing a frequency response graph",
+    "expected_clip_ids": [
+      "bf6c798d-830e-4b87-bbee-ab7dd8d31fdf",
+      "8826020c-d098-42a6-8c04-ad6f2d6723e0"
+    ],
+    "notes": "SEMANTIC-SHOULD-WIN, 'Testing panels' project (REW acoustic-measurement software screenshots). Verified live: keyword mode returns 0 (no doc's tsvector contains this exact phrase combination), hybrid surfaces both clips in its top 4 via the semantic channel."
+  },
+  {
+    "query": "celebratory photo after installing the panel",
+    "expected_clip_ids": ["0c552d40-835c-4c57-bd65-8bb54db0fa36"],
+    "notes": "SEMANTIC-SHOULD-WIN, 'Hanging ceiling panels' (highlight: 'they lean in close to pose for a final celebratory photo'). Verified live: keyword mode returns 0, hybrid surfaces it at rank 5 of 6 (still within top-10) via the semantic channel."
+  },
+  {
+    "query": "man laughing about midi comping",
+    "expected_clip_ids": ["7a01242e-3d6c-4ee5-afd3-cc0c944f0032"],
+    "notes": "KEYWORD-favoring, exact highlight-description phrase overlap in 'Working on the dumper'. Verified live: keyword mode's single hit is this clip at rank 1 (score 0.025, well above typical single-term scores); hybrid keeps it at rank 1 of 3."
+  },
+  {
+    "query": "smiling up at the ceiling after finishing a loop",
+    "expected_clip_ids": ["088a3886-544f-4b25-87eb-7418c2795e10"],
+    "notes": "KEYWORD-favoring, near-verbatim highlight-description overlap in 'Working on the dumper'. Verified live: keyword mode's single hit is this clip at rank 1; hybrid keeps it at rank 1 of 6."
+  }
+]

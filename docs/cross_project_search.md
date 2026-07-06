@@ -314,6 +314,59 @@ until it does; `visual_description` and `highlight` hits are unaffected
 (their generated columns backfill themselves automatically when the S2
 migration's `ALTER TABLE ADD COLUMN` runs).
 
+## Eval harness (S10, #127)
+
+`web/scripts/search-eval.ts` is a small regression harness: it runs a curated
+"golden set" of real verbal queries (`web/scripts/search-eval/golden-queries.json`
+— built by actually exploring the live library's clips/transcripts/highlights,
+not hypothetical queries) against live `GET /api/search` for all three modes
+(`keyword`/`semantic`/`hybrid`), checks whether each query's expected clip(s)
+land in the top-k, and reports a per-mode success@k summary plus a per-query
+hit/miss table. Use it to catch a ranking regression after touching S2/S3/S5
+(FTS scoring, embedding coverage, or RRF fusion) — it's meant to be re-run, not
+a one-off.
+
+**Run it** (from `web/`, needs the same `LYRICSYNC_BASE_URL` /
+`LYRICSYNC_API_KEY` every agent web session already has exported, or your own
+prod API key):
+
+```bash
+npm run eval:search
+# or, with options:
+node --experimental-strip-types scripts/search-eval.ts --k 10 \
+  --report-json scripts/search-eval/last-report.json
+```
+
+**What "hit" means**: for a golden query, a mode "hits" if *any* of that
+query's `expected_clip_ids` appears among the top-`k` results returned for
+that mode (default `k=10`); the reported rank is the best (lowest) rank among
+them. The per-mode summary (`success@k`) is the fraction of golden queries
+that hit — the standard metric for a small hand-built golden set like this
+one. `golden-queries.json`'s per-query `notes` call out which queries are
+deliberately **keyword-favoring** (exact lexical overlap — e.g. `"dumper"`),
+**semantic-favoring** (no shared words, only conceptual/visual overlap — e.g.
+`"someone laughing"`, the ticket's own example), or **all-modes-agree**
+sanity checks (e.g. `"cat"`), so a future ranking change that regresses one
+channel shows up as a category-specific dip rather than just a single
+aggregate number moving.
+
+A live run against prod (2026-07-06, 15 golden queries, `k=10`) found:
+
+| Mode | success@10 |
+|---|---|
+| keyword | 10/15 (66.7%) |
+| semantic | 11/15 (73.3%) |
+| hybrid | 15/15 (100.0%) |
+
+Hybrid met or beat the best single channel on every query in this golden set —
+the acceptance criterion this ticket asked the harness to check for future
+ranking changes. See the S10 PR description for the full per-query table.
+
+Manual-run only for now (not wired as a CI gate): it hits **live prod**, so
+making it a blocking/required check would fail CI on transient prod issues
+(Modal cold starts, embedding coverage drift) unrelated to the PR under
+review. Re-run it manually after any change to S2/S3/S5 ranking code.
+
 ## Deferred (later `[SEARCH]` tickets)
 
 - **Embedding coverage/backfill** so semantic mode (and hybrid's semantic
@@ -323,10 +376,8 @@ migration's `ALTER TABLE ADD COLUMN` runs).
 - **Editor search UI** — **S8 (#125)**; **OpenAPI + agent tool** — **S9
   (#126)**, already documenting this consolidated shape (`SearchQuery`/
   `SearchResponse` in `web/src/lib/openapi/existing.ts`, updated for S5 to add
-  the `hybrid` mode, `sources`, and `mode`/`warnings` response fields);
-  **eval harness** — **S10 (#127)**, not built yet — S5 was verified manually
-  (see the PR description for the lexical-only and concept-only test cases)
-  rather than against a formal precision@k comparison.
+  the `hybrid` mode, `sources`, and `mode`/`warnings` response fields).
+  **Eval harness** — **S10 (#127)** — see "Eval harness" above.
 
 The response shape remains forward-compatible: further tickets may add facet
 dimensions or result fields without breaking `{clip_id, project, project_id,
