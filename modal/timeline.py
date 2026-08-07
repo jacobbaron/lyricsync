@@ -25,7 +25,8 @@ Schema (version 1):
         ]},
         {"type": "text", "items": [
           {"id": "t1", "text": "Title card", "start": 0.0, "end": 3.0,
-           "size": 64, "position": "center", "wrap": 22}
+           "size": 64, "position": "center", "wrap": 22,
+           "box_opacity": 0.75}
         ]}
       ]
     }
@@ -60,6 +61,10 @@ RANGE_PAD_S = 0.08
 MIN_SPEED, MAX_SPEED = 0.25, 20.0  # up to 20x for time-lapse speed-ups
 MAX_CROSSFADE_S = 3.0
 TEXT_POSITIONS = ("center", "upper", "lower")
+# Alpha of the box behind caption text. Dark enough to stay readable over the
+# bright, busy footage captions usually sit on; override per item via
+# `box_opacity`.
+DEFAULT_BOX_OPACITY = 0.75
 
 # Optional per-clip audio effects, applied after the speed/resample stage.
 # Each value is an ffmpeg audio-filter chain (aecho gives an echo/reverb wash) —
@@ -254,7 +259,7 @@ def timeline_from_ranges(ranges: list[dict]) -> dict:
                 "start": round(out_pos + t_in, 3),
                 "end": round(out_pos + min(t_out, seg_len), 3),
             }
-            for key in ("size", "position", "wrap"):
+            for key in ("size", "position", "wrap", "box_opacity"):
                 if overlay.get(key) is not None:
                     text[key] = overlay[key]
             texts.append(text)
@@ -434,6 +439,11 @@ def validate_timeline(timeline: dict) -> list[str]:
             isinstance(wrap, (int, float)) and 4 <= wrap <= 80
         ):
             errors.append(f"{label}: wrap must be between 4 and 80")
+        box_opacity = item.get("box_opacity")
+        if box_opacity is not None and not (
+            isinstance(box_opacity, (int, float)) and 0 <= box_opacity <= 1
+        ):
+            errors.append(f"{label}: box_opacity must be between 0 and 1")
 
     errors.extend(_validate_music(timeline.get("music")))
     return errors
@@ -652,7 +662,7 @@ def _op_add_text(timeline: dict, op: dict) -> None:
         "start": op.get("start"),
         "end": op.get("end"),
     }
-    for key in ("size", "position", "wrap"):
+    for key in ("size", "position", "wrap", "box_opacity"):
         if op.get(key) is not None:
             item[key] = op[key]
     items.append(item)
@@ -660,7 +670,8 @@ def _op_add_text(timeline: dict, op: dict) -> None:
 
 def _op_update_text(timeline: dict, op: dict) -> None:
     item = _find_text(timeline, op.get("id", ""))
-    for key in ("text", "start", "end", "size", "position", "wrap"):
+    for key in ("text", "start", "end", "size", "position", "wrap",
+                "box_opacity"):
         if op.get(key) is not None:
             item[key] = op[key]
 
@@ -1383,6 +1394,8 @@ def _drawtext(item: dict, textfile: str, font_path: str) -> str:
     """Build one drawtext filter for a text item (output-time enable window)."""
     size = int(item.get("size") or 64)
     pos = str(item.get("position") or "center").lower()
+    opacity = item.get("box_opacity")
+    opacity = DEFAULT_BOX_OPACITY if opacity is None else float(opacity)
     yexpr = {
         "upper": "h*0.10",
         "lower": "h*0.72",
@@ -1394,7 +1407,7 @@ def _drawtext(item: dict, textfile: str, font_path: str) -> str:
     return (
         f"drawtext=fontfile={font_path}:textfile={textfile}:"
         f"fontcolor=white:fontsize={size}:line_spacing=14:"
-        f"box=1:boxcolor=black@0.5:boxborderw=30:"
+        f"box=1:boxcolor=black@{opacity:.3g}:boxborderw=30:"
         f"x=(w-text_w)/2:y={yexpr}:enable='{enable}'"
     )
 
