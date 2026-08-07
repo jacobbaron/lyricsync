@@ -81,13 +81,10 @@ export async function POST(
 
   await supabase.from("stories").update(storyUpdate).eq("id", storyId);
 
-  // Reset project status to rendering only if it's in a P1-style terminal state.
-  // In P2 (stories_ready), leave the project status alone so StoryBrowser stays visible.
-  await supabase
-    .from("projects")
-    .update({ status: "rendering" })
-    .eq("id", story.project_id)
-    .in("status", ["transcribed", "done", "error"]);
+  // The project status is deliberately left alone: render progress lives on the
+  // story row, and the render worker never moves the project back, so flipping
+  // it to 'rendering' stranded the project there — hiding the upload area
+  // (ADD_VIDEOS_STATUSES) for good. /music and /lipsync already render this way.
 
   // Fire Modal render endpoint (fire-and-forget)
   const renderUrl = process.env.MODAL_RENDER_URL;

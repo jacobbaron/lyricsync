@@ -317,6 +317,21 @@ def _set_project(sb, project_id: str, **fields) -> None:
     sb.table("projects").update(fields).eq("id", project_id).execute()
 
 
+def _clear_project_rendering(sb, project_id: str) -> None:
+    """Release a project stranded at 'rendering' by an older render.
+
+    Render progress belongs to the story row; a project left at 'rendering'
+    hides the upload area indefinitely. Scoped to that one status so a project
+    busy transcribing new clips is untouched.
+    """
+    try:
+        sb.table("projects").update({"status": "transcribed"}).eq(
+            "id", project_id
+        ).eq("status", "rendering").execute()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[render] could not clear project {project_id} status: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # P1-06: Transcribe clip
 # ---------------------------------------------------------------------------
@@ -3740,13 +3755,14 @@ def _render_worker(story_id: str) -> None:
             # estimated_duration_secs so the web list shows the real length
             # (it would otherwise keep the stale create-time estimate, e.g.
             # after a speed/time-lapse edit).
-            # Note: project status intentionally NOT changed — it stays at
-            # 'transcribed' so users can create additional cuts at any time.
+            # Note: the project is left at 'transcribed' so users can create
+            # additional cuts (and upload more clips) at any time.
             sb.table("stories").update({
                 "status": "done",
                 "render_r2_key": output_key,
                 "estimated_duration_secs": round(float(compiled["duration"]), 2),
             }).eq("id", story_id).execute()
+            _clear_project_rendering(sb, project_id)
 
             print(f"[render] story {story_id} done ✓")
 
@@ -3757,6 +3773,7 @@ def _render_worker(story_id: str) -> None:
             "status": "error",
             "error_message": msg[:500],
         }).eq("id", story_id).execute()
+        _clear_project_rendering(sb, project_id)
 
 
 
