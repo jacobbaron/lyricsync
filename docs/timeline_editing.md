@@ -45,7 +45,8 @@ Implementation map:
     ]},
     {"type": "text", "items": [
       {"id": "t1", "text": "Title card", "start": 0.0, "end": 3.0,
-       "size": 64, "position": "center", "wrap": 22}
+       "size": 64, "position": "center", "wrap": 22,
+       "box_opacity": 0.75}
     ]}
   ]
 }
@@ -60,7 +61,9 @@ Implementation map:
   ≤ 3 s, and the first item's `transition_in` must be null.
 - Text items live in **output time** (seconds into the rendered video), so
   they stay put when the video track is re-cut underneath them. `position` is
-  `center | upper | lower`; `wrap` is max characters per line.
+  `center | upper | lower`; `wrap` is max characters per line. `box_opacity`
+  (0–1, default 0.75) is the alpha of the black box behind the text — raise it
+  toward 1 when captions sit over bright, busy footage.
 - `note` is informational (the transcript text the item came from) and has no
   effect on rendering.
 
@@ -81,7 +84,7 @@ invalid, nothing is saved and the error message says which op failed and why.
 | `set_transition` | `id`, `transition` | `null` or `{"type": "crossfade", "duration": s}` (joins to previous item) |
 | `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`?, `clip_id`? | Appends when `index` omitted. `clip_id` (uuid) references a clip in *any* project (cross-project cuts — see `docs/cross_project_editing.md`); `source` is then just a label |
 | `insert_blank` | `duration`, `index`? | Black + silence spacer |
-| `add_text` | `text`, `start`, `end`, `size`?, `position`?, `wrap`? | Output-time window |
+| `add_text` | `text`, `start`, `end`, `size`?, `position`?, `wrap`?, `box_opacity`? | Output-time window |
 | `update_text` | `id`, any text fields | Partial update |
 | `remove_text` | `id` | |
 | `clean_speech` | `id`, `params`? | Tighten a speech clip: split it into jump-cut sub-items, dropping filler words + over-long silences. Needs the project transcript. See below |

@@ -431,6 +431,29 @@ class TestCompile:
         # drawtext runs before the final pixel-format normalization
         assert fc.index("drawtext") < fc.index("format=yuv420p")
 
+    def test_box_opacity_default_and_override(self):
+        timeline = make_timeline(1)
+        timeline["tracks"].append({
+            "type": "text",
+            "items": [
+                {"id": "t1", "text": "default", "start": 0.0, "end": 1.0},
+                {"id": "t2", "text": "solid", "start": 1.0, "end": 2.0,
+                 "box_opacity": 1},
+            ],
+        })
+        fc = compile_simple(timeline)["filter_complex"]
+        assert f"boxcolor=black@{tl.DEFAULT_BOX_OPACITY:.3g}" in fc
+        assert "boxcolor=black@1" in fc
+
+    def test_bad_box_opacity(self):
+        timeline = make_timeline(1)
+        timeline["tracks"].append({
+            "type": "text",
+            "items": [{"id": "t1", "text": "hi", "start": 0.0, "end": 1.0,
+                       "box_opacity": 1.5}],
+        })
+        assert any("box_opacity" in e for e in tl.validate_timeline(timeline))
+
     def test_invalid_timeline_rejected(self):
         timeline = make_timeline()
         tl.video_items(timeline)[0]["src_end"] = -1
