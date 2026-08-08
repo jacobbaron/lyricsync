@@ -135,12 +135,21 @@ def _load_words(project_id: str) -> list[dict]:
     Returns [] when the transcript is missing — callers that need word timings
     (clean_speech) should surface a clear error in that case.
     """
+    from botocore.exceptions import ClientError
+
     r2 = _r2()
     bucket = os.environ["R2_BUCKET_NAME"]
     key = f"projects/{project_id}/merged.json"
     try:
         obj = r2.get_object(Bucket=bucket, Key=key)
-    except Exception:
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return []
+        print(f"[_load_words] R2 error for {key}: {exc}")
+        return []
+    except Exception as exc:  # noqa: BLE001
+        print(f"[_load_words] unexpected error reading {key}: {exc}")
         return []
     merged = json.loads(obj["Body"].read())
     return merged.get("words", []) or []
@@ -154,10 +163,18 @@ def _read_clip_audio_analysis(r2, bucket: str, project_id: str, clip_id: str):
     word-gap timing). The path is per-clip and the same for local and foreign
     clips — only the (project_id, clip_id) lookup differs by caller.
     """
+    from botocore.exceptions import ClientError
+
     key = f"projects/{project_id}/clips/{clip_id}/audio_analysis.json"
     try:
         doc = json.loads(r2.get_object(Bucket=bucket, Key=key)["Body"].read())
-    except Exception:
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("NoSuchKey", "404"):
+            print(f"[_read_clip_audio_analysis] R2 error for {key}: {exc}")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[_read_clip_audio_analysis] unexpected error reading {key}: {exc}")
         return None
     vad = doc.get("vad") or {}
     wave = doc.get("waveform") or {}
@@ -1558,8 +1575,8 @@ def _load_clip_signals(sb, clip_id: str) -> dict:
             )
             if r.data and r.data[0].get("result"):
                 out[kind] = r.data[0]["result"]
-        except Exception:  # noqa: BLE001 — grounding is best-effort
-            pass
+        except Exception as exc:  # noqa: BLE001 — grounding is best-effort
+            print(f"[_load_clip_signals] failed to load {kind} for {clip_id}: {exc}")
     return out
 
 
@@ -2180,8 +2197,8 @@ async def perception_describe(request: Request) -> JSONResponse:
         finally:
             try:
                 client.files.delete(name=gfile.name)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                print(f"[describe] failed to delete Gemini file {gfile.name}: {exc}")
 
     return JSONResponse({
         "clip_id": clip_id,
@@ -4030,80 +4047,85 @@ def _analyze_clip_audio_worker(clip_id: str) -> None:
     pid = clip["project_id"]
     filename = clip["filename"]
 
-    words = words_in_clip(_load_words(pid), filename)
+    try:
+        words = words_in_clip(_load_words(pid), filename)
 
-    with tempfile.TemporaryDirectory() as td:
-        tdp = Path(td)
-        src = tdp / "source"
-        wav = tdp / "audio16k.wav"
-        m4a = tdp / "audio.m4a"
-        r2.download_file(bucket, clip["r2_key"], str(src))
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            src = tdp / "source"
+            wav = tdp / "audio16k.wav"
+            m4a = tdp / "audio.m4a"
+            r2.download_file(bucket, clip["r2_key"], str(src))
 
-        # 16 kHz mono PCM for VAD; AAC mono proxy for browser playback.
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
-             str(wav)], check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-b:a", "64k",
-             str(m4a)], check=True, capture_output=True,
-        )
-
-        with wave.open(str(wav), "rb") as wf:
-            sr = wf.getframerate()
-            audio = (
-                np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
-                .astype(np.float32) / 32768.0
+            # 16 kHz mono PCM for VAD; AAC mono proxy for browser playback.
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+                 str(wav)], check=True, capture_output=True,
             )
-        duration = (len(audio) / sr) if sr else float(clip.get("duration_secs") or 0.0)
-
-        # Waveform: peak amplitude per 20 ms hop, normalized to [0, 1].
-        wf_hop = 0.02
-        hop_n = max(1, int(sr * wf_hop))
-        peaks = [
-            float(np.max(np.abs(audio[i:i + hop_n]))) if i < len(audio) else 0.0
-            for i in range(0, len(audio), hop_n)
-        ]
-        mx = max(peaks) if peaks else 0.0
-        peaks = [round(p / mx, 4) for p in peaks] if mx > 0 else peaks
-
-        # VAD curve (best effort) → intervals via our tested gate.
-        vad_hop = 512 / 16000  # 0.032 s
-        try:
-            prob = _silero_prob_curve(audio, sr)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[audio] silero VAD unavailable, falling back to energy gate: {exc}")
-            prob = None
-
-        if prob:
-            intervals = intervals_from_curve(
-                prob, vad_hop, threshold=0.5, min_speech=0.1,
-                min_silence=0.1, pad=0.0, total=duration,
-            )
-        else:
-            # Last-resort: gate the waveform energy so the UI still shows speech
-            # regions (coarser, but no model needed).
-            gate = [1.0 if p > 0.08 else 0.0 for p in peaks]
-            intervals = intervals_from_curve(
-                gate, wf_hop, threshold=0.5, min_speech=0.15,
-                min_silence=0.2, pad=0.0, total=duration,
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-b:a", "64k",
+                 str(m4a)], check=True, capture_output=True,
             )
 
-        audio_key = f"projects/{pid}/clips/{clip_id}/audio.m4a"
-        analysis_key = f"projects/{pid}/clips/{clip_id}/audio_analysis.json"
-        r2.upload_file(
-            str(m4a), bucket, audio_key,
-            ExtraArgs={"ContentType": "audio/mp4"},
-        )
-        doc = build_analysis(
-            duration, audio_key, wf_hop, peaks, vad_hop, prob, intervals, words,
-        )
-        r2.put_object(
-            Bucket=bucket, Key=analysis_key,
-            Body=json.dumps(doc).encode(), ContentType="application/json",
-        )
-        print(
-            f"[audio] clip {clip_id} ✓ {len(peaks)} peaks, "
-            f"prob={'yes' if prob else 'energy-gate'}, "
-            f"{len(intervals)} speech intervals, {len(words)} words"
-        )
+            with wave.open(str(wav), "rb") as wf:
+                sr = wf.getframerate()
+                audio = (
+                    np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                    .astype(np.float32) / 32768.0
+                )
+            duration = (len(audio) / sr) if sr else float(clip.get("duration_secs") or 0.0)
+
+            # Waveform: peak amplitude per 20 ms hop, normalized to [0, 1].
+            wf_hop = 0.02
+            hop_n = max(1, int(sr * wf_hop))
+            peaks = [
+                float(np.max(np.abs(audio[i:i + hop_n]))) if i < len(audio) else 0.0
+                for i in range(0, len(audio), hop_n)
+            ]
+            mx = max(peaks) if peaks else 0.0
+            peaks = [round(p / mx, 4) for p in peaks] if mx > 0 else peaks
+
+            # VAD curve (best effort) → intervals via our tested gate.
+            vad_hop = 512 / 16000  # 0.032 s
+            try:
+                prob = _silero_prob_curve(audio, sr)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[audio] silero VAD unavailable, falling back to energy gate: {exc}")
+                prob = None
+
+            if prob:
+                intervals = intervals_from_curve(
+                    prob, vad_hop, threshold=0.5, min_speech=0.1,
+                    min_silence=0.1, pad=0.0, total=duration,
+                )
+            else:
+                # Last-resort: gate the waveform energy so the UI still shows speech
+                # regions (coarser, but no model needed).
+                gate = [1.0 if p > 0.08 else 0.0 for p in peaks]
+                intervals = intervals_from_curve(
+                    gate, wf_hop, threshold=0.5, min_speech=0.15,
+                    min_silence=0.2, pad=0.0, total=duration,
+                )
+
+            audio_key = f"projects/{pid}/clips/{clip_id}/audio.m4a"
+            analysis_key = f"projects/{pid}/clips/{clip_id}/audio_analysis.json"
+            r2.upload_file(
+                str(m4a), bucket, audio_key,
+                ExtraArgs={"ContentType": "audio/mp4"},
+            )
+            doc = build_analysis(
+                duration, audio_key, wf_hop, peaks, vad_hop, prob, intervals, words,
+            )
+            r2.put_object(
+                Bucket=bucket, Key=analysis_key,
+                Body=json.dumps(doc).encode(), ContentType="application/json",
+            )
+            print(
+                f"[audio] clip {clip_id} ✓ {len(peaks)} peaks, "
+                f"prob={'yes' if prob else 'energy-gate'}, "
+                f"{len(intervals)} speech intervals, {len(words)} words"
+            )
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        print(f"[audio] error for clip {clip_id}: {exc}")
+        print(traceback.format_exc())

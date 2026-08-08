@@ -48,5 +48,10 @@ def extract_audio(video: Path, out_wav: Path) -> Path:
         "pcm_s16le",
         str(out_wav),
     ]
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg audio extraction failed (exit {result.returncode}):\n"
+            f"{result.stderr[-2000:] if result.stderr else '(no stderr)'}"  # noqa: E501
+        )
     return out_wav

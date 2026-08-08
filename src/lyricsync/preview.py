@@ -123,5 +123,10 @@ def render_preview(
         "copy",
         str(out_path),
     ]
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg preview render failed (exit {result.returncode}):\n"
+            f"{result.stderr[-2000:] if result.stderr else '(no stderr)'}"  # noqa: E501
+        )
     return out_path
