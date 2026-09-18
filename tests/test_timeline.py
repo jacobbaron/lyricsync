@@ -454,6 +454,79 @@ class TestCompile:
         })
         assert any("box_opacity" in e for e in tl.validate_timeline(timeline))
 
+    def styled(self, **style):
+        timeline = make_timeline(1)
+        timeline["tracks"].append({
+            "type": "text",
+            "items": [{"id": "t1", "text": "hi", "start": 1.0, "end": 5.0,
+                       **style}],
+        })
+        return timeline
+
+    def test_caption_color_named_and_hex(self):
+        fc = compile_simple(self.styled(color="gold"))["filter_complex"]
+        assert "fontcolor=gold" in fc
+        fc = compile_simple(self.styled(color="#FFCC00"))["filter_complex"]
+        assert "fontcolor=0xffcc00" in fc
+
+    def test_caption_defaults_to_white_with_no_outline(self):
+        fc = compile_simple(self.styled())["filter_complex"]
+        assert "fontcolor=white" in fc
+        assert ":borderw=" not in fc  # boxborderw is the box, not an outline
+
+    def test_caption_outline(self):
+        fc = compile_simple(
+            self.styled(outline=4, outline_color="black", box_opacity=0)
+        )["filter_complex"]
+        assert "borderw=4:bordercolor=black" in fc
+        # box_opacity 0 keeps the (invisible) box out of the way of the outline
+        assert "boxcolor=black@0" in fc
+
+    def test_caption_fade_ramps_alpha_within_the_window(self):
+        fc = compile_simple(self.styled(fade=0.4))["filter_complex"]
+        assert "alpha='if(lt(t\\,1.400)" in fc
+        assert "enable='between(t\\,1.000\\,5.000)'" in fc
+
+    def test_caption_fade_skipped_when_window_too_short(self):
+        """Both ramps must fit, or the caption would never reach full opacity."""
+        timeline = make_timeline(1)
+        timeline["tracks"].append({
+            "type": "text",
+            "items": [{"id": "t1", "text": "hi", "start": 1.0, "end": 1.5,
+                       "fade": 0.4}],
+        })
+        assert "alpha=" not in compile_simple(timeline)["filter_complex"]
+
+    @pytest.mark.parametrize(
+        "style,needle",
+        [
+            ({"color": "chartreuse"}, "color"),
+            ({"color": "white:fontsize=200"}, "color"),   # filter injection
+            ({"outline_color": "#GGHHII"}, "outline_color"),
+            ({"outline": 99}, "outline"),
+            ({"fade": 5}, "fade"),
+        ],
+    )
+    def test_bad_caption_style_rejected(self, style, needle):
+        errors = tl.validate_timeline(self.styled(**style))
+        assert any(needle in e for e in errors), errors
+
+    def test_style_keys_survive_add_and_update_ops(self):
+        timeline = make_timeline(1)
+        timeline = tl.apply_ops(timeline, [{
+            "op": "add_text", "text": "hi", "start": 0.0, "end": 2.0,
+            "color": "gold", "outline": 3, "outline_color": "black",
+            "fade": 0.3, "box_opacity": 0,
+        }])
+        item = tl.text_items(timeline)[0]
+        assert item["color"] == "gold" and item["outline"] == 3
+        assert item["fade"] == 0.3 and item["box_opacity"] == 0
+        timeline = tl.apply_ops(timeline, [
+            {"op": "update_text", "id": item["id"], "color": "cyan"},
+        ])
+        assert tl.text_items(timeline)[0]["color"] == "cyan"
+        assert tl.text_items(timeline)[0]["outline"] == 3  # untouched
+
     def test_invalid_timeline_rejected(self):
         timeline = make_timeline()
         tl.video_items(timeline)[0]["src_end"] = -1
