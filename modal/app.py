@@ -469,7 +469,10 @@ def _transcribe_worker(clip_id: str) -> None:
 
 # Separate image: CPU PyTorch + WhisperX wav2vec2 alignment model.
 # Built separately from the transcription image to keep layer caching clean.
-align_image = (
+# Build layers only, with no local files mounted yet. Modal forbids a build
+# step after `add_local_*`, so anything deriving from this (lyric_image) must
+# branch from here rather than from align_image.
+align_base = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
     .run_commands(
@@ -489,6 +492,10 @@ align_image = (
         "boto3>=1.34",
         "supabase>=2.10",
     )
+)
+
+align_image = (
+    align_base
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
     .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
 )
@@ -1071,14 +1078,19 @@ def _align_worker(
 # Lyric forced alignment
 # ---------------------------------------------------------------------------
 
-# Derived from align_image (same torch/whisperx/wav2vec2 stack) rather than
-# modifying it, so the transcription-alignment worker's image is untouched.
+# Branches from align_base (same torch/whisperx/wav2vec2 stack), NOT from
+# align_image: Modal rejects a build step layered after `add_local_*`, and
+# align_image ends with its local-file mounts. Building from the base also
+# leaves align_image's layers untouched, so the transcription-alignment
+# worker does not rebuild.
 # whisperx.align() sentence-splits with NLTK punkt, so the data is baked in
 # here — the worker has no writable HOME to download it into at runtime.
-lyric_image = align_image.run_commands(
-    "python -c \"import nltk; nltk.download('punkt_tab')\""
-).add_local_file(
-    Path(__file__).parent / "lyric_align.py", "/root/lyric_align.py"
+lyric_image = (
+    align_base
+    .run_commands("python -c \"import nltk; nltk.download('punkt_tab')\"")
+    .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
+    .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
+    .add_local_file(Path(__file__).parent / "lyric_align.py", "/root/lyric_align.py")
 )
 
 
