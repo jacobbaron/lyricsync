@@ -4293,3 +4293,4 @@ def _analyze_clip_audio_worker(clip_id: str) -> None:
             f"prob={'yes' if prob else 'energy-gate'}, "
             f"{len(intervals)} speech intervals, {len(words)} words"
         )
+
