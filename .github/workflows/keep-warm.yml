@@ -1,0 +1,52 @@
+name: Keep warm
+
+# Supabase pauses free-tier projects after ~7 days without database activity.
+# When that happens the Vercel frontend stays up but every authenticated route
+# 401s and magic-link sign-in breaks, because auth and all data live on the
+# paused project. Hitting /api/health runs a real Postgres read, which both
+# resets that idle timer and verifies the database is actually reachable.
+#
+# A failing run is the alert: GitHub emails the repo owner when a scheduled
+# workflow fails.
+
+on:
+  schedule:
+    # Every 6 hours — far inside the ~7-day idle window, so several checks can
+    # fail or be skipped before the project is ever at risk of pausing.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Ping /api/health
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check database-backed health endpoint
+        env:
+          # Override by setting a LYRICSYNC_BASE_URL repository variable.
+          BASE_URL: ${{ vars.LYRICSYNC_BASE_URL || 'https://lyricsync-ten.vercel.app' }}
+        run: |
+          set -uo pipefail
+          base="${BASE_URL%/}"
+
+          # Retry so a transient blip or a cold start doesn't page anyone;
+          # only a sustained failure fails the job.
+          for attempt in 1 2 3; do
+            body=$(curl -sS --max-time 30 -w $'\n%{http_code}' "$base/api/health" || true)
+            code=$(printf '%s' "$body" | tail -n1)
+            payload=$(printf '%s' "$body" | sed '$d')
+
+            echo "attempt $attempt: HTTP ${code:-000}"
+            [ -n "$payload" ] && echo "$payload"
+
+            if [ "$code" = "200" ]; then
+              echo "Database is up."
+              exit 0
+            fi
+
+            [ "$attempt" -lt 3 ] && sleep 15
+          done
+
+          echo "::error::/api/health did not return 200 after 3 attempts — the Supabase project may be paused. Check https://supabase.com/dashboard/project/ywfdqggvqrapwvxdzrfi"
+          exit 1
