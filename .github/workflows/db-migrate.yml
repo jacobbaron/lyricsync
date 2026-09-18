@@ -48,9 +48,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned, not `latest`: resolving `latest` makes an unauthenticated
+      # GitHub API call per run, which intermittently fails the whole job with
+      # "Failed to resolve latest Supabase CLI release: rate limit exceeded"
+      # (the runner's IP is shared). The action takes no token input, so a
+      # fixed version is the only way to skip that call. Bump deliberately.
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: 2.117.0
 
       - name: Check required secrets
         run: |

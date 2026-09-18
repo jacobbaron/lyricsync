@@ -1068,6 +1068,180 @@ def _align_worker(
 
 
 # ---------------------------------------------------------------------------
+# Lyric forced alignment
+# ---------------------------------------------------------------------------
+
+# Derived from align_image (same torch/whisperx/wav2vec2 stack) rather than
+# modifying it, so the transcription-alignment worker's image is untouched.
+# whisperx.align() sentence-splits with NLTK punkt, so the data is baked in
+# here — the worker has no writable HOME to download it into at runtime.
+lyric_image = align_image.run_commands(
+    "python -c \"import nltk; nltk.download('punkt_tab')\""
+).add_local_file(
+    Path(__file__).parent / "lyric_align.py", "/root/lyric_align.py"
+)
+
+
+def _set_lyric_alignment(sb, alignment_id: str, **fields) -> None:
+    sb.table("lyric_alignments").update(fields).eq("id", alignment_id).execute()
+
+
+@app.function(image=lyric_image, secrets=secrets, timeout=60)
+@modal.fastapi_endpoint(method="POST")
+async def align_lyrics(request: Request) -> JSONResponse:
+    """Vercel calls this endpoint; it authenticates, spawns the worker, and
+    returns {"status": "accepted"} immediately so Vercel doesn't time out."""
+    secret = request.headers.get("x-webhook-secret", "")
+    expected = os.environ.get("MODAL_WEBHOOK_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+    alignment_id = body.get("alignment_id")
+    if not alignment_id:
+        raise HTTPException(status_code=400, detail="alignment_id required")
+
+    await _align_lyrics_worker.spawn.aio(alignment_id)
+    return JSONResponse({"status": "accepted"})
+
+
+@app.function(image=lyric_image, secrets=secrets, timeout=1800)
+def _align_lyrics_worker(alignment_id: str) -> None:
+    """Force-align known lyrics to a clip's audio.
+
+    Unlike _align_worker — which refines timings for whatever Whisper *heard* —
+    this takes the text as given and solves only for timing. That is the only
+    thing that works on sung audio: ASR mishears lyrics, drops lines under loud
+    instrumentation, and loops on repeated refrains.
+
+    The clip's existing raw transcript is used as *anchor evidence* to window
+    the audio before alignment (see modal/lyric_align.py for why a single
+    whole-track segment does not work), but it never contributes text — every
+    word that lands in the result comes from the submitted lyrics.
+    """
+    import whisperx
+
+    import lyric_align
+
+    sb = _supabase()
+    r2 = _r2()
+    bucket = os.environ["R2_BUCKET_NAME"]
+
+    row = (
+        sb.table("lyric_alignments")
+        .select("id, clip_id, lyrics")
+        .eq("id", alignment_id)
+        .single()
+        .execute()
+    ).data
+    if not row:
+        print(f"[lyrics] alignment {alignment_id} not found")
+        return
+
+    try:
+        clip = (
+            sb.table("clips")
+            .select("id, r2_key, filename, transcript_r2_key, duration_secs")
+            .eq("id", row["clip_id"])
+            .single()
+            .execute()
+        ).data
+        if not clip or not clip.get("r2_key"):
+            raise ValueError(f"clip {row['clip_id']} has no media")
+
+        lines = lyric_align.parse_lyrics_text(row.get("lyrics") or "")
+        if not lines:
+            raise ValueError("lyrics contain no caption lines")
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+
+            ext = Path(clip["r2_key"]).suffix or ".mp4"
+            media_path = tmp / f"{clip['id']}{ext}"
+            r2.download_file(bucket, clip["r2_key"], str(media_path))
+
+            audio_path = tmp / f"{clip['id']}.wav"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(media_path),
+                    "-vn", "-ac", "1", "-ar", "16000", str(audio_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            # Anchors: the clip's existing transcript, if it has one. Absent or
+            # unreadable is fine — planning then falls back to one whole-track
+            # window, which is simply less precise.
+            asr_words: list[dict] = []
+            if clip.get("transcript_r2_key"):
+                try:
+                    tpath = tmp / "transcript.json"
+                    r2.download_file(
+                        bucket, clip["transcript_r2_key"], str(tpath)
+                    )
+                    asr_words = [
+                        {"text": w["word"], "local_start": w["start"],
+                         "local_end": w["end"]}
+                        for w in _words_from(json.loads(tpath.read_text()))
+                    ]
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[lyrics] no usable transcript anchors: {exc}")
+
+            wav = whisperx.load_audio(str(audio_path))
+            duration = float(clip.get("duration_secs") or 0) or (
+                len(wav) / 16000.0
+            )
+            windows = lyric_align.plan_windows(lines, asr_words, duration)
+            anchored = sum(1 for w in windows if w.anchored)
+            print(
+                f"[lyrics] {len(lines)} line(s) → {len(windows)} window(s) "
+                f"({anchored} anchored) over {duration:.1f}s"
+            )
+
+            model_a, metadata = whisperx.load_align_model(
+                language_code="en", device="cpu"
+            )
+
+            rows: list[dict] = []
+            for win in windows:
+                aligned = whisperx.align(
+                    [win.as_segment()], model_a, metadata, wav, "cpu",
+                    return_char_alignments=False,
+                )
+                # Always fold up from the flat word stream: whisperx re-splits
+                # the text into its own sentences, so its `segments` do not
+                # correspond to the lines that went in.
+                rows += lyric_align.aggregate_words(
+                    list(win.lines), aligned.get("word_segments", [])
+                )
+
+            captions = lyric_align.tidy_lines(rows)
+
+        scores = [r["score"] for r in captions if r.get("score")]
+        result = {
+            "lines": captions,
+            "windows": len(windows),
+            "anchored_windows": anchored,
+            "coverage": round(len(captions) / len(lines), 3),
+            "mean_score": round(sum(scores) / len(scores), 3) if scores else 0.0,
+        }
+        _set_lyric_alignment(
+            sb, alignment_id, status="ready", result=result, error=None
+        )
+        print(
+            f"[lyrics] {alignment_id} ready — {len(captions)}/{len(lines)} "
+            f"line(s) timed, mean score {result['mean_score']}"
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        print(f"[lyrics] error for alignment {alignment_id}: {msg}")
+        _set_lyric_alignment(sb, alignment_id, status="error", error=msg[:500])
+
+
+# ---------------------------------------------------------------------------
 # P2-02: Generate Stories Task
 # ---------------------------------------------------------------------------
 

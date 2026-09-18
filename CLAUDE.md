@@ -102,6 +102,7 @@ DB migrate). Don't call a merge done until you've checked them all:
 |---|---|---|
 | `MODAL_WEBHOOK_SECRET` | Vercel env | Authenticates Vercel → Modal calls |
 | `MODAL_EDIT_URL` | Vercel env | Modal `edit_timeline` endpoint (timeline edit ops, see docs/timeline_editing.md) |
+| `MODAL_LYRIC_ALIGN_URL` | Vercel env | Modal `align_lyrics` endpoint (force-align known lyrics, see docs/lyric_alignment.md) |
 | `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` | GitHub secrets | Modal deploy in GHA |
 | `GEMINI_API_KEY` | Modal secret `lyricsync-secrets` | Gemini visual analysis |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Modal secret `lyricsync-secrets` | DB access from Modal workers |
@@ -233,6 +234,16 @@ Returns `409` until `status=done`. **To give the user a video:** hand them the
 use `SendUserFile`, the login-gated `/stories/[id]` page, or a raw pasted URL;
 all have failed for the user. The `/api/stories/[id]/video` route needs a
 browser session (401 with an API key).
+
+## Lyrics (sung audio — align known text, don't transcribe it)
+
+For music, ASR is the wrong tool: it mishears lyrics, drops lines under loud
+instrumentation, and loops on repeated refrains. Send the lyrics you already
+have to `POST /api/clips/{id}/align-lyrics {lyrics}` and poll `GET` on the same
+path — the worker solves only for timing, so nothing is invented. `result.lines`
+is `[{text, start, end, score}]` in clip-local seconds, which drops straight onto
+a timeline text track via `add_text`. Write the sheet as *performed* (repeat the
+chorus as many times as the take does). See `docs/lyric_alignment.md`.
 
 ## Transcripts (match overlay copy to what's said)
 

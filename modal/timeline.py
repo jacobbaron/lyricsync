@@ -66,6 +66,29 @@ TEXT_POSITIONS = ("center", "upper", "lower")
 # `box_opacity`.
 DEFAULT_BOX_OPACITY = 0.75
 
+# Caption styling. A box is the readable-anywhere default, but for lyric
+# captions an outlined glyph over bare picture reads better, so `color`,
+# `outline` (+ `outline_color`) and `fade` are offered per item. Set
+# `box_opacity: 0` to drop the box entirely and rely on the outline.
+#
+# Colors land inside an ffmpeg filter string, so they are whitelisted rather
+# than passed through: a name from TEXT_COLORS, or #RRGGBB.
+TEXT_COLORS = (
+    "white", "black", "gray", "silver", "yellow", "gold", "orange", "red",
+    "pink", "magenta", "purple", "blue", "cyan", "green", "lime",
+)
+_HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
+MAX_OUTLINE_W = 12
+MAX_TEXT_FADE_S = 2.0
+# Fades shorter than this are imperceptible and just cost filter complexity.
+MIN_TEXT_FADE_S = 0.05
+
+# Style fields an add_text/update_text op may carry through to the item.
+TEXT_STYLE_KEYS = (
+    "size", "position", "wrap", "box_opacity",
+    "color", "outline", "outline_color", "fade",
+)
+
 # Optional per-clip audio effects, applied after the speed/resample stage.
 # Each value is an ffmpeg audio-filter chain (aecho gives an echo/reverb wash) —
 # handy for exaggerated "bad room" sounds in before/after gags. aecho preserves
@@ -259,7 +282,7 @@ def timeline_from_ranges(ranges: list[dict]) -> dict:
                 "start": round(out_pos + t_in, 3),
                 "end": round(out_pos + min(t_out, seg_len), 3),
             }
-            for key in ("size", "position", "wrap", "box_opacity"):
+            for key in TEXT_STYLE_KEYS:
                 if overlay.get(key) is not None:
                     text[key] = overlay[key]
             texts.append(text)
@@ -444,6 +467,23 @@ def validate_timeline(timeline: dict) -> list[str]:
             isinstance(box_opacity, (int, float)) and 0 <= box_opacity <= 1
         ):
             errors.append(f"{label}: box_opacity must be between 0 and 1")
+        for key in ("color", "outline_color"):
+            val = item.get(key)
+            if val is not None and _color_expr(val) is None:
+                errors.append(
+                    f"{label}: {key} must be #RRGGBB or one of "
+                    f"{', '.join(TEXT_COLORS)}"
+                )
+        outline = item.get("outline")
+        if outline is not None and not (
+            isinstance(outline, (int, float)) and 0 <= outline <= MAX_OUTLINE_W
+        ):
+            errors.append(f"{label}: outline must be between 0 and {MAX_OUTLINE_W}")
+        fade = item.get("fade")
+        if fade is not None and not (
+            isinstance(fade, (int, float)) and 0 <= fade <= MAX_TEXT_FADE_S
+        ):
+            errors.append(f"{label}: fade must be between 0 and {MAX_TEXT_FADE_S}")
 
     errors.extend(_validate_music(timeline.get("music")))
     return errors
@@ -662,7 +702,7 @@ def _op_add_text(timeline: dict, op: dict) -> None:
         "start": op.get("start"),
         "end": op.get("end"),
     }
-    for key in ("size", "position", "wrap", "box_opacity"):
+    for key in TEXT_STYLE_KEYS:
         if op.get(key) is not None:
             item[key] = op[key]
     items.append(item)
@@ -670,8 +710,7 @@ def _op_add_text(timeline: dict, op: dict) -> None:
 
 def _op_update_text(timeline: dict, op: dict) -> None:
     item = _find_text(timeline, op.get("id", ""))
-    for key in ("text", "start", "end", "size", "position", "wrap",
-                "box_opacity"):
+    for key in ("text", "start", "end", *TEXT_STYLE_KEYS):
         if op.get(key) is not None:
             item[key] = op[key]
 
@@ -1390,6 +1429,32 @@ def _atempo_chain(speed: float) -> str:
     return ",".join(f"atempo={f:.6g}" for f in factors)
 
 
+def _color_expr(value: object) -> str | None:
+    """Map a caption color to an ffmpeg color token, or None if unacceptable.
+
+    Whitelist-only: the result is interpolated into a filter string, so an
+    arbitrary value would let a caption inject filter syntax.
+    """
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    if raw in TEXT_COLORS:
+        return raw
+    if _HEX_COLOR_RE.match(raw):
+        return "0x" + raw.lstrip("#")
+    return None
+
+
+def _alpha_expr(start: float, end: float, fade: float) -> str:
+    """drawtext alpha ramp: fade in over the first `fade` seconds of the item's
+    window and out over the last. Commas are escaped for filter_complex."""
+    a, b = start + fade, end - fade
+    return (
+        f"if(lt(t\\,{a:.3f})\\,(t-{start:.3f})/{fade:.3f}\\,"
+        f"if(lt(t\\,{b:.3f})\\,1\\,({end:.3f}-t)/{fade:.3f}))"
+    )
+
+
 def _drawtext(item: dict, textfile: str, font_path: str) -> str:
     """Build one drawtext filter for a text item (output-time enable window)."""
     size = int(item.get("size") or 64)
@@ -1402,14 +1467,30 @@ def _drawtext(item: dict, textfile: str, font_path: str) -> str:
     }.get(pos, "(h-text_h)/2")
     start = float(item["start"])
     end = float(item["end"])
+    color = _color_expr(item.get("color")) or "white"
+    outline = float(item.get("outline") or 0)
+    outline_color = _color_expr(item.get("outline_color")) or "black"
+    fade = float(item.get("fade") or 0)
+
+    parts = [
+        f"drawtext=fontfile={font_path}",
+        f"textfile={textfile}",
+        f"fontcolor={color}",
+        f"fontsize={size}",
+        "line_spacing=14",
+        f"box=1:boxcolor=black@{opacity:.3g}:boxborderw=30",
+        "x=(w-text_w)/2",
+        f"y={yexpr}",
+    ]
+    if outline > 0:
+        parts.append(f"borderw={outline:.3g}:bordercolor={outline_color}")
+    # A fade needs room for both ramps inside the window; below that the item is
+    # shown flat rather than never reaching full opacity.
+    if MIN_TEXT_FADE_S <= fade and end - start > 2 * fade:
+        parts.append(f"alpha='{_alpha_expr(start, end, fade)}'")
     # Commas inside the enable expression must be escaped within filter_complex.
-    enable = f"between(t\\,{start:.3f}\\,{end:.3f})"
-    return (
-        f"drawtext=fontfile={font_path}:textfile={textfile}:"
-        f"fontcolor=white:fontsize={size}:line_spacing=14:"
-        f"box=1:boxcolor=black@{opacity:.3g}:boxborderw=30:"
-        f"x=(w-text_w)/2:y={yexpr}:enable='{enable}'"
-    )
+    parts.append(f"enable='between(t\\,{start:.3f}\\,{end:.3f})'")
+    return ":".join(parts)
 
 
 def compile_timeline(
