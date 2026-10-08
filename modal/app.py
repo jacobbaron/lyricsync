@@ -1088,6 +1088,9 @@ def _align_worker(
 lyric_image = (
     align_base
     .run_commands("python -c \"import nltk; nltk.download('punkt_tab')\"")
+    # Song-level alignment transcribes the master once for anchors, through
+    # the same Whisper API the clip transcription worker uses.
+    .pip_install("openai>=1.40")
     .add_local_file(Path(__file__).parent / "transcript.py", "/root/transcript.py")
     .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
     .add_local_file(Path(__file__).parent / "lyric_align.py", "/root/lyric_align.py")
@@ -1117,19 +1120,75 @@ async def align_lyrics(request: Request) -> JSONResponse:
     return JSONResponse({"status": "accepted"})
 
 
+def _song_anchor_words(sb, r2, bucket: str, song: dict, audio_path: Path,
+                       tmp: Path) -> list[dict]:
+    """ASR anchor words for a song, transcribing it once and caching the result.
+
+    Songs have no transcript of their own (clips get one at upload), so the
+    first song-level lyric alignment runs the master through Whisper — the same
+    API call as _transcribe_worker — and stores it at songs.transcript_r2_key.
+    The words are anchor evidence only; none of their text reaches a caption.
+    """
+    tpath = tmp / "song_transcript.json"
+    key = song.get("transcript_r2_key")
+    if key:
+        r2.download_file(bucket, key, str(tpath))
+        data = json.loads(tpath.read_text())
+    else:
+        from openai import OpenAI
+
+        mp3 = tmp / "song_asr.mp3"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(audio_path), "-vn", "-ac", "1",
+                "-ar", "16000", "-b:a", AUDIO_BITRATE, str(mp3),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if mp3.stat().st_size > WHISPER_LIMIT_BYTES:
+            raise ValueError("song audio exceeds the Whisper upload limit")
+        with mp3.open("rb") as f:
+            resp = OpenAI().audio.transcriptions.create(
+                file=f,
+                model="whisper-1",
+                response_format="verbose_json",
+                timestamp_granularities=["word", "segment"],
+            )
+        data = resp.model_dump()
+        key = f"projects/{song['project_id']}/songs/{song['id']}/transcript.json"
+        r2.put_object(
+            Bucket=bucket, Key=key, Body=json.dumps(data).encode(),
+            ContentType="application/json",
+        )
+        sb.table("songs").update({"transcript_r2_key": key}).eq(
+            "id", song["id"]
+        ).execute()
+        print(f"[lyrics] transcribed song {song['id']} → {key}")
+    return [
+        {"text": w["word"], "local_start": w["start"], "local_end": w["end"]}
+        for w in _words_from(data)
+    ]
+
+
 @app.function(image=lyric_image, secrets=secrets, timeout=1800)
 def _align_lyrics_worker(alignment_id: str) -> None:
-    """Force-align known lyrics to a clip's audio.
+    """Force-align known lyrics to a clip's audio, or to a song master.
 
     Unlike _align_worker — which refines timings for whatever Whisper *heard* —
     this takes the text as given and solves only for timing. That is the only
     thing that works on sung audio: ASR mishears lyrics, drops lines under loud
     instrumentation, and loops on repeated refrains.
 
-    The clip's existing raw transcript is used as *anchor evidence* to window
-    the audio before alignment (see modal/lyric_align.py for why a single
+    The target's raw transcript is used as *anchor evidence* to window the
+    audio before alignment (see modal/lyric_align.py for why a single
     whole-track segment does not work), but it never contributes text — every
-    word that lands in the result comes from the submitted lyrics.
+    word that lands in the result comes from the submitted lyrics. A clip
+    already has a transcript; a song is transcribed on first use (and cached).
+
+    Result times are in the target's own frame: clip-local seconds for a clip,
+    song time for a song.
     """
     import whisperx
 
@@ -1141,7 +1200,7 @@ def _align_lyrics_worker(alignment_id: str) -> None:
 
     row = (
         sb.table("lyric_alignments")
-        .select("id, clip_id, lyrics")
+        .select("id, clip_id, song_id, lyrics")
         .eq("id", alignment_id)
         .single()
         .execute()
@@ -1151,15 +1210,29 @@ def _align_lyrics_worker(alignment_id: str) -> None:
         return
 
     try:
-        clip = (
-            sb.table("clips")
-            .select("id, r2_key, filename, transcript_r2_key, duration_secs")
-            .eq("id", row["clip_id"])
-            .single()
-            .execute()
-        ).data
-        if not clip or not clip.get("r2_key"):
-            raise ValueError(f"clip {row['clip_id']} has no media")
+        if row.get("song_id"):
+            target = (
+                sb.table("songs")
+                .select("id, project_id, r2_key, transcript_r2_key, "
+                        "duration_secs, status")
+                .eq("id", row["song_id"])
+                .single()
+                .execute()
+            ).data
+            if not target or not target.get("r2_key"):
+                raise ValueError(f"song {row['song_id']} has no media")
+            if target.get("status") != "ready":
+                raise ValueError(f"song {row['song_id']} is not ready")
+        else:
+            target = (
+                sb.table("clips")
+                .select("id, r2_key, filename, transcript_r2_key, duration_secs")
+                .eq("id", row["clip_id"])
+                .single()
+                .execute()
+            ).data
+            if not target or not target.get("r2_key"):
+                raise ValueError(f"clip {row['clip_id']} has no media")
 
         lines = lyric_align.parse_lyrics_text(row.get("lyrics") or "")
         if not lines:
@@ -1168,11 +1241,11 @@ def _align_lyrics_worker(alignment_id: str) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
 
-            ext = Path(clip["r2_key"]).suffix or ".mp4"
-            media_path = tmp / f"{clip['id']}{ext}"
-            r2.download_file(bucket, clip["r2_key"], str(media_path))
+            ext = Path(target["r2_key"]).suffix or ".mp4"
+            media_path = tmp / f"{target['id']}{ext}"
+            r2.download_file(bucket, target["r2_key"], str(media_path))
 
-            audio_path = tmp / f"{clip['id']}.wav"
+            audio_path = tmp / f"{target['id']}.wav"
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-i", str(media_path),
@@ -1183,26 +1256,30 @@ def _align_lyrics_worker(alignment_id: str) -> None:
                 stderr=subprocess.DEVNULL,
             )
 
-            # Anchors: the clip's existing transcript, if it has one. Absent or
-            # unreadable is fine — planning then falls back to one whole-track
-            # window, which is simply less precise.
+            # Anchors: the target's transcript. Absent or unreadable is fine —
+            # planning then falls back to one whole-track window, which is
+            # simply less precise.
             asr_words: list[dict] = []
-            if clip.get("transcript_r2_key"):
-                try:
+            try:
+                if row.get("song_id"):
+                    asr_words = _song_anchor_words(
+                        sb, r2, bucket, target, audio_path, tmp
+                    )
+                elif target.get("transcript_r2_key"):
                     tpath = tmp / "transcript.json"
                     r2.download_file(
-                        bucket, clip["transcript_r2_key"], str(tpath)
+                        bucket, target["transcript_r2_key"], str(tpath)
                     )
                     asr_words = [
                         {"text": w["word"], "local_start": w["start"],
                          "local_end": w["end"]}
                         for w in _words_from(json.loads(tpath.read_text()))
                     ]
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[lyrics] no usable transcript anchors: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[lyrics] no usable transcript anchors: {exc}")
 
             wav = whisperx.load_audio(str(audio_path))
-            duration = float(clip.get("duration_secs") or 0) or (
+            duration = float(target.get("duration_secs") or 0) or (
                 len(wav) / 16000.0
             )
             windows = lyric_align.plan_windows(lines, asr_words, duration)
@@ -1234,6 +1311,7 @@ def _align_lyrics_worker(alignment_id: str) -> None:
         scores = [r["score"] for r in captions if r.get("score")]
         result = {
             "lines": captions,
+            "time_base": "song" if row.get("song_id") else "clip",
             "windows": len(windows),
             "anchored_windows": anchored,
             "coverage": round(len(captions) / len(lines), 3),
