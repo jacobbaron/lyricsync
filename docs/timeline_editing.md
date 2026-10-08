@@ -71,6 +71,15 @@ Implementation map:
   around the glyphs, and `fade` (0–2 s) ramps the caption in and out; a fade is
   skipped when the item is too short to fit both ramps. For lyric captions,
   `box_opacity: 0` plus an `outline` of 3–4 reads better than the box.
+- `crop` (optional, clips only) zooms into part of the source: `{x, y, w, h}`
+  as fractions (0–1) of the source's display frame — `(x, y)` is the top-left
+  corner, `(w, h)` the size, each side ≥ 0.1 (≤ 10× zoom). The region is
+  scaled to **cover** the canvas (centred, overflow trimmed), so it never
+  letterboxes. To see exactly the region you picked, match the canvas aspect:
+  `(w·iw)/(h·ih) = width/height` — when the source and canvas share an aspect
+  (9:16 footage on a 9:16 canvas) that is simply `w == h`. Typical use: a face close-up cut from a locked-off wide, synced
+  by using the same `src_start`/`src_end` as the wide. Upscaling is real — a
+  0.4-wide crop of 1080p footage is ~430 px blown up to 1080, so it softens.
 - `note` is informational (the transcript text the item came from) and has no
   effect on rendering.
 
@@ -88,8 +97,9 @@ invalid, nothing is saved and the error message says which op failed and why.
 | `delete` | `id` | Remove a video item |
 | `set_speed` | `id`, `speed` | 0.25–20.0; clips only |
 | `set_mute` | `id`, `mute` | `true` silences the clip (e.g. silent time-lapse); clips only |
+| `set_crop` | `id`, `crop` | `{x, y, w, h}` (fractions 0–1 of the source frame) zooms into that region; `null` clears. Clips only — see "Crop / zoom" below |
 | `set_transition` | `id`, `transition` | `null` or `{"type": "crossfade", "duration": s}` (joins to previous item) |
-| `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`?, `clip_id`? | Appends when `index` omitted. `clip_id` (uuid) references a clip in *any* project (cross-project cuts — see `docs/cross_project_editing.md`); `source` is then just a label |
+| `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`?, `clip_id`?, `crop`? | Appends when `index` omitted. `clip_id` (uuid) references a clip in *any* project (cross-project cuts — see `docs/cross_project_editing.md`); `source` is then just a label |
 | `insert_blank` | `duration`, `index`? | Black + silence spacer |
 | `add_text` | `text`, `start`, `end`, `size`?, `position`?, `wrap`?, `box_opacity`?, `color`?, `outline`?, `outline_color`?, `fade`? | Output-time window |
 | `update_text` | `id`, any text fields | Partial update |

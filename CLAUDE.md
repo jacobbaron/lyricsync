@@ -202,6 +202,9 @@ for 3:4 footage. Per-clip video-item knobs: `speed` (0.25–20×, slow-mo / fast
 `mute` (silence the clip — e.g. a silent time-lapse, via the `set_mute` op)
 and `audio_fx` (`echo` | `reverb` | `cavern` — `aecho`-based echo/reverb wash,
 e.g. for exaggerated "bad room" gags).
+`crop` (`{x, y, w, h}` fractions of the source frame, via `set_crop` or
+`insert_clip`) zooms into a region — e.g. face close-ups cut from one wide
+shot, kept in sync by reusing the wide's `src_start`/`src_end`.
 
 ⚠️ **Vocabulary:** "crop" here means **trimming the time range** (`start`/`end`),
 **not** reframing the picture.
@@ -423,7 +426,7 @@ screen instead of the face, it's a blurry pan, it's sideways/letterboxed).
   the **edit API** — `POST /api/stories/[id]/edit` ops (`set_speed`, `set_mute`,
   `set_transition`, `trim`, `insert_blank`, `add_text`, …). See
   `docs/timeline_editing.md`.
-- Per-clip knobs: `speed` 0.25–20× (slow-mo / fast / **time-lapse**), `mute`
+- Per-clip knobs: `crop` (zoom/reframe — close-ups from a wide), `speed` 0.25–20× (slow-mo / fast / **time-lapse**), `mute`
   (silent time-lapse), `audio_fx` (echo/reverb), `overlay` drawtext cards,
   `blank` black cards.
 - **Time-lapse:** high `speed` + `mute` = clean silent fast-motion. Or a
