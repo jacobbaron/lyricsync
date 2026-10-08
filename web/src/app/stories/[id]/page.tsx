@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { StoryViewer } from "./StoryViewer";
 import { LibrarySearch } from "./LibrarySearch";
+import { MusicBed } from "./MusicBed";
 
 interface Props {
   params: Promise<{ id: string }>;
@@ -23,7 +24,7 @@ export default async function StoryPage({ params }: Props) {
 
   const { data: story } = await supabase
     .from("stories")
-    .select("id, project_id, status, error_message, render_r2_key, created_at")
+    .select("id, project_id, status, error_message, render_r2_key, created_at, music_json, render_epoch")
     .eq("id", storyId)
     .maybeSingle();
 
@@ -51,7 +52,19 @@ export default async function StoryPage({ params }: Props) {
           Cut
         </h1>
 
-        <StoryViewer storyId={storyId} initialStory={story} />
+        {/* Keyed on status + epoch so a bed/caption change (router.refresh)
+            remounts the viewer into its polling state. */}
+        <StoryViewer
+          key={`${story.status}-${story.render_epoch ?? 0}`}
+          storyId={storyId}
+          initialStory={story}
+        />
+
+        <MusicBed
+          storyId={storyId}
+          projectId={story.project_id}
+          initialBed={story.music_json}
+        />
 
         <LibrarySearch storyId={storyId} />
       </div>
