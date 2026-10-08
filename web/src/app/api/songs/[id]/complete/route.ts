@@ -1,13 +1,15 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { resolveAuth } from "@/lib/auth/resolve";
+import { startSongSync } from "@/lib/songs/sync";
 
 export const runtime = "nodejs";
 
 // ── POST /api/songs/[id]/complete ───────────────────────────────────────────
 // Called after the client PUTs the audio to the presigned URL. Marks the song
-// 'ready' so it can be aligned/rendered against. Optional duration_secs (the
-// client already has the file and can probe it) is stored for display.
+// 'ready' so it can be aligned/rendered against, then auto-syncs it to every
+// clip of the project (see POST /api/songs/[id]/sync). Optional durationSecs
+// (the client already has the file and can probe it) is stored for display.
 
 const Body = z
   .object({ durationSecs: z.number().positive().max(36000).optional() })
@@ -36,7 +38,7 @@ export async function POST(
   // RLS scopes this to songs in the caller's projects.
   const { data: song } = await supabase
     .from("songs")
-    .select("id, r2_key")
+    .select("id, project_id, r2_key")
     .eq("id", songId)
     .maybeSingle();
   if (!song) {
@@ -61,5 +63,14 @@ export async function POST(
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  return NextResponse.json({ songId, status: "ready" });
+  // Locate every clip inside the new song. A sync failure doesn't undo the
+  // upload — the song is ready either way, and /sync can be re-run.
+  let sync: Awaited<ReturnType<typeof startSongSync>> | { error: string };
+  try {
+    sync = await startSongSync(supabase, song);
+  } catch (err) {
+    sync = { error: err instanceof Error ? err.message : "sync failed" };
+  }
+
+  return NextResponse.json({ songId, status: "ready", sync });
 }

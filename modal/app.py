@@ -3986,6 +3986,7 @@ music_align_image = (
     .add_local_file(Path(__file__).parent / "timeline.py", "/root/timeline.py")
     # Imported lazily inside the worker — only this image needs librosa.
     .add_local_file(Path(__file__).parent / "music_align.py", "/root/music_align.py")
+    .add_local_file(Path(__file__).parent / "song_sync.py", "/root/song_sync.py")
 )
 
 
@@ -4024,12 +4025,20 @@ async def align_music(request: Request) -> JSONResponse:
     volumes={RENDER_CACHE_DIR: render_cache},
 )
 def _align_music_worker(alignment_id: str) -> None:
-    """Locate a clip's footage window inside a song (chroma-DTW) and store the
-    footage↔song mapping on the clip_alignments row. Durable, reusable metadata:
-    `song_start` is the song time that lines up with `footage_start`, so any cut
-    can lip-sync that footage to a bed of the same song.
+    """Locate a clip's footage window inside a song and store the footage↔song
+    mapping on the clip_alignments row. Durable, reusable metadata: `song_start`
+    is the song time that lines up with `footage_start`, so any cut can lip-sync
+    that footage to a bed of the same song.
+
+    Tries the same-take fast path first (onset-envelope xcorr + attack-curve
+    refinement, modal/song_sync.py), which is exact when the master is a mix of
+    the filmed performance and also reports drift across the window. When its
+    peak isn't trusted (a different take or arrangement) it falls back to
+    chroma-DTW (modal/music_align.py), which absorbs tempo differences.
     """
     import music_align  # heavy (librosa); only this image has it
+    import soundfile
+    import song_sync
 
     sb = _supabase()
     r2 = _r2()
@@ -4073,31 +4082,65 @@ def _align_music_worker(alignment_id: str) -> None:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            song_path = tmp / f"song{Path(song['r2_key']).suffix or '.mp3'}"
-            r2.download_file(bucket, song["r2_key"], str(song_path))
-            # Fast-seek the footage window to wav for librosa.
+            song_src = tmp / f"song_src{Path(song['r2_key']).suffix or '.mp3'}"
+            r2.download_file(bucket, song["r2_key"], str(song_src))
+            # Decode both sides to mono wav at one rate: masters arrive as
+            # wav/mp3/m4a/aiff/flac, and soundfile can't read all of those.
+            song_path = tmp / "song.wav"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error", "-i", str(song_src),
+                    "-vn", "-ac", "1", "-ar", str(song_sync.SR), str(song_path),
+                ],
+                check=True,
+            )
+            # Fast-seek the footage window to wav.
             win = tmp / "take.wav"
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-loglevel", "error",
                     "-ss", f"{footage_start:.3f}",
                     "-t", f"{footage_end - footage_start:.3f}",
-                    "-i", str(cached), "-ac", "1", "-ar", "22050", str(win),
+                    "-i", str(cached), "-vn", "-ac", "1",
+                    "-ar", str(song_sync.SR), str(win),
                 ],
                 check=True,
             )
-            res = music_align.align(str(win), str(song_path))
-        print(f"[align] alignment {alignment_id}: {res}")
+
+            take_y, _ = soundfile.read(str(win), dtype="float32")
+            song_y, _ = soundfile.read(str(song_path), dtype="float32")
+            fast = song_sync.sync(take_y, song_y)
+            print(f"[align] alignment {alignment_id} fast path: {fast}")
+            if fast["trusted"]:
+                update = {
+                    # The window wav starts at footage_start, so the window
+                    # offset is exactly the song time at footage_start.
+                    "song_start": fast["offset"],
+                    "cost": None,
+                    "method": "xcorr",
+                    "confidence": fast["confidence"],
+                    "drift_ms": fast["drift_ms"],
+                }
+            else:
+                res = music_align.align(str(win), str(song_path))
+                print(f"[align] alignment {alignment_id} DTW: {res}")
+                update = {
+                    "song_start": res["song_start"],
+                    "cost": res["cost"],
+                    "method": "dtw",
+                    "confidence": fast["confidence"],
+                    "drift_ms": None,
+                }
 
         sb.table("clip_alignments").update({
-            "song_start": res["song_start"],
-            "cost": res["cost"],
+            **update,
             "status": "ready",
             "error": None,
         }).eq("id", alignment_id).execute()
         print(
-            f"[align] alignment {alignment_id} → song_start={res['song_start']}s "
-            f"cost={res['cost']} (dur_ratio {res['dur_ratio']})"
+            f"[align] alignment {alignment_id} → song_start={update['song_start']}s "
+            f"via {update['method']} (confidence {update['confidence']}, "
+            f"drift {update['drift_ms']} ms)"
         )
 
     except Exception as exc:  # noqa: BLE001
