@@ -89,7 +89,7 @@ curl -sS -XPOST -H "$AUTH" -H 'Content-Type: application/json' \
 curl -sS -XPATCH -H "$AUTH" -H 'Content-Type: application/json' \
   "$BASE/api/stories/$SID" -d '{"title":"New title"}'
 ```
-Edit ops: `trim`, `split`, `move`, `delete`, `set_speed`, `set_mute`,
+Edit ops: `trim`, `split`, `move`, `delete`, `set_speed`, `set_mute`, `set_crop`,
 `set_transition`, `insert_clip`, `insert_blank`, `add_text`, `clean_speech`.
 Items materialize as `v1..vN` from ranges; the first sub-item keeps the original id.
 

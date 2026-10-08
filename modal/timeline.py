@@ -59,6 +59,7 @@ AUDIO_SR = 48000
 RANGE_PAD_S = 0.08
 
 MIN_SPEED, MAX_SPEED = 0.25, 20.0  # up to 20x for time-lapse speed-ups
+MIN_CROP = 0.1  # smallest crop side (fraction of the frame) — caps zoom at 10x
 MAX_CROSSFADE_S = 3.0
 TEXT_POSITIONS = ("center", "upper", "lower")
 # Alpha of the box behind caption text. Dark enough to stay readable over the
@@ -297,6 +298,34 @@ def timeline_from_ranges(ranges: list[dict]) -> dict:
 # Validation
 # ---------------------------------------------------------------------------
 
+def _validate_crop(crop: object, label: str) -> list[str]:
+    """Validate an optional clip `crop` — a zoom into part of the source frame.
+
+    `{x, y, w, h}` are fractions (0–1) of the source's display frame: (x, y) is
+    the top-left corner, (w, h) the size. The region is scaled up to *cover*
+    the output canvas (centred, overflow trimmed), so it never letterboxes; a
+    region that already matches the canvas aspect is shown exactly.
+    """
+    if crop is None:
+        return []
+    if not isinstance(crop, dict):
+        return [f"{label}: crop must be an object {{x, y, w, h}} or null"]
+    vals = {}
+    for k in ("x", "y", "w", "h"):
+        v = crop.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return [f"{label}: crop.{k} must be a number between 0 and 1"]
+        vals[k] = float(v)
+    errors = []
+    if vals["w"] < MIN_CROP or vals["h"] < MIN_CROP:
+        errors.append(f"{label}: crop w/h must be >= {MIN_CROP} (at most a {1/MIN_CROP:g}x zoom)")
+    if vals["x"] < 0 or vals["y"] < 0:
+        errors.append(f"{label}: crop x/y must be >= 0")
+    if vals["x"] + vals["w"] > 1 + 1e-6 or vals["y"] + vals["h"] > 1 + 1e-6:
+        errors.append(f"{label}: crop region must lie inside the frame (x+w <= 1, y+h <= 1)")
+    return errors
+
+
 def validate_timeline(timeline: dict) -> list[str]:
     """Return a list of error strings; empty list means the timeline renders."""
     errors: list[str] = []
@@ -388,6 +417,11 @@ def validate_timeline(timeline: dict) -> list[str]:
             mute = item.get("mute")
             if mute is not None and not isinstance(mute, bool):
                 errors.append(f"{label}: mute must be true or false (got {mute!r})")
+                durations.append(max(0.0, e - s))
+                continue
+            crop_errs = _validate_crop(item.get("crop"), label)
+            if crop_errs:
+                errors.extend(crop_errs)
                 durations.append(max(0.0, e - s))
                 continue
         elif kind == "blank":
@@ -634,6 +668,19 @@ def _op_set_mute(timeline: dict, op: dict) -> None:
         item.pop("mute", None)
 
 
+def _op_set_crop(timeline: dict, op: dict) -> None:
+    _, item = _find_video(timeline, op.get("id", ""))
+    _require_clip(item, "set_crop")
+    crop = op.get("crop")
+    errs = _validate_crop(crop, "set_crop")
+    if errs:
+        raise TimelineError("; ".join(errs))
+    if crop is None:
+        item.pop("crop", None)
+    else:
+        item["crop"] = {k: float(crop[k]) for k in ("x", "y", "w", "h")}
+
+
 def _op_set_transition(timeline: dict, op: dict) -> None:
     idx, item = _find_video(timeline, op.get("id", ""))
     tr = op.get("transition")
@@ -666,6 +713,11 @@ def _op_insert_clip(timeline: dict, op: dict) -> None:
     # source; `source` may still be supplied as a human-readable label.
     if op.get("clip_id") is not None:
         item["clip_id"] = op.get("clip_id")
+    if op.get("crop") is not None:
+        errs = _validate_crop(op.get("crop"), "insert_clip")
+        if errs:
+            raise TimelineError("; ".join(errs))
+        item["crop"] = {k: float(op["crop"][k]) for k in ("x", "y", "w", "h")}
     index = op.get("index")
     if index is None:
         index = len(items)
@@ -731,6 +783,7 @@ _OPS = {
     "delete": _op_delete,
     "set_speed": _op_set_speed,
     "set_mute": _op_set_mute,
+    "set_crop": _op_set_crop,
     "set_transition": _op_set_transition,
     "insert_clip": _op_insert_clip,
     "insert_blank": _op_insert_blank,
@@ -1586,7 +1639,23 @@ def compile_timeline(
         # `mute` silences the clip's audio (kept length-matched via volume=0) —
         # e.g. a silent time-lapse. Applied last so it overrides any audio_fx.
         mute_chain = ",volume=0" if item.get("mute") else ""
-        parts.append(f"[{vidx}:v]{vsetpts},{vnorm}[v{i}]")
+        crop = item.get("crop")
+        if crop:
+            # Zoom: cut the region out of the (display-oriented) source, then
+            # scale it to *cover* the canvas and trim the overflow, so a crop
+            # whose aspect differs from the canvas fills it instead of
+            # letterboxing.
+            vchain = (
+                f"crop=w=iw*{float(crop['w']):.6g}:h=ih*{float(crop['h']):.6g}"
+                f":x=iw*{float(crop['x']):.6g}:y=ih*{float(crop['y']):.6g},"
+                f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+                f"crop={w}:{h},setsar=1,fps={fps}"
+            )
+            if has_xfade:
+                vchain += ",settb=AVTB"
+        else:
+            vchain = vnorm
+        parts.append(f"[{vidx}:v]{vsetpts},{vchain}[v{i}]")
         parts.append(
             f"[{vidx}:a]asetpts=PTS-STARTPTS,{aspeed}"
             f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}{mute_chain}[a{i}]"

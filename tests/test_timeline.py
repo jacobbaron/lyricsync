@@ -850,3 +850,83 @@ class TestMusicCompile:
         assert len(c["inputs"]) == 1
         assert "amix" not in c["filter_complex"]
         assert "anull[aout]" in c["filter_complex"]
+
+
+# ---------------------------------------------------------------------------
+# Crop / zoom (reframe part of the source, e.g. a face close-up from a wide)
+# ---------------------------------------------------------------------------
+
+FACE = {"x": 0.1, "y": 0.05, "w": 0.4, "h": 0.4}
+
+
+class TestCrop:
+    def test_valid_crop_validates(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["crop"] = FACE
+        assert tl.validate_timeline(t) == []
+
+    @pytest.mark.parametrize("crop,msg", [
+        ({"x": 0.7, "y": 0, "w": 0.4, "h": 0.4}, "inside the frame"),
+        ({"x": 0, "y": 0, "w": 0.05, "h": 0.4}, ">= 0.1"),
+        ({"x": -0.1, "y": 0, "w": 0.4, "h": 0.4}, ">= 0"),
+        ({"x": 0, "y": 0, "w": 0.4}, "crop.h must be a number"),
+        ("face", "must be an object"),
+    ])
+    def test_invalid_crop_rejected(self, crop, msg):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["crop"] = crop
+        errs = tl.validate_timeline(t)
+        assert errs and msg in "; ".join(errs)
+
+    def test_set_crop_op_sets_and_clears(self):
+        out = tl.apply_ops(make_timeline(1), [
+            {"op": "set_crop", "id": "v1", "crop": FACE},
+        ])
+        assert tl.video_items(out)[0]["crop"] == FACE
+        out = tl.apply_ops(out, [{"op": "set_crop", "id": "v1", "crop": None}])
+        assert "crop" not in tl.video_items(out)[0]
+
+    def test_set_crop_invalid_raises(self):
+        with pytest.raises(tl.TimelineError, match="inside the frame"):
+            tl.apply_ops(make_timeline(1), [
+                {"op": "set_crop", "id": "v1",
+                 "crop": {"x": 0.8, "y": 0, "w": 0.5, "h": 0.5}},
+            ])
+
+    def test_insert_clip_with_crop(self):
+        out = tl.apply_ops(make_timeline(1), [
+            {"op": "insert_clip", "source": "IMG_0001.mov",
+             "src_start": 20, "src_end": 24, "crop": FACE},
+        ])
+        assert tl.video_items(out)[1]["crop"] == FACE
+        assert "crop" not in tl.video_items(out)[0]
+
+    def test_split_carries_crop(self):
+        t = make_timeline(1)
+        tl.video_items(t)[0]["crop"] = FACE
+        out = tl.apply_ops(t, [{"op": "split", "id": "v1", "at": 2.0}])
+        assert all(it["crop"] == FACE for it in tl.video_items(out))
+
+    def test_compile_crops_then_covers_canvas(self):
+        t = make_timeline(2)
+        tl.video_items(t)[1]["crop"] = FACE
+        fc = compile_simple(t)["filter_complex"]
+        v0, v1 = [p for p in fc.split(";") if p.startswith(("[0:v]", "[1:v]"))]
+        assert "crop=" not in v0 and "pad=" in v0
+        assert "crop=w=iw*0.4:h=ih*0.4:x=iw*0.1:y=ih*0.05" in v1
+        assert "force_original_aspect_ratio=increase,crop=1080:1920" in v1
+        assert "pad=" not in v1
+
+    def test_crop_does_not_change_duration(self):
+        t = make_timeline(1)
+        base = tl.timeline_duration(t)
+        tl.video_items(t)[0]["crop"] = FACE
+        assert tl.timeline_duration(t) == base
+
+    def test_crop_with_crossfade_sets_timebase(self):
+        t = make_timeline(2)
+        tl.video_items(t)[1]["crop"] = FACE
+        tl.video_items(t)[1]["transition_in"] = {"type": "crossfade", "duration": 0.5}
+        fc = compile_simple(t)["filter_complex"]
+        v1 = [p for p in fc.split(";") if p.startswith("[1:v]")][0]
+        assert v1.endswith("settb=AVTB[v1]")
