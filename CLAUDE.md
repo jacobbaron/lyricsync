@@ -103,6 +103,7 @@ DB migrate). Don't call a merge done until you've checked them all:
 | `MODAL_WEBHOOK_SECRET` | Vercel env | Authenticates Vercel → Modal calls |
 | `MODAL_EDIT_URL` | Vercel env | Modal `edit_timeline` endpoint (timeline edit ops, see docs/timeline_editing.md) |
 | `MODAL_LYRIC_ALIGN_URL` | Vercel env | Modal `align_lyrics` endpoint (force-align known lyrics, see docs/lyric_alignment.md) |
+| `MODAL_MUSIC_ALIGN_URL` | Vercel env | Modal `align_music` endpoint (clip ↔ song sync, see "Music bed / multi-angle") |
 | `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` | GitHub secrets | Modal deploy in GHA |
 | `GEMINI_API_KEY` | Modal secret `lyricsync-secrets` | Gemini visual analysis |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Modal secret `lyricsync-secrets` | DB access from Modal workers |
@@ -244,6 +245,35 @@ path — the worker solves only for timing, so nothing is invented. `result.line
 is `[{text, start, end, score}]` in clip-local seconds, which drops straight onto
 a timeline text track via `add_text`. Write the sheet as *performed* (repeat the
 chorus as many times as the take does). See `docs/lyric_alignment.md`.
+
+## Music bed / multi-angle (lay a song master under the cut)
+
+For a performance shot from several angles with a clean master (desk/DAW mix
+of the same take), don't sync by hand:
+
+1. **Upload the master**: project page → "Upload song / audio master", or
+   `POST /api/projects/[id]/songs {filename, contentType}` → PUT the file to
+   `uploadUrl` → `POST /api/songs/[id]/complete {durationSecs?}`.
+2. **Sync is automatic**: `/complete` creates one full-clip `clip_alignments`
+   row per clip and runs the Modal worker (re-run: `POST /api/songs/[id]/sync`).
+   It tries a same-take fast path (`modal/song_sync.py`: onset xcorr +
+   attack-curve refinement, re-measured in 5 windows) and falls back to
+   chroma-DTW (`method: "dtw"`, approximate). `GET /api/projects/[id]/songs`
+   lists each clip's `offset` (song_t = clip_t + offset), `confidence`, and
+   `drift_ms`; `drift_warning` (> 40 ms) = a different take, lip-sync will wander.
+3. **Set the bed**: `POST /api/stories/[id]/music {song_id}` with no
+   `song_start` lip-syncs the bed to the cut's first clip from its sync
+   (`song_start_source: "first_clip"`); pass `song_start` to pin it. Re-anchor
+   to another clip with `POST /api/stories/[id]/lipsync {item_id}`. The bed
+   plays continuously; video items cut freely over it. Other angles stay in
+   sync only if their `src_start` is consistent with their own offset
+   (src_start_B = src_start_A + offset_A − offset_B at the same output time),
+   which is not yet automatic.
+4. **Lyrics against the master**: `POST /api/songs/[id]/align-lyrics {lyrics}`
+   → poll `GET` → `result.lines` in **song time** →
+   `POST /api/stories/[id]/lyric-captions {alignment_id}` converts
+   (`output_t = song_t − song_start`), adds `add_text` captions, re-renders
+   (`dry_run: true` to preview the ops). See `docs/lyric_alignment.md`.
 
 ## Transcripts (match overlay copy to what's said)
 

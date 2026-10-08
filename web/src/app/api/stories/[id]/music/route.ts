@@ -1,6 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { resolveAuth } from "@/lib/auth/resolve";
+import {
+  bedStartFor,
+  coveringAlignment,
+  resolveClipId,
+  triggerRender,
+  videoItems,
+} from "@/lib/songs/bed";
 
 export const runtime = "nodejs";
 
@@ -11,13 +18,15 @@ export const runtime = "nodejs";
 // (modal/timeline.py). Lip-sync a specific clip to this bed with
 // POST /api/stories/[id]/lipsync.
 //
-// Body: { song_id, song_start, gain_db?, fade_in_s?, fade_out_s? } to set the
+// Body: { song_id, song_start?, gain_db?, fade_in_s?, fade_out_s? } to set the
 // bed (song_start = song time aligned to output t=0), or { song_id: null } to
-// remove it.
+// remove it. Omit song_start to lip-sync the bed to the cut's first clip, using
+// that clip's sync to the song (made automatically on song upload); 409 if the
+// first clip has no ready alignment covering its footage.
 
 const SetBody = z.object({
   song_id: z.string().uuid(),
-  song_start: z.number().min(0).max(36000),
+  song_start: z.number().min(0).max(36000).optional(),
   gain_db: z.number().min(-40).max(20).optional(),
   fade_in_s: z.number().min(0).max(30).optional(),
   fade_out_s: z.number().min(0).max(30).optional(),
@@ -47,7 +56,7 @@ export async function POST(
 
   const { data: story } = await supabase
     .from("stories")
-    .select("id, project_id, render_epoch")
+    .select("id, project_id, ranges_json, timeline_json, render_epoch")
     .eq("id", storyId)
     .maybeSingle();
   if (!story) {
@@ -55,6 +64,7 @@ export async function POST(
   }
 
   let bed: Record<string, unknown> | null = null;
+  let songStartSource: "given" | "first_clip" | null = null;
   if (parsed.data.song_id !== null) {
     const { data: song } = await supabase
       .from("songs")
@@ -73,9 +83,32 @@ export async function POST(
         { status: 409 },
       );
     }
+    let songStart = parsed.data.song_start;
+    songStartSource = "given";
+    if (songStart === undefined) {
+      const first = videoItems(story).find((it) => it.isClip);
+      const clipId = first
+        ? await resolveClipId(supabase, story.project_id, first)
+        : undefined;
+      const align =
+        first && clipId
+          ? await coveringAlignment(supabase, clipId, parsed.data.song_id, first)
+          : undefined;
+      if (!first || !align) {
+        return NextResponse.json(
+          {
+            error:
+              "No song_start given and the cut's first clip has no ready sync to this song — pass song_start, or sync the song (POST /api/songs/[id]/sync) and retry",
+          },
+          { status: 409 },
+        );
+      }
+      songStart = Number(bedStartFor(first, align).toFixed(3));
+      songStartSource = "first_clip";
+    }
     bed = {
       song_id: parsed.data.song_id,
-      song_start: parsed.data.song_start,
+      song_start: songStart,
       gain_db: parsed.data.gain_db ?? 0,
       fade_in_s: parsed.data.fade_in_s ?? 0,
       fade_out_s: parsed.data.fade_out_s ?? 0,
@@ -92,20 +125,11 @@ export async function POST(
     })
     .eq("id", storyId);
 
-  const renderUrl = process.env.MODAL_RENDER_URL;
-  const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
-  if (renderUrl && webhookSecret) {
-    fetch(renderUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": webhookSecret,
-      },
-      body: JSON.stringify({ story_id: storyId }),
-    }).catch((err) => console.error("[music] Modal render trigger failed:", err));
-  } else {
-    console.warn("[music] MODAL_RENDER_URL not set — render not triggered");
-  }
+  triggerRender(storyId, "music");
 
-  return NextResponse.json({ status: "accepted", music: bed });
+  return NextResponse.json({
+    status: "accepted",
+    music: bed,
+    song_start_source: songStartSource,
+  });
 }

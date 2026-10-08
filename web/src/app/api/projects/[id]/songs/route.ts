@@ -98,3 +98,83 @@ export async function POST(
     { status: 201 },
   );
 }
+
+// ── GET /api/projects/[id]/songs ────────────────────────────────────────────
+// List the project's songs, newest first, each with its per-clip sync state:
+// the latest clip_alignments row per clip, with `offset` = song time at clip
+// t=0 (song_t = clip_t + offset). `drift_ms` > DRIFT_WARN_MS means the footage
+// is a different take than the master, so lip-sync will wander.
+
+const DRIFT_WARN_MS = 40; // matches modal/song_sync.py DRIFT_WARN_MS
+
+export async function GET(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  const { id: projectId } = await context.params;
+
+  const auth = await resolveAuth(request);
+  if (!auth) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const { supabase } = auth;
+
+  const { data: songs, error } = await supabase
+    .from("songs")
+    .select("id, filename, duration_secs, status, created_at")
+    .eq("project_id", projectId)
+    .order("created_at", { ascending: false });
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+  const songIds = (songs ?? []).map((s) => s.id);
+
+  const { data: clips } = await supabase
+    .from("clips")
+    .select("id, filename")
+    .eq("project_id", projectId);
+  const clipName = new Map((clips ?? []).map((c) => [c.id, c.filename]));
+
+  const { data: aligns } = songIds.length
+    ? await supabase
+        .from("clip_alignments")
+        .select(
+          "id, clip_id, song_id, footage_start, footage_end, song_start, cost, method, confidence, drift_ms, status, error, created_at",
+        )
+        .in("song_id", songIds)
+        .order("created_at", { ascending: false })
+    : { data: [] };
+
+  // Latest alignment per (song, clip).
+  const latest = new Map<string, NonNullable<typeof aligns>[number]>();
+  for (const a of aligns ?? []) {
+    const k = `${a.song_id}:${a.clip_id}`;
+    if (!latest.has(k)) latest.set(k, a);
+  }
+
+  const out = (songs ?? []).map((s) => ({
+    ...s,
+    clips: [...latest.values()]
+      .filter((a) => a.song_id === s.id)
+      .map((a) => ({
+        clip_id: a.clip_id,
+        filename: clipName.get(a.clip_id) ?? null,
+        alignment_id: a.id,
+        status: a.status,
+        offset:
+          a.song_start == null
+            ? null
+            : Number((Number(a.song_start) - Number(a.footage_start)).toFixed(4)),
+        footage_start: a.footage_start,
+        footage_end: a.footage_end,
+        method: a.method,
+        confidence: a.confidence,
+        cost: a.cost,
+        drift_ms: a.drift_ms,
+        drift_warning: a.drift_ms != null && Number(a.drift_ms) > DRIFT_WARN_MS,
+        error: a.error,
+      })),
+  }));
+
+  return NextResponse.json({ songs: out });
+}

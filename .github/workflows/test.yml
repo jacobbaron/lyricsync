@@ -24,7 +24,8 @@ jobs:
           python-version: "3.11"
 
       - name: Install pytest
-        run: pip install pytest
+        # numpy + scipy for the song-sync DSP tests (test_song_sync.py).
+        run: pip install pytest numpy scipy
 
       - name: Run unit tests
-        run: pytest tests/test_transcript_match.py tests/test_generate_worker.py tests/test_visual_parse.py tests/test_timeline.py tests/test_speech_cleanup.py tests/test_audio_analysis.py tests/test_quality.py tests/test_detection.py -v
+        run: pytest tests/test_transcript_match.py tests/test_generate_worker.py tests/test_visual_parse.py tests/test_timeline.py tests/test_speech_cleanup.py tests/test_audio_analysis.py tests/test_quality.py tests/test_detection.py tests/test_song_sync.py -v

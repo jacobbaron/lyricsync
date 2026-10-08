@@ -57,6 +57,44 @@ Scores are wav2vec2 confidences. On sung audio over a full mix, 0.5–0.75 is
 normal and is not a sign of a bad alignment — compare lines against each other
 rather than against an absolute bar.
 
+## Aligning against a song master (preferred for music videos)
+
+A clip's phone audio is the worst input wav2vec2 gets: room noise, a distant
+mic, the band bleeding in. When the project has the clean mix as a song
+(project page → "Upload song / audio master"), align against that instead:
+
+```bash
+curl -sS -X POST -H "Authorization: Bearer $LYRICSYNC_API_KEY" \
+  -H 'Content-Type: application/json' \
+  "$BASE/api/songs/$SONG/align-lyrics" \
+  -d "{\"lyrics\": $(jq -Rs . < lyrics.txt)}"
+curl -sS -H "Authorization: Bearer $LYRICSYNC_API_KEY" \
+  "$BASE/api/songs/$SONG/align-lyrics"   # poll until status == "ready"
+```
+
+Same worker, same result shape, plus `"time_base": "song"`: `start`/`end` are
+**song time**, not clip time. Songs have no transcript of their own, so the
+first alignment against a song runs it through Whisper once (cached at
+`songs.transcript_r2_key`) purely for anchors; if that fails, planning falls
+back to the single whole-track window.
+
+To put the lines on a cut whose music bed is that song, in one step:
+
+```bash
+curl -sS -X POST -H "Authorization: Bearer $LYRICSYNC_API_KEY" \
+  -H 'Content-Type: application/json' \
+  "$BASE/api/stories/$STORY/lyric-captions" \
+  -d '{"alignment_id": "<id>"}'
+# → {"status":"accepted","added":31,"dropped":4,"revision":7}
+```
+
+It converts each line with `output_t = song_t - bed.song_start`, drops lines
+outside the cut (clipping ones that straddle an edge), adds them as `add_text`
+items in the lyric style below (override any field with `style: {...}`), and
+re-renders. `dry_run: true` returns the ops without applying them. Captions are
+added, not replaced; remove old ones with `remove_text` first. The cut page's
+"Music bed" panel does the same from the UI.
+
 ## Write the lyrics as performed, not as written
 
 The aligner distributes exactly the text you give it across exactly the audio
