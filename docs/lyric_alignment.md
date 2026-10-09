@@ -148,6 +148,22 @@ score).
 A clip with no transcript at all still works — planning falls back to a single
 whole-track window. It is simply less precise, so transcribe first when you can.
 
+### Window boundaries (why captions used to land late)
+
+Each anchored line is aligned inside `[first ASR word − PAD_HEAD_S, last ASR
+word + PAD_TAIL_S]`, and the aligner cannot place a word before its window
+starts. When two lines are close, the previous line's tail pad overlaps the
+next line's head pad. That overlap used to be resolved in the previous line's
+favour, so the next window could start *after* the singer had begun: its
+opening words were crammed against the window edge, up to ~1 s late ("I let
+myself" squeezed into half a second). Overlaps now give up the tail pad first,
+never cutting into the previous line's own ASR evidence. And when the ASR
+missed a line's opening words, the head pad grows by `LEAD_TOKEN_S` per
+unheard word, since the line really starts that many words before its anchor.
+
+`result.window_spans` records each window; a line whose first word sits
+exactly on its window's start is the signature of this failure.
+
 ## Caption styling
 
 Text items take `color` (a name or `#RRGGBB`), `outline` + `outline_color`, and

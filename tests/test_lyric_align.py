@@ -297,3 +297,51 @@ def test_tidy_lines_clamps_words_into_the_line():
     ]
     out = la.tidy_lines(rows)
     assert out[1]["words"][0]["start"] == out[1]["start"] == 2.05
+
+
+def test_previous_tail_pad_never_pushes_a_line_past_its_onset():
+    """Regression (the one who runs, 2026-10-09): the previous line's 1 s tail
+    pad overlapped this line's head, and the overlap was resolved by starting
+    this window at the previous window's end, after the singer had already
+    started. The aligner then crammed the opening words against the window
+    edge. The tail pad must give way instead."""
+    lines = ["i guess this is self care", "scrolling in the candlelight"]
+    asr = words(
+        [
+            ("i", 60.8, 62.0), ("guess", 62.0, 62.8), ("this", 62.8, 63.4),
+            ("is", 63.4, 63.7), ("self", 63.7, 64.3), ("care", 64.3, 65.6),
+            ("scrolling", 65.8, 66.9), ("in", 66.9, 67.7), ("the", 67.7, 67.9),
+            ("candlelight", 67.9, 69.7),
+        ]
+    )
+    wins = la.plan_windows(lines, asr, duration=120.0)
+    assert len(wins) == 2
+    # Head pad would start at 65.2, before "care" ends (65.6): the cut lands on
+    # the end of the previous line's evidence, still ahead of "scrolling".
+    assert wins[1].start == pytest.approx(65.6)
+    assert wins[1].start < 65.8
+    assert wins[0].end == wins[1].start
+
+
+def test_window_keeps_full_head_pad_when_the_gap_allows():
+    lines = ["hold the line", "walk the wire"]
+    asr = words(
+        [
+            ("hold", 10.0, 10.4), ("the", 10.4, 10.8), ("line", 10.8, 11.6),
+            ("walk", 12.5, 12.9), ("the", 12.9, 13.3), ("wire", 13.3, 14.0),
+        ]
+    )
+    wins = la.plan_windows(lines, asr, duration=40.0)
+    # Tail pad (to 12.6) yields to the next head pad (from 11.9).
+    assert wins[1].start == pytest.approx(12.5 - la.PAD_HEAD_S)
+    assert wins[0].end == pytest.approx(wins[1].start)
+
+
+def test_unheard_opening_words_widen_the_head():
+    """ASR missed the first word ("lying" → "lion"): the anchor starts at the
+    second word, so the window reaches back one extra token's worth."""
+    lines = ["lying in my filth"]
+    asr = words([("lion", 28.8, 30.2), ("in", 30.2, 31.0), ("my", 31.0, 31.3),
+                 ("filth", 31.3, 33.1)])
+    (win,) = la.plan_windows(lines, asr, duration=60.0)
+    assert win.start == pytest.approx(30.2 - la.PAD_HEAD_S - la.LEAD_TOKEN_S)
