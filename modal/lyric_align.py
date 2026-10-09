@@ -71,6 +71,11 @@ MIN_WINDOW_S = 1.2
 # sung vowels are held well past the point the aligner stops scoring them, and
 # because a window that ends too early truncates the final word outright.
 PAD_HEAD_S = 0.6
+# Extra head room per lyric token that precedes a line's first ASR-matched
+# token. An anchor only covers the words the ASR heard correctly; when it
+# misheard the opening words ("Lying" → "Lion"), the line actually starts
+# that many words before its anchor.
+LEAD_TOKEN_S = 0.6
 PAD_TAIL_S = 1.0
 
 
@@ -165,7 +170,8 @@ def clean_asr_words(asr_words: list[dict]) -> list[tuple[str, float, float]]:
 
 
 def line_anchors(
-    lines: list[str], asr_words: list[dict]
+    lines: list[str], asr_words: list[dict],
+    leads: dict[int, int] | None = None,
 ) -> dict[int, tuple[float, float]]:
     """Map line index → (earliest, latest) ASR time confidently on that line.
 
@@ -176,6 +182,8 @@ def line_anchors(
     asr_words: [{text, local_start, local_end}, ...] in time order — the raw
     per-word transcript already stored for the clip.
     """
+    if leads is None:
+        leads = {}
     lyric_toks = _flatten(lines)
     asr = clean_asr_words(asr_words)
 
@@ -194,6 +202,11 @@ def line_anchors(
             _, start, end = asr[j + k]
             lo, hi = anchors.get(line_idx, (start, end))
             anchors[line_idx] = (min(lo, start), max(hi, end))
+            if line_idx not in leads:
+                # Lyric tokens of this line before its first matched one.
+                leads[line_idx] = sum(
+                    1 for li, _ in lyric_toks[:i + k] if li == line_idx
+                )
     return anchors
 
 
@@ -216,7 +229,8 @@ def plan_windows(
     """
     if not lines:
         return []
-    anchors = line_anchors(lines, asr_words)
+    leads: dict[int, int] = {}
+    anchors = line_anchors(lines, asr_words, leads=leads)
 
     # A run of identical lines (a chorus repeated N times) cannot be anchored
     # line-by-line: every repeat matches the ASR equally well, so difflib pairs
@@ -241,13 +255,18 @@ def plan_windows(
     # whole. Resolve each group's span first, then fill unanchored spans from
     # their neighbours.
     spans: list[tuple[list[int], float | None, float | None, bool]] = []
+    # Raw ASR evidence per span (no padding), used to resolve overlaps below.
+    evidence: list[tuple[float, float] | None] = []
     for has, idxs in groups:
         if has:
             for idx in idxs:
                 lo, hi = anchors[idx]
-                spans.append(([idx], lo - pad_head, hi + pad_tail, True))
+                head = pad_head + LEAD_TOKEN_S * leads.get(idx, 0)
+                spans.append(([idx], lo - head, hi + pad_tail, True))
+                evidence.append((lo, hi))
         else:
             spans.append((idxs, None, None, False))
+            evidence.append(None)
 
     for pos, (idxs, lo, hi, anchored) in enumerate(spans):
         if anchored:
@@ -265,18 +284,38 @@ def plan_windows(
             False,
         )
 
+    # Where two padded windows overlap, the boundary goes where it costs the
+    # least: the earlier window's tail pad is given up before the later
+    # window's head pad. Each line's own head pad is what lets the aligner
+    # place its first sung word; a boundary placed after that onset forces
+    # the line late and crams its opening words against the window edge
+    # (the aligner cannot put a word before its window starts). The tail pad
+    # only covers a held final note, which is a fixed-length loss at worst.
+    bounds = [
+        [
+            max(0.0, min(float(lo if lo is not None else 0.0), duration)),
+            max(0.0, min(float(hi if hi is not None else duration), duration)),
+        ]
+        for _, lo, hi, _ in spans
+    ]
+    for k in range(1, len(bounds)):
+        prev, cur = bounds[k - 1], bounds[k]
+        if prev[1] <= cur[0]:
+            continue
+        # Never cut into the earlier line's own ASR evidence; within that
+        # limit, keep the later window's head pad whole.
+        floor = evidence[k - 1][1] if evidence[k - 1] else prev[0]
+        cut = max(prev[0], cur[0], min(floor, cur[1]))
+        prev[1] = cut
+        cur[0] = cut
+
     windows: list[Window] = []
-    prev_end = 0.0
-    for idxs, lo, hi, anchored in spans:
-        start = max(0.0, min(float(lo if lo is not None else 0.0), duration))
-        end = max(0.0, min(float(hi if hi is not None else duration), duration))
-        start = max(start, prev_end)  # no overlap with the window before it
+    for (idxs, _, _, anchored), (start, end) in zip(spans, bounds):
         if end <= start:
             end = min(duration, start + 0.05)
         windows.append(
             Window(tuple(lines[i] for i in idxs), start, end, anchored)
         )
-        prev_end = end
     return _merge_starved(windows)
 
 

@@ -1319,6 +1319,16 @@ def _align_lyrics_worker(alignment_id: str) -> None:
             "time_base": "song" if row.get("song_id") else "clip",
             "windows": len(windows),
             "anchored_windows": anchored,
+            # The audio span each group of lines was aligned within. A line
+            # whose first word sits on its window's start was clipped there —
+            # the first thing to check when captions land late.
+            "window_spans": [
+                {
+                    "start": round(w.start, 3), "end": round(w.end, 3),
+                    "lines": len(w.lines), "anchored": w.anchored,
+                }
+                for w in windows
+            ],
             "coverage": round(len(captions) / len(lines), 3),
             "mean_score": round(sum(scores) / len(scores), 3) if scores else 0.0,
         }
