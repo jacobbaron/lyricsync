@@ -33,15 +33,19 @@ from pathlib import Path
 ANIM_STYLES = ("line", "highlight", "pop", "word")
 
 # Font key -> ASS family name (as fontconfig sees the bundled file), the
-# metrics.json entry for layout, and whether a true italic is bundled.
+# metrics.json entry for layout, and the bundled true italic (None: no italic).
 FONTS = {
-    "instrument-serif": ("Instrument Serif", "InstrumentSerif-Regular.ttf", True),
-    "playfair": ("Playfair Display SemiBold", "PlayfairDisplay-SemiBold.ttf", True),
-    "cormorant": ("Cormorant Garamond SemiBold", "CormorantGaramond-SemiBold.ttf", True),
-    "dm-serif": ("DM Serif Display", "DMSerifDisplay-Regular.ttf", True),
-    "manrope": ("Manrope SemiBold", "Manrope-SemiBold.ttf", False),
-    "dm-sans": ("DM Sans 14pt Medium", "DMSans-Medium.ttf", False),
-    "montserrat": ("Montserrat SemiBold", "Montserrat-SemiBold.ttf", False),
+    "instrument-serif": ("Instrument Serif", "InstrumentSerif-Regular.ttf",
+                         "InstrumentSerif-Italic.ttf"),
+    "playfair": ("Playfair Display SemiBold", "PlayfairDisplay-SemiBold.ttf",
+                 "PlayfairDisplay-SemiBoldItalic.ttf"),
+    "cormorant": ("Cormorant Garamond SemiBold", "CormorantGaramond-SemiBold.ttf",
+                  "CormorantGaramond-SemiBoldItalic.ttf"),
+    "dm-serif": ("DM Serif Display", "DMSerifDisplay-Regular.ttf",
+                 "DMSerifDisplay-Italic.ttf"),
+    "manrope": ("Manrope SemiBold", "Manrope-SemiBold.ttf", None),
+    "dm-sans": ("DM Sans 14pt Medium", "DMSans-Medium.ttf", None),
+    "montserrat": ("Montserrat SemiBold", "Montserrat-SemiBold.ttf", None),
 }
 DEFAULT_FONT = "instrument-serif"
 DEFAULT_HIGHLIGHT = "#F5C860"  # warm gold
@@ -55,9 +59,9 @@ FONT_SIZE_SCALE = {
 MAX_WIDTH_FRAC = 0.86   # widest a caption row may be, as a fraction of frame width
 LINE_HEIGHT = 1.12      # row pitch, in multiples of the font size
 WORD_SIZE_SCALE = 1.6   # `word` style: size relative to the item's size
-SWELL = 106             # `highlight`: % scale of the sung word
+SWELL = 106             # `highlight`: % scale of the sung word (fonts without an italic)
 SWELL_MS = 120
-WORD_GAP = 0.06         # extra space between words, in multiples of font size
+WORD_GAP = 0.02         # extra space between words, in multiples of font size
 
 _METRICS: dict | None = None
 
@@ -130,11 +134,26 @@ def break_rows(widths: list[float], space: float, max_width: float) -> list[int]
 
 def layout_words(
     words: list[str], font_key: str, size: float, frame_w: int, frame_h: int,
-    position: str, fonts_dir: str,
+    position: str, fonts_dir: str, emphasis: bool = False,
 ) -> list[tuple[float, float]]:
-    """Centre point (x, y) of each word, in frame pixels."""
-    fm = _metrics(fonts_dir)[FONTS[font_key][1]]
+    """Centre point (x, y) of each word, in frame pixels.
+
+    With `emphasis`, each word is given the room it needs in its highlighted
+    form too (italic, or swelled for fonts without one), so a sung word never
+    crowds its neighbours.
+    """
+    metrics = _metrics(fonts_dir)
+    fm = metrics[FONTS[font_key][1]]
     widths = [text_width(w, fm, size) for w in words]
+    if emphasis:
+        italic = FONTS[font_key][2]
+        if italic:
+            widths = [
+                max(wd, text_width(w, metrics[italic], size))
+                for wd, w in zip(widths, words)
+            ]
+        else:
+            widths = [wd * SWELL / 100 for wd in widths]
     space = text_width(" ", fm, size) + WORD_GAP * size
     rows = break_rows(widths, space, frame_w * MAX_WIDTH_FRAC)
     n_rows = (rows[-1] + 1) if rows else 0
@@ -227,7 +246,7 @@ def _events_for_item(
     item: dict, frame_w: int, frame_h: int, fonts_dir: str
 ) -> list[str]:
     font_key = item.get("font") or DEFAULT_FONT
-    family, _, has_italic = FONTS[font_key]
+    family, _, italic_file = FONTS[font_key]
     size = float(item.get("size") or 64) * FONT_SIZE_SCALE.get(font_key, 1.0)
     position = str(item.get("position") or "center").lower()
     start, end = float(item["start"]), float(item["end"])
@@ -250,7 +269,13 @@ def _events_for_item(
         f"\\fn{family}\\fs{size:.1f}\\c{color}\\3c{out_col}\\4c&H000000&"
         f"\\4a&H70&\\bord{outline:.2g}\\shad3\\blur1.5\\an5"
     )
-    italic = "\\i1" if has_italic else ""
+    # Fonts with a true italic emphasise the sung word by italicising it; the
+    # rest swell it slightly instead. Either way layout_words reserved room.
+    italic = "\\i1" if italic_file else ""
+    swell = (
+        "" if italic_file
+        else f"\\t(0,{SWELL_MS},\\fscx{SWELL}\\fscy{SWELL})"
+    )
     ev: list[str] = []
 
     def add(s: float, e: float, x: float, y: float, tags: str, text: str) -> None:
@@ -279,7 +304,10 @@ def _events_for_item(
             add(w["start"], seg_e, x, y, tags, w["text"])
         return ev
 
-    centres = layout_words(words, font_key, size, frame_w, frame_h, position, fonts_dir)
+    centres = layout_words(
+        words, font_key, size, frame_w, frame_h, position, fonts_dir,
+        emphasis=anim == "highlight",
+    )
     for k, (word, (x, y)) in enumerate(zip(words, centres)):
         if anim == "line":
             add(start, end, x, y, fades(start, end), word)
@@ -289,7 +317,7 @@ def _events_for_item(
         if anim == "highlight":
             add(start, w_s, x, y, fades(start, w_s), word)
             add(w_s, w_e, x, y,
-                f"\\c{hi}{italic}\\t(0,{SWELL_MS},\\fscx{SWELL}\\fscy{SWELL})"
+                f"\\c{hi}{italic}{swell}"
                 + fades(w_s, w_e), word)
             add(w_e, end, x, y, fades(w_e, end), word)
         else:  # pop
