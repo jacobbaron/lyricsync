@@ -362,15 +362,66 @@ def aggregate_words(lines: list[str], words: list[dict]) -> list[dict]:
             rows.append({"text": line, "start": None, "end": None, "score": 0.0})
             continue
         scores = [float(w.get("score") or 0.0) for w in timed]
+        start = round(min(float(w["start"]) for w in timed), 3)
+        end = round(max(float(w["end"]) for w in timed), 3)
         rows.append(
             {
                 "text": line,
-                "start": round(min(float(w["start"]) for w in timed), 3),
-                "end": round(max(float(w["end"]) for w in timed), 3),
+                "start": start,
+                "end": end,
                 "score": round(sum(scores) / len(scores), 3),
+                "words": _line_words(line, chunk, start, end),
             }
         )
     return rows
+
+
+def _line_words(
+    line: str, chunk: list[dict], start: float, end: float
+) -> list[dict]:
+    """Per-word timings for one line, in the lyric sheet's own spelling.
+
+    `chunk` holds one aligner entry per lexical token of `line`. Tokens with no
+    letters or digits ("-", "&") have no entry and ride along with the word
+    before them. A word the aligner left untimed is placed between its timed
+    neighbours (or the line's edges) so every displayed word has a time —
+    word-level caption animation needs all of them.
+    """
+    display: list[str] = []
+    for tok in line.split():
+        if normalize_token(tok) or not display:
+            display.append(tok)
+        else:
+            display[-1] += " " + tok
+    # A leading punctuation-only token was kept as its own entry; fold it into
+    # the next word so display and chunk stay one-to-one.
+    if display and not normalize_token(display[0]) and len(display) > 1:
+        display[1] = display[0] + " " + display[1]
+        display.pop(0)
+
+    n = min(len(display), len(chunk))
+    times: list[tuple[float, float] | None] = [
+        (float(w["start"]), float(w.get("end", w["start"])))
+        if w.get("start") is not None else None
+        for w in chunk[:n]
+    ]
+    out: list[dict] = []
+    for i in range(n):
+        if times[i] is None:
+            prev_end = next(
+                (times[j][1] for j in range(i - 1, -1, -1) if times[j]), start
+            )
+            nxt = next(
+                ((j, times[j][0]) for j in range(i + 1, n) if times[j]), None
+            )
+            # Spread the run of untimed words evenly over the gap; filling in
+            # order means the previous word is always timed by now.
+            next_start, run = (nxt[1], nxt[0] - i) if nxt else (end, n - i)
+            step = max(0.0, next_start - prev_end) / run
+            times[i] = (prev_end, prev_end + step)
+        s, e = times[i]
+        out.append({"text": display[i], "start": round(s, 3), "end": round(max(s, e), 3)})
+    return out
 
 
 def tidy_lines(
@@ -395,5 +446,15 @@ def tidy_lines(
             end = start + max_hold
         if end <= start:
             continue
-        out.append({**row, "start": round(start, 3), "end": round(end, 3)})
+        row = {**row, "start": round(start, 3), "end": round(end, 3)}
+        if row.get("words"):
+            row["words"] = [
+                {
+                    **w,
+                    "start": round(min(max(w["start"], start), end), 3),
+                    "end": round(min(max(w["end"], start), end), 3),
+                }
+                for w in row["words"]
+            ]
+        out.append(row)
     return out

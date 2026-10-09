@@ -71,6 +71,18 @@ Implementation map:
   around the glyphs, and `fade` (0–2 s) ramps the caption in and out; a fade is
   skipped when the item is too short to fit both ramps. For lyric captions,
   `box_opacity: 0` plus an `outline` of 3–4 reads better than the box.
+- Typeface + word animation (libass, `modal/captions.py`): a text item with
+  `font` or `anim` is rendered through ffmpeg's `ass` filter instead of
+  drawtext. `font` is one of `instrument-serif` (default) | `playfair` |
+  `cormorant` | `dm-serif` | `manrope` | `dm-sans` | `montserrat`. `anim` is
+  `line` (static) | `highlight` (the sung word tinted `highlight_color`,
+  default gold, italic where the font has one) | `pop` (words appear as sung)
+  | `word` (one large word at a time). Word timing comes from `words`:
+  `[{text, start, end}]` in seconds **relative to the item's `start`** (the
+  lyric-captions route fills it from the alignment); without it the animated
+  styles fall back to `line`. Every word is pinned to a precomputed position,
+  so highlighting or scaling a word never moves the line breaks. These items
+  draw no box (`box_opacity` is ignored): a thin outline plus soft shadow.
 - `crop` (optional, clips only) zooms into part of the source: `{x, y, w, h}`
   as fractions (0–1) of the source's display frame — `(x, y)` is the top-left
   corner, `(w, h)` the size, each side ≥ 0.1 (≤ 10× zoom). The region is
@@ -101,7 +113,7 @@ invalid, nothing is saved and the error message says which op failed and why.
 | `set_transition` | `id`, `transition` | `null` or `{"type": "crossfade", "duration": s}` (joins to previous item) |
 | `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`?, `clip_id`?, `crop`? | Appends when `index` omitted. `clip_id` (uuid) references a clip in *any* project (cross-project cuts — see `docs/cross_project_editing.md`); `source` is then just a label |
 | `insert_blank` | `duration`, `index`? | Black + silence spacer |
-| `add_text` | `text`, `start`, `end`, `size`?, `position`?, `wrap`?, `box_opacity`?, `color`?, `outline`?, `outline_color`?, `fade`? | Output-time window |
+| `add_text` | `text`, `start`, `end`, `size`?, `position`?, `wrap`?, `box_opacity`?, `color`?, `outline`?, `outline_color`?, `fade`?, `font`?, `anim`?, `highlight_color`?, `words`? | Output-time window |
 | `update_text` | `id`, any text fields | Partial update |
 | `remove_text` | `id` | |
 | `clean_speech` | `id`, `params`? | Tighten a speech clip: split it into jump-cut sub-items, dropping filler words + over-long silences. Needs the project transcript. See below |

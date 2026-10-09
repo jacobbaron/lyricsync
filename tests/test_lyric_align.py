@@ -272,3 +272,28 @@ def test_tidy_caps_a_held_final_syllable():
     rows = [{"text": "away", "start": 10.0, "end": 60.0, "score": 0.5}]
     out = la.tidy_lines(rows, max_hold=6.0)
     assert out[0]["end"] == pytest.approx(16.0)
+
+
+def test_aggregate_words_keeps_word_timings_and_fills_gaps():
+    words = [
+        {"word": "Stare", "start": 1.0, "end": 1.3},
+        {"word": "at", "start": None, "end": None},
+        {"word": "my", "start": 1.6, "end": 1.8},
+    ]
+    (row,) = la.aggregate_words(["Stare at - my"], words)
+    assert [w["text"] for w in row["words"]] == ["Stare", "at -", "my"]
+    assert row["words"][0] == {"text": "Stare", "start": 1.0, "end": 1.3}
+    assert row["words"][1] == {"text": "at -", "start": 1.3, "end": 1.6}
+    assert row["words"][2]["start"] == 1.6
+
+
+def test_tidy_lines_clamps_words_into_the_line():
+    rows = [
+        {"text": "a b", "start": 0.0, "end": 2.0, "score": 1,
+         "words": [{"text": "a", "start": 0.0, "end": 1.0},
+                   {"text": "b", "start": 1.0, "end": 2.0}]},
+        {"text": "c", "start": 1.5, "end": 3.0, "score": 1,
+         "words": [{"text": "c", "start": 1.5, "end": 3.0}]},
+    ]
+    out = la.tidy_lines(rows)
+    assert out[1]["words"][0]["start"] == out[1]["start"] == 2.05
