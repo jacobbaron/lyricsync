@@ -167,3 +167,20 @@ def test_add_text_op_carries_caption_keys():
     item = tl.text_items(out)[0]
     assert item["font"] == "playfair" and item["anim"] == "pop"
     assert len(item["words"]) == 7
+
+
+def test_highlight_leaves_room_for_the_italic_swelled_word():
+    """A sung word drawn italic must not overlap its neighbours."""
+    m = cap._metrics(FONTS_DIR)
+    reg, ita = m["InstrumentSerif-Regular.ttf"], m["InstrumentSerif-Italic.ttf"]
+    words = LINE.split()
+    size = 54 * cap.FONT_SIZE_SCALE["instrument-serif"]
+    centres = cap.layout_words(words, "instrument-serif", size, 1080, 1920,
+                               "lower", FONTS_DIR, emphasis=True)
+    for k in range(len(words) - 1):
+        def half(w, fm, scale=1.0):
+            return cap.text_width(w, fm, size) * scale / 2
+        # Either neighbour may be the one highlighted.
+        a = max(half(words[k], reg), half(words[k], ita))
+        b = max(half(words[k + 1], reg), half(words[k + 1], ita))
+        assert centres[k + 1][0] - centres[k][0] >= a + b
