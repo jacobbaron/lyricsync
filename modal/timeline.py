@@ -46,6 +46,7 @@ import copy
 import math
 import re
 import textwrap
+from pathlib import Path
 
 TIMELINE_VERSION = 1
 
@@ -88,7 +89,18 @@ MIN_TEXT_FADE_S = 0.05
 TEXT_STYLE_KEYS = (
     "size", "position", "wrap", "box_opacity",
     "color", "outline", "outline_color", "fade",
+    # libass captions (modal/captions.py): typeface, word animation, the
+    # sung-word color, and per-word timings relative to the item's start.
+    "font", "anim", "highlight_color", "words",
 )
+# Mirrors captions.FONTS / captions.ANIM_STYLES (kept here so validation stays
+# importable on its own; tests/test_captions.py checks they agree).
+TEXT_FONTS = (
+    "instrument-serif", "playfair", "cormorant", "dm-serif",
+    "manrope", "dm-sans", "montserrat",
+)
+TEXT_ANIMS = ("line", "highlight", "pop", "word")
+MAX_TEXT_WORDS = 200
 
 # Optional per-clip audio effects, applied after the speed/resample stage.
 # Each value is an ffmpeg audio-filter chain (aecho gives an echo/reverb wash) —
@@ -518,9 +530,43 @@ def validate_timeline(timeline: dict) -> list[str]:
             isinstance(fade, (int, float)) and 0 <= fade <= MAX_TEXT_FADE_S
         ):
             errors.append(f"{label}: fade must be between 0 and {MAX_TEXT_FADE_S}")
+        font = item.get("font")
+        if font is not None and font not in TEXT_FONTS:
+            errors.append(f"{label}: font must be one of {', '.join(TEXT_FONTS)}")
+        anim = item.get("anim")
+        if anim is not None and anim not in TEXT_ANIMS:
+            errors.append(f"{label}: anim must be one of {', '.join(TEXT_ANIMS)}")
+        hi = item.get("highlight_color")
+        if hi is not None and _color_expr(hi) is None:
+            errors.append(
+                f"{label}: highlight_color must be #RRGGBB or one of "
+                f"{', '.join(TEXT_COLORS)}"
+            )
+        words = item.get("words")
+        if words is not None and not _valid_words(words):
+            errors.append(
+                f"{label}: words must be a list of up to {MAX_TEXT_WORDS} "
+                "{text, start, end} with start <= end, times >= 0 (seconds "
+                "from the item's start)"
+            )
 
     errors.extend(_validate_music(timeline.get("music")))
     return errors
+
+
+def _valid_words(words: object) -> bool:
+    if not isinstance(words, list) or len(words) > MAX_TEXT_WORDS:
+        return False
+    for w in words:
+        if not isinstance(w, dict) or not str(w.get("text") or "").strip():
+            return False
+        s, e = w.get("start"), w.get("end", w.get("start"))
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   for v in (s, e)):
+            return False
+        if s < 0 or e < s:
+            return False
+    return True
 
 
 def _validate_music(music: object) -> list[str]:
@@ -1508,6 +1554,28 @@ def _alpha_expr(start: float, end: float, fade: float) -> str:
     )
 
 
+def _uses_ass(item: dict) -> bool:
+    """Text items with a font or word animation render via libass."""
+    return bool(item.get("font") or item.get("anim"))
+
+
+def _captions_module():
+    """Load modal/captions.py beside this file (lazily: only renders with
+    styled captions need it, and Modal images other than the render one do
+    not mount it)."""
+    import importlib.util
+    import sys
+
+    mod = sys.modules.get("lyricsync_captions")
+    if mod is None:
+        path = Path(__file__).resolve().parent / "captions.py"
+        spec = importlib.util.spec_from_file_location("lyricsync_captions", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["lyricsync_captions"] = mod
+    return mod
+
+
 def _drawtext(item: dict, textfile: str, font_path: str) -> str:
     """Build one drawtext filter for a text item (output-time enable window)."""
     size = int(item.get("size") or 64)
@@ -1552,6 +1620,7 @@ def compile_timeline(
     workdir: str,
     font_path: str,
     resolve_music=None,
+    fonts_dir: str | None = None,
 ) -> dict:
     """Compile a timeline into ffmpeg invocation pieces.
 
@@ -1696,7 +1765,13 @@ def compile_timeline(
     # placement is independent of how the video track is sliced underneath.
     text_files: list[tuple[str, str]] = []
     draw_filters: list[str] = []
+    # Items naming a font or a word animation go to libass (captions.py);
+    # plain title cards keep the drawtext path unchanged.
+    ass_items = [i for i in titems if _uses_ass(i)]
+    captions = _captions_module() if ass_items else None
     for item in titems:
+        if _uses_ass(item):
+            continue
         wrap = int(item.get("wrap") or 22)
         raw = str(item["text"]).strip()
         wrapped = "\n".join(textwrap.wrap(raw, width=wrap)) or raw
@@ -1705,6 +1780,13 @@ def compile_timeline(
         text_files.append((path, wrapped))
         draw_filters.append(_drawtext(item, path, font_path))
 
+    if ass_items:
+        fonts_dir = fonts_dir or str(Path(font_path).parent / "fonts")
+        ass_path = f"{workdir}/captions.ass"
+        text_files.append(
+            (ass_path, captions.build_ass(ass_items, w, h, fonts_dir))
+        )
+        draw_filters.append(f"ass=filename={ass_path}:fontsdir={fonts_dir}")
     draw = (",".join(draw_filters) + ",") if draw_filters else ""
     parts.append(f"[{cv}]{draw}format=yuv420p[vout]")
 

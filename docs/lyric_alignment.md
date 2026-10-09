@@ -156,4 +156,12 @@ an outlined glyph over bare picture usually reads better than the default
 black box — set `box_opacity: 0` and give it an `outline` of 3–4. Colors are
 whitelisted, since they are interpolated into an ffmpeg filter string.
 
+**Word-level captions.** Each aligned line also carries `words:
+[{text, start, end}]` (same time base as the line). `POST
+/api/stories/[id]/lyric-captions` passes them through, so its default look is
+Instrument Serif with the sung word highlighted (`font: "instrument-serif"`,
+`anim: "highlight"`); pass `style: {anim: "pop"}` / `{anim: "word"}` /
+`{font: "playfair"}` etc. to change it. Alignments made before word timings
+were stored have no `words` — re-run align-lyrics to get them.
+
 See `docs/timeline_editing.md` for the full text-item reference.

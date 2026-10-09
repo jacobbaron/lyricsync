@@ -86,10 +86,15 @@ image = (
         Path(__file__).parent / "assets" / "Montserrat.ttf",
         "/root/overlay_font.ttf",
     )
+    # Styled / word-animated captions (libass): renderer + bundled fonts.
+    .add_local_file(Path(__file__).parent / "captions.py", "/root/captions.py")
+    .add_local_dir(Path(__file__).parent / "assets" / "fonts", "/root/fonts")
 )
 
 # Path to the bundled overlay font inside the container (see image above).
 OVERLAY_FONT = "/root/overlay_font.ttf"
+# Caption fonts + metrics.json for libass captions (see modal/captions.py).
+CAPTION_FONTS_DIR = "/root/fonts"
 
 secrets = [modal.Secret.from_name("lyricsync-secrets")]
 
@@ -3948,6 +3953,7 @@ def _render_worker(story_id: str) -> None:
                 workdir=str(tmp),
                 font_path=OVERLAY_FONT,
                 resolve_music=lambda song_id: music_paths.get(song_id),
+                fonts_dir=CAPTION_FONTS_DIR,
             )
             for text_path, content in compiled["text_files"]:
                 Path(text_path).write_text(content)
