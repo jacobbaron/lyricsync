@@ -407,6 +407,24 @@ class TestCompile:
         assert "offset=7.000" in fc
         assert result["duration"] == pytest.approx(11.0)
 
+    def test_items_snap_to_output_frames(self):
+        # Spans that aren't whole frames used to round up one by one, so a long
+        # cut drifted behind a continuous music bed. Each item is now trimmed
+        # to the frames between its snapped start and end on the output.
+        import re
+        timeline = make_timeline(3)
+        spans = [3.13, 2.27, 4.05]
+        for item, span in zip(tl.video_items(timeline), spans):
+            item["src_end"] = item["src_start"] + span
+        result = compile_simple(timeline)
+        fc = result["filter_complex"]
+        frames = [int(n) for n in re.findall(r"trim=end_frame=(\d+)", fc)]
+        assert frames == [94, 68, 122]  # 0→94, 94→162 (5.40 s), 162→284
+        assert sum(frames) == round(sum(spans) * 30)
+        samples = [int(n) for n in re.findall(r"atrim=end_sample=(\d+)", fc)]
+        assert samples == [f * 1600 for f in frames]  # 48 kHz / 30 fps
+        assert result["duration"] == pytest.approx(284 / 30, abs=1e-3)
+
     def test_blank_item_lavfi_inputs(self):
         timeline = tl.timeline_from_ranges(RANGES)
         result = compile_simple(timeline)
@@ -915,7 +933,7 @@ class TestCrop:
         assert "crop=" not in v0 and "pad=" in v0
         assert "crop=w=iw*0.4:h=ih*0.4:x=iw*0.1:y=ih*0.05" in v1
         assert "force_original_aspect_ratio=increase,crop=1080:1920" in v1
-        assert "pad=" not in v1
+        assert "pad=1080" not in v1
 
     def test_crop_does_not_change_duration(self):
         t = make_timeline(1)
