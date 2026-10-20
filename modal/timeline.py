@@ -1658,11 +1658,39 @@ def compile_timeline(
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"setsar=1,fps={fps}"
     )
-    # xfade needs identical timebases on both inputs; harmless otherwise but
-    # only added when crossfades are present to keep the cut-only graph
-    # byte-identical with the long-proven legacy one.
-    if has_xfade:
-        vnorm += ",settb=AVTB"
+    # Frame-exact item lengths. Each item's span is rarely a whole number of
+    # frames, and the per-item fps filter rounds it, so a joined cut drifts
+    # from its nominal timeline by a fraction of a frame per item. Under a
+    # continuous music bed that drift accumulates (~0.17 s over 31 shots), so
+    # lip-sync slides out late in the cut. Snap each item's start and end on
+    # the OUTPUT timeline to the nearest frame and trim/pad its video and
+    # audio to exactly that many frames: the error then never exceeds half a
+    # frame, however many items there are.
+    frames: list[int] = []
+    pos = 0.0
+    for k, item in enumerate(vitems):
+        tr = item.get("transition_in") if k else None
+        if tr and tr.get("type") == "crossfade":
+            pos -= float(tr["duration"])
+        d = item_duration(item)
+        frames.append(max(1, round((pos + d) * fps) - round(pos * fps)))
+        pos += d
+
+    def seg_dur(k: int) -> float:
+        return frames[k] / fps
+
+    def fit_video(k: int) -> str:
+        # Clone-pad in case the source runs short, then cut at the frame count.
+        # xfade needs identical timebases on both inputs, so crossfaded graphs
+        # end each chain with settb (left out of cut-only graphs).
+        settb = ",settb=AVTB" if has_xfade else ""
+        return (
+            f",tpad=stop_mode=clone:stop_duration=1,trim=end_frame={frames[k]}"
+            f"{settb}"
+        )
+
+    def fit_audio(k: int) -> str:
+        return f",apad,atrim=end_sample={round(frames[k] * sr / fps)}"
 
     inputs: list[list[str]] = []
     parts: list[str] = []
@@ -1681,11 +1709,13 @@ def compile_timeline(
             ])
             vidx, aidx = in_idx, in_idx + 1
             in_idx += 2
-            parts.append(f"[{vidx}:v]setpts=PTS-STARTPTS,{vnorm}[v{i}]")
+            parts.append(
+                f"[{vidx}:v]setpts=PTS-STARTPTS,{vnorm}{fit_video(i)}[v{i}]"
+            )
             parts.append(
                 f"[{aidx}:a]asetpts=PTS-STARTPTS,"
-                f"aresample={sr},aformat=channel_layouts=stereo,"
-                f"atrim=duration={dur:.3f}[a{i}]"
+                f"aresample={sr},aformat=channel_layouts=stereo"
+                f"{fit_audio(i)}[a{i}]"
             )
             continue
 
@@ -1720,30 +1750,29 @@ def compile_timeline(
                 f"scale={w}:{h}:force_original_aspect_ratio=increase,"
                 f"crop={w}:{h},setsar=1,fps={fps}"
             )
-            if has_xfade:
-                vchain += ",settb=AVTB"
         else:
             vchain = vnorm
-        parts.append(f"[{vidx}:v]{vsetpts},{vchain}[v{i}]")
+        parts.append(f"[{vidx}:v]{vsetpts},{vchain}{fit_video(i)}[v{i}]")
         parts.append(
             f"[{vidx}:a]asetpts=PTS-STARTPTS,{aspeed}"
-            f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}{mute_chain}[a{i}]"
+            f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}{mute_chain}"
+            f"{fit_audio(i)}[a{i}]"
         )
 
     # Join the per-item streams.
     if len(vitems) == 1:
         cv, ca = "v0", "a0"
-        out_dur = item_duration(vitems[0])
+        out_dur = seg_dur(0)
     elif not has_xfade:
         concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(vitems)))
         parts.append(f"{concat_in}concat=n={len(vitems)}:v=1:a=1[vcat][acat]")
         cv, ca = "vcat", "acat"
-        out_dur = sum(item_duration(it) for it in vitems)
+        out_dur = sum(seg_dur(k) for k in range(len(vitems)))
     else:
         cv, ca = "v0", "a0"
-        out_dur = item_duration(vitems[0])
+        out_dur = seg_dur(0)
         for k, item in enumerate(vitems[1:], start=1):
-            d = item_duration(item)
+            d = seg_dur(k)
             i = k  # per-item stream labels [v{i}]/[a{i}] use the vitems index
             tr = item.get("transition_in")
             if tr and tr.get("type") == "crossfade":
