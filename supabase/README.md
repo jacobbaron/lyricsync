@@ -20,7 +20,31 @@ table, so each file runs exactly once.
 2. Write idempotent SQL where practical (`add column if not exists`,
    `create ... if not exists`, `create or replace`). Destructive/locking
    changes deserve extra care on large tables.
-3. Open a PR. The dry-run shows what will apply. Merge → it ships.
+3. **New table in `public`? Grant Data API access in the same migration**
+   (see below). The workflow fails the PR if you don't.
+4. Open a PR. The dry-run shows what will apply. Merge → it ships.
+
+## Data API grants (required for every new table)
+
+Since 2026-10-30 Supabase no longer grants API roles access to new tables in
+`public`. Without a grant, supabase-js / PostgREST returns "permission denied"
+at runtime. So every `create table` gets, in the same file:
+
+```sql
+alter table public.my_table enable row level security;
+create policy my_table_owner_all on public.my_table for all to authenticated using (...);
+
+grant select, insert, update, delete on public.my_table to authenticated, service_role;
+```
+
+- `authenticated`: the web app's user sessions and API-key tokens (RLS scopes rows).
+- `service_role`: server routes and Modal workers (bypasses RLS).
+- `anon`: don't grant unless a policy actually targets `anon`; none do today.
+
+`scripts/check_migration_grants.py` enforces this in the DB migrate workflow
+(run it locally the same way). Tables from migrations up to
+`20261020130000_data_api_grants` are covered by that backfill migration, which
+also makes local `supabase db reset` and preview branches match production.
 
 ## Required GitHub secrets
 
