@@ -70,6 +70,11 @@ hand. The flow is seamless if you follow it:
 2. Commit + open a PR. On the PR the Action runs `db push --dry-run` (review
    gate); on merge to `main` it runs `db push`, which records the version =
    **your filename's timestamp**. Filename == recorded version, so no drift.
+3. **New `public` table → grant Data API access in the same migration:**
+   `grant select, insert, update, delete on public.<t> to authenticated, service_role;`
+   Supabase stopped auto-granting on 2026-10-30; without it supabase-js gets
+   "permission denied". `scripts/check_migration_grants.py` fails the PR
+   otherwise. See supabase/README.md, "Data API grants".
 
 **Do NOT `mcp__Supabase__apply_migration` to ship schema.** It stamps its own
 clock version (e.g. `20260701121837`) that won't match your filename

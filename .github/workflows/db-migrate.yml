@@ -22,12 +22,14 @@ on:
     paths:
       - "supabase/migrations/**"
       - "supabase/config.toml"
+      - "scripts/check_migration_grants.py"
       - ".github/workflows/db-migrate.yml"
   pull_request:
     branches: [main]
     paths:
       - "supabase/migrations/**"
       - "supabase/config.toml"
+      - "scripts/check_migration_grants.py"
       - ".github/workflows/db-migrate.yml"
 
 # Never run two migration jobs against the same DB at once.
@@ -47,6 +49,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Every new public table needs explicit Data API grants (Supabase stopped
+      # adding them automatically on 2026-10-30). Fails before anything ships.
+      - name: Check Data API grants
+        run: python3 scripts/check_migration_grants.py
 
       # Pinned, not `latest`: resolving `latest` makes an unauthenticated
       # GitHub API call per run, which intermittently fails the whole job with
