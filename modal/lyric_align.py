@@ -232,9 +232,10 @@ def plan_windows(
     leads: dict[int, int] = {}
     anchors = line_anchors(lines, asr_words, leads=leads)
 
-    # A run of identical lines (a chorus repeated N times) cannot be anchored
-    # line-by-line: every repeat matches the ASR equally well, so difflib pairs
-    # them arbitrarily and the repeats land scattered across the section. Drop
+    # A run of repeats (one line, or a whole stanza, sung N times back to
+    # back) cannot be anchored line-by-line: every copy matches the ASR equally
+    # well, so difflib pairs lines with the wrong copy and the repeats land
+    # scattered across the section. Drop
     # anchors inside such a run and let the whole run share one window — the
     # aligner then distributes the repeats evenly across exactly the audio
     # bounded by the distinct lines on either side, which is what a repeated
@@ -320,17 +321,37 @@ def plan_windows(
 
 
 def _repeated_line_indices(lines: list[str]) -> set[int]:
-    """Indices of lines identical to an adjacent line (a repeated refrain)."""
+    """Indices of lines inside a back-to-back repeat of a block of lines.
+
+    Covers a single line sung N times in a row ("fade away" x3) and a
+    multi-line stanza sung N times in a row (a four-line outro chorus x3).
+    In both cases every copy matches the ASR equally well, so the matcher
+    pairs lines with the wrong copy. Repeats separated by other lines (a
+    chorus that returns after a verse) are not included: the distinct lines
+    between them keep the matcher honest.
+    """
     norm = [
         " ".join(t for t in (normalize_token(w) for w in line.split()) if t)
         for line in lines
     ]
-    return {
-        i
-        for i in range(len(norm))
-        if (i > 0 and norm[i] == norm[i - 1])
-        or (i + 1 < len(norm) and norm[i] == norm[i + 1])
-    }
+    n = len(norm)
+    out: set[int] = set()
+    for period in range(1, n // 2 + 1):
+        i = 0
+        while i + 2 * period <= n:
+            block = norm[i:i + period]
+            copies = 1
+            while (
+                i + (copies + 1) * period <= n
+                and norm[i + copies * period:i + (copies + 1) * period] == block
+            ):
+                copies += 1
+            if copies >= 2 and any(block):
+                out.update(range(i, i + copies * period))
+                i += copies * period
+            else:
+                i += 1
+    return out
 
 
 def _required_s(lines: tuple[str, ...]) -> float:

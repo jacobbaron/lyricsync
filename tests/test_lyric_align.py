@@ -181,6 +181,56 @@ def test_repeated_refrain_shares_one_window():
     assert not refrain[0].anchored
 
 
+def test_repeated_stanza_is_not_anchored_line_by_line():
+    """A multi-line stanza sung several times back to back has the same
+    ambiguity as a repeated single line: each copy matches the ASR equally
+    well, so difflib pairs a line in copy 1 with its twin in copy 2. Here the
+    ASR missed copy 1's third line; anchored line-by-line, that line would be
+    pinned to copy 2's audio and the lines between squeezed into what is left.
+    The whole run must share one window instead."""
+    stanza = ["gonna pick it up", "gonna put it back",
+              "just give me an hour", "to clear this stuff attack"]
+    lines = ["the slow line before"] + stanza * 3 + ["the final line after"]
+    asr = words(
+        [
+            ("the", 1.0, 1.3), ("slow", 1.3, 1.8), ("line", 1.8, 2.2),
+            ("before", 2.2, 3.0),
+            # copy 1: the ASR heard only the first two lines
+            ("gonna", 5.0, 5.3), ("pick", 5.3, 5.6), ("it", 5.6, 5.8),
+            ("up", 5.8, 6.2),
+            ("gonna", 7.0, 7.3), ("put", 7.3, 7.6), ("it", 7.6, 7.8),
+            ("back", 7.8, 8.2),
+            # copy 2: only its third line
+            ("just", 17.0, 17.3), ("give", 17.3, 17.6), ("me", 17.6, 17.8),
+            ("an", 17.8, 18.0), ("hour", 18.0, 18.6),
+            # copy 3: only its last line
+            ("to", 27.0, 27.2), ("clear", 27.2, 27.6), ("this", 27.6, 27.8),
+            ("stuff", 27.8, 28.2), ("attack", 28.2, 30.0),
+            ("the", 40.0, 40.3), ("final", 40.3, 40.8), ("line", 40.8, 41.2),
+            ("after", 41.2, 42.0),
+        ]
+    )
+    wins = la.plan_windows(lines, asr, duration=50.0)
+    run = [w for w in wins if "gonna pick it up" in w.lines]
+    assert len(run) == 1
+    assert run[0].lines == tuple(stanza * 3)
+    assert not run[0].anchored
+    # bounded by the distinct lines on either side, not by a copy's twin
+    assert run[0].start < 5.0 and run[0].end > 30.0
+
+
+def test_repeat_detection_ignores_a_chorus_separated_by_a_verse():
+    """A chorus that returns after other lines is not ambiguous: the distinct
+    lines between the copies keep the matcher on the right one."""
+    lines = ["chorus one", "chorus two", "verse line", "chorus one", "chorus two"]
+    assert la._repeated_line_indices(lines) == set()
+
+
+def test_repeat_detection_finds_line_and_stanza_runs():
+    lines = ["a", "b", "b", "b", "c", "d", "e", "d", "e", "f"]
+    assert la._repeated_line_indices(lines) == {1, 2, 3, 5, 6, 7, 8}
+
+
 def test_starved_window_is_merged_into_a_neighbour():
     """Anchors that cluster too tightly for the text would starve the aligner;
     the window is merged rather than left sub-second."""
