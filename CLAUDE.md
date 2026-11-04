@@ -210,6 +210,10 @@ e.g. for exaggerated "bad room" gags).
 `crop` (`{x, y, w, h}` fractions of the source frame, via `set_crop` or
 `insert_clip`) zooms into a region — e.g. face close-ups cut from one wide
 shot, kept in sync by reusing the wide's `src_start`/`src_end`.
+To animate between two crops of the same clip (a smooth push-in from the wide
+to a face, or back out) instead of jump-cutting, set the later item's
+`transition_in` to `{"type": "zoom", "duration": 0.5, "easing": "ease_in_out"}`
+via `set_transition` (opt-in per cut; doesn't change timing or the bed).
 
 ⚠️ **Vocabulary:** "crop" here means **trimming the time range** (`start`/`end`),
 **not** reframing the picture.
