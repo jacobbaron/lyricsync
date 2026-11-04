@@ -57,6 +57,7 @@ DEFAULT_W = 1080
 DEFAULT_H = 1920
 DEFAULT_FPS = 30
 AUDIO_SR = 48000
+CLICK_FADE_S = 0.004  # fade at each audio join so a hard cut doesn't click
 
 # Padding baked into timelines built from quote ranges, matching the implicit
 # ±0.08 s the legacy render applied around each trim point.
@@ -1893,6 +1894,51 @@ def compile_timeline(
     def fit_audio(k: int) -> str:
         return f",apad,atrim=end_sample={round(frames[k] * sr / fps)}"
 
+    # Continuous audio runs. Cutting between framings of one take (a close-up
+    # and a wide cut from the same clip, back to back in source time) must not
+    # touch the sound, but decoding each item from its own seeked input and
+    # snapping it to whole frames leaves a few samples skipped or repeated at
+    # every join, which is heard as a click. So in a cut-only graph, items that
+    # continue the previous one in source time take their audio from ONE input
+    # spanning the run, trimmed to the run's total frame count (sync stays
+    # within half a frame, as before). Each joined segment also gets a few-ms
+    # fade at both ends so a jump between unrelated moments doesn't click.
+    def _continues(prev: dict, cur: dict) -> bool:
+        if prev.get("kind") != "clip" or cur.get("kind") != "clip":
+            return False
+        same = (prev.get("clip_id") and prev.get("clip_id") == cur.get("clip_id")) or (
+            not prev.get("clip_id") and not cur.get("clip_id")
+            and prev.get("source") == cur.get("source")
+        )
+        return bool(
+            same
+            and float(prev.get("speed") or 1.0) == 1.0
+            and float(cur.get("speed") or 1.0) == 1.0
+            and prev.get("audio_fx") == cur.get("audio_fx")
+            and bool(prev.get("mute")) == bool(cur.get("mute"))
+            and abs(float(cur["src_start"]) - float(prev["src_end"])) < 1e-3
+        )
+
+    runs: list[list[int]] = []
+    for k, item in enumerate(vitems):
+        if runs and not has_xfade and _continues(vitems[runs[-1][-1]], item):
+            runs[-1].append(k)
+        else:
+            runs.append([k])
+    run_audio = not has_xfade and any(len(r) > 1 for r in runs)
+    in_run = {k for r in runs if len(r) > 1 for k in r}
+
+    def click_guard(n_samples: int) -> str:
+        if len(vitems) < 2 or has_xfade:
+            return ""
+        d = CLICK_FADE_S
+        if n_samples / sr <= 4 * d:
+            return ""
+        return (
+            f",afade=t=in:d={d:.3f}"
+            f",afade=t=out:st={n_samples / sr - d:.6f}:d={d:.3f}"
+        )
+
     inputs: list[list[str]] = []
     parts: list[str] = []
     in_idx = 0
@@ -1987,16 +2033,53 @@ def compile_timeline(
                 parts.append(f"[zm{i}]null{fit_video(i)}[v{i}]")
         else:
             parts.append(f"[{vidx}:v]{vsetpts},{vchain}{fit_video(i)}[v{i}]")
-        parts.append(
-            f"[{vidx}:a]asetpts=PTS-STARTPTS,{aspeed}"
-            f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}{mute_chain}"
-            f"{fit_audio(i)}[a{i}]"
+        if i not in in_run:
+            parts.append(
+                f"[{vidx}:a]asetpts=PTS-STARTPTS,{aspeed}"
+                f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}{mute_chain}"
+                f"{fit_audio(i)}{click_guard(round(frames[i] * sr / fps))}[a{i}]"
+            )
+
+    # One audio input per continuous run (see _continues above).
+    seg_audio: list[str] = []
+    for r in runs:
+        if len(r) == 1:
+            seg_audio.append(f"a{r[0]}")
+            continue
+        first, last = vitems[r[0]], vitems[r[-1]]
+        start = float(first["src_start"])
+        span = float(last["src_end"]) - start
+        inputs.append(
+            ["-ss", f"{start:.3f}", "-t", f"{span:.3f}", "-i", str(resolve_source(first))]
         )
+        ridx = in_idx
+        in_idx += 1
+        afx = first.get("audio_fx")
+        afx_chain = "," + AUDIO_FX[afx] if afx in AUDIO_FX else ""
+        mute_chain = ",volume=0" if first.get("mute") else ""
+        n = round(sum(frames[k] for k in r) * sr / fps)
+        label = f"ar{r[0]}"
+        parts.append(
+            f"[{ridx}:a]asetpts=PTS-STARTPTS,aresample={sr},"
+            f"aformat=channel_layouts=stereo{afx_chain}{mute_chain}"
+            f",apad,atrim=end_sample={n}{click_guard(n)}[{label}]"
+        )
+        seg_audio.append(label)
 
     # Join the per-item streams.
     if len(vitems) == 1:
         cv, ca = "v0", "a0"
         out_dur = seg_dur(0)
+    elif not has_xfade and run_audio:
+        vin = "".join(f"[v{i}]" for i in range(len(vitems)))
+        parts.append(f"{vin}concat=n={len(vitems)}:v=1:a=0[vcat]")
+        if len(seg_audio) == 1:
+            parts.append(f"[{seg_audio[0]}]anull[acat]")
+        else:
+            ain = "".join(f"[{a}]" for a in seg_audio)
+            parts.append(f"{ain}concat=n={len(seg_audio)}:v=0:a=1[acat]")
+        cv, ca = "vcat", "acat"
+        out_dur = sum(seg_dur(k) for k in range(len(vitems)))
     elif not has_xfade:
         concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(vitems)))
         parts.append(f"{concat_in}concat=n={len(vitems)}:v=1:a=1[vcat][acat]")

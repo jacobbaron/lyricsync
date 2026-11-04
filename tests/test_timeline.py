@@ -362,6 +362,43 @@ class TestCompile:
             ["-ss", "10.000", "-t", "4.000", "-i", "/cache/IMG_0001.mov"],
         ]
 
+    def test_contiguous_cuts_share_one_audio_input(self):
+        # Close-up / wide cuts from one take, back to back in source time: the
+        # sound must play straight through (no per-item seams that click).
+        timeline = make_timeline(3)
+        items = tl.video_items(timeline)
+        items[1]["src_start"], items[1]["src_end"] = 4.0, 6.5
+        items[1]["crop"] = {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
+        items[2]["src_start"], items[2]["src_end"] = 6.5, 9.0
+        result = compile_simple(timeline)
+        fc = result["filter_complex"]
+        assert result["inputs"][-1] == [
+            "-ss", "0.000", "-t", "9.000", "-i", "/cache/IMG_0001.mov",
+        ]
+        assert "concat=n=3:v=1:a=0[vcat]" in fc
+        assert "[3:a]" in fc and "atrim=end_sample=432000" in fc
+        assert "[0:a]" not in fc and "[1:a]" not in fc
+        assert fc.endswith("[aout]")
+
+    def test_runs_and_jumps_mix(self):
+        timeline = make_timeline(3)
+        items = tl.video_items(timeline)
+        items[1]["src_start"], items[1]["src_end"] = 4.0, 6.0  # continues v1
+        # v3 jumps to 20s: its own audio, joined with a short fade
+        result = compile_simple(timeline)
+        fc = result["filter_complex"]
+        assert "concat=n=2:v=0:a=1[acat]" in fc
+        assert "[2:a]" in fc
+        assert f"afade=t=in:d={tl.CLICK_FADE_S:.3f}" in fc
+
+    def test_non_contiguous_cuts_get_click_guard(self):
+        fc = compile_simple(make_timeline(2))["filter_complex"]
+        assert "concat=n=2:v=1:a=1" in fc
+        assert fc.count("afade=t=in") == 2 and fc.count("afade=t=out") == 2
+
+    def test_single_item_has_no_click_guard(self):
+        assert "afade" not in compile_simple(make_timeline(1))["filter_complex"]
+
     def test_single_item_no_concat(self):
         result = compile_simple(make_timeline(1))
         assert "concat" not in result["filter_complex"]
