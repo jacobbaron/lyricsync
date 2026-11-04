@@ -60,6 +60,17 @@ Implementation map:
   `{"type": "crossfade", "duration": s}` overlaps the two (total duration
   shrinks by `s`). The crossfade must be shorter than both adjacent items,
   ≤ 3 s, and the first item's `transition_in` must be null.
+- `{"type": "zoom", "duration": s, "easing": e}` animates the framing instead
+  of cutting it: over the first `s` seconds of this item (default 0.5, ≤ 3,
+  shorter than the item) the picture glides from the previous item's `crop`
+  to this item's `crop` (no crop = the full frame). Only valid between two
+  items cut from the **same clip** (same `clip_id`, or same `source`); a
+  structural edit that puts a different shot in front turns it back into a
+  hard cut. Nothing overlaps, so durations, a music bed and captions are
+  unaffected. `easing`: `ease_in_out` (default), `linear`, `ease_in`,
+  `ease_out`. The move is a pure zoom about the point the two framings share
+  (a push-in onto a face doesn't drift sideways), with the zoom factor
+  interpolated geometrically so its speed feels even. Opt-in per cut.
 - Text items live in **output time** (seconds into the rendered video), so
   they stay put when the video track is re-cut underneath them. `position` is
   `center | upper | lower`; `wrap` is max characters per line. `box_opacity`
@@ -110,8 +121,8 @@ invalid, nothing is saved and the error message says which op failed and why.
 | `set_speed` | `id`, `speed` | 0.25–20.0; clips only |
 | `set_mute` | `id`, `mute` | `true` silences the clip (e.g. silent time-lapse); clips only |
 | `set_crop` | `id`, `crop` | `{x, y, w, h}` (fractions 0–1 of the source frame) zooms into that region; `null` clears. Clips only — see "Crop / zoom" below |
-| `set_transition` | `id`, `transition` | `null` or `{"type": "crossfade", "duration": s}` (joins to previous item) |
-| `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`?, `clip_id`?, `crop`? | Appends when `index` omitted. `clip_id` (uuid) references a clip in *any* project (cross-project cuts — see `docs/cross_project_editing.md`); `source` is then just a label |
+| `set_transition` | `id`, `transition` | `null`, `{"type": "crossfade", "duration": s}`, or `{"type": "zoom", "duration"?: s, "easing"?: e}` (joins to previous item; zoom = animated crop-to-crop move within one clip) |
+| `insert_clip` | `source`, `src_start`, `src_end`, `index`?, `speed`?, `clip_id`?, `crop`?, `transition`? | Appends when `index` omitted. `clip_id` (uuid) references a clip in *any* project (cross-project cuts — see `docs/cross_project_editing.md`); `source` is then just a label |
 | `insert_blank` | `duration`, `index`? | Black + silence spacer |
 | `add_text` | `text`, `start`, `end`, `size`?, `position`?, `wrap`?, `box_opacity`?, `color`?, `outline`?, `outline_color`?, `fade`?, `font`?, `anim`?, `highlight_color`?, `words`? | Output-time window |
 | `update_text` | `id`, any text fields | Partial update |

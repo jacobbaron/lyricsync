@@ -948,3 +948,139 @@ class TestCrop:
         fc = compile_simple(t)["filter_complex"]
         v1 = [p for p in fc.split(";") if p.startswith("[1:v]")][0]
         assert v1.endswith("settb=AVTB[v1]")
+
+
+# ---------------------------------------------------------------------------
+# zoom transition (animated crop-to-crop move)
+# ---------------------------------------------------------------------------
+
+ZOOM_FACE = {"x": 0.45, "y": 0.18, "w": 0.42, "h": 0.42}
+
+
+def zoom_timeline():
+    """Wide then a face crop of the same clip, continuous in source time."""
+    timeline = make_timeline(2)
+    a, b = tl.video_items(timeline)
+    a["src_start"], a["src_end"] = 0.0, 2.0
+    b["src_start"], b["src_end"] = 2.0, 4.0
+    b["crop"] = dict(ZOOM_FACE)
+    return timeline
+
+
+class TestZoomTransition:
+    def test_set_transition_fills_defaults(self):
+        out = tl.apply_ops(zoom_timeline(), [
+            {"op": "set_transition", "id": "v2", "transition": {"type": "zoom"}},
+        ])
+        assert tl.video_items(out)[1]["transition_in"] == {
+            "type": "zoom", "duration": 0.5, "easing": "ease_in_out",
+        }
+
+    def test_zoom_keeps_duration(self):
+        timeline = zoom_timeline()
+        tl.video_items(timeline)[1]["transition_in"] = {"type": "zoom"}
+        assert tl.timeline_duration(timeline) == pytest.approx(4.0)
+        assert compile_simple(timeline)["duration"] == pytest.approx(4.0)
+
+    def test_rejects_different_clip(self):
+        timeline = zoom_timeline()
+        tl.video_items(timeline)[1]["source"] = "IMG_0002.mov"
+        with pytest.raises(tl.TimelineError, match="same clip"):
+            tl.apply_ops(timeline, [
+                {"op": "set_transition", "id": "v2",
+                 "transition": {"type": "zoom"}},
+            ])
+
+    def test_rejects_blank_neighbour(self):
+        timeline = zoom_timeline()
+        timeline = tl.apply_ops(timeline, [{"op": "insert_blank", "index": 1,
+                                            "duration": 1.0}])
+        with pytest.raises(tl.TimelineError, match="same clip"):
+            tl.apply_ops(timeline, [
+                {"op": "set_transition", "id": "v2",
+                 "transition": {"type": "zoom"}},
+            ])
+
+    def test_same_clip_id_across_labels(self):
+        timeline = zoom_timeline()
+        a, b = tl.video_items(timeline)
+        a["clip_id"] = b["clip_id"] = "253defde-dd5b-4d2b-9674-72d6d1b73b62"
+        b["source"] = "label only"
+        b["transition_in"] = {"type": "zoom"}
+        assert tl.validate_timeline(timeline) == []
+
+    @pytest.mark.parametrize("tr, needle", [
+        ({"type": "zoom", "duration": 0}, "zoom duration"),
+        ({"type": "zoom", "duration": 3.5}, "zoom duration"),
+        ({"type": "zoom", "duration": 2.0}, "shorter than the item"),
+        ({"type": "zoom", "easing": "bounce"}, "zoom easing"),
+    ])
+    def test_bad_zoom_rejected(self, tr, needle):
+        timeline = zoom_timeline()
+        tl.video_items(timeline)[1]["transition_in"] = tr
+        errors = tl.validate_timeline(timeline)
+        assert any(needle in e for e in errors), errors
+
+    def test_zoom_on_first_item_rejected(self):
+        timeline = zoom_timeline()
+        tl.video_items(timeline)[0]["transition_in"] = {"type": "zoom"}
+        assert any("first item" in e for e in tl.validate_timeline(timeline))
+
+    def test_move_breaking_pair_falls_back_to_hard_cut(self):
+        timeline = make_timeline(3)
+        items = tl.video_items(timeline)
+        items[2]["source"] = "IMG_0002.mov"
+        items[1]["transition_in"] = {"type": "zoom", "duration": 0.5,
+                                     "easing": "ease_in_out"}
+        out = tl.apply_ops(timeline, [{"op": "move", "id": "v3", "to_index": 1}])
+        ids = [it["id"] for it in tl.video_items(out)]
+        assert ids == ["v1", "v3", "v2"]
+        assert tl.video_items(out)[2]["transition_in"] is None
+
+    def test_insert_clip_with_zoom(self):
+        timeline = make_timeline(1)
+        out = tl.apply_ops(timeline, [{
+            "op": "insert_clip", "source": "IMG_0001.mov", "src_start": 4.0,
+            "src_end": 6.0, "crop": ZOOM_FACE,
+            "transition": {"type": "zoom", "duration": 0.4, "easing": "linear"},
+        }])
+        assert tl.video_items(out)[1]["transition_in"]["easing"] == "linear"
+
+    def test_graph_animates_head_then_static_tail(self):
+        timeline = zoom_timeline()
+        tl.video_items(timeline)[1]["transition_in"] = {"type": "zoom"}
+        fc = compile_simple(timeline)["filter_complex"]
+        # 0.5 s at 30 fps = 15 animated frames, then the usual crop chain.
+        assert "fps=30,split=2[zs1][zt1]" in fc
+        assert "[zs1]trim=end_frame=15" in fc
+        assert "[zt1]trim=start_frame=15" in fc
+        assert "perspective=" in fc and "eval=frame" in fc
+        assert "min(in/15,1)" in fc
+        assert "[zm1][zh1]concat=n=2:v=1:a=0" in fc
+        assert "crop=w=iw*0.42" in fc  # static tail keeps the crop
+        # Item lengths still snap to whole frames (60 + 60).
+        assert "trim=end_frame=60[v1]" in fc
+
+    def test_framing_matches_static_render(self):
+        # Uncropped 9:16 source on a 9:16 canvas: the whole frame.
+        assert tl._framing(None, (1080, 1920), 1080, 1920) == pytest.approx(
+            (0.5, 0.5, 1.0, 1.0))
+        # Square crop on a 9:16 canvas covers: full crop height, trimmed width.
+        cx, cy, vw, vh = tl._framing(ZOOM_FACE, (1080, 1920), 1080, 1920)
+        assert (cx, cy) == pytest.approx((0.66, 0.39))
+        assert vh == pytest.approx(0.42 * 1080 / 1920 * 1920 / 1080 * 1)
+        assert vw == pytest.approx(0.42)
+        # 9:16 source letterboxed on a square canvas: window wider than source.
+        _, _, vw, vh = tl._framing(None, (1080, 1920), 1080, 1080)
+        assert vh == pytest.approx(1.0) and vw > 1.0
+
+    def test_letterboxed_end_pads_source(self):
+        timeline = zoom_timeline()
+        timeline["width"] = timeline["height"] = 1080
+        tl.video_items(timeline)[1]["transition_in"] = {"type": "zoom"}
+        fc = tl.compile_timeline(
+            timeline, resolve_source=lambda item: "/cache/x.mov",
+            workdir="/tmp/render", font_path="/root/f.ttf",
+            source_dims=lambda item: (1080, 1920),
+        )["filter_complex"]
+        assert "pad=w='ceil(iw*" in fc

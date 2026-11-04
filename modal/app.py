@@ -3964,6 +3964,10 @@ def _render_worker(story_id: str) -> None:
                 font_path=OVERLAY_FONT,
                 resolve_music=lambda song_id: music_paths.get(song_id),
                 fonts_dir=CAPTION_FONTS_DIR,
+                # Display size per source, for animated zoom transitions.
+                source_dims=lambda item: _probe_display_dims(
+                    local_paths[_resolve_r2_key(item)]
+                ),
             )
             for text_path, content in compiled["text_files"]:
                 Path(text_path).write_text(content)

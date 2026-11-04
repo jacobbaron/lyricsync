@@ -35,7 +35,10 @@ Conventions:
   - Video items play in array order. src_start/src_end are source-clip seconds;
     speed changes playback rate (output duration = span / speed).
   - transition_in describes how an item is joined to the PREVIOUS item
-    (null = hard cut). It is meaningless on the first item.
+    (null = hard cut). It is meaningless on the first item. Types:
+    {"type": "crossfade", "duration": s} dissolves (the two items overlap);
+    {"type": "zoom", "duration": s, "easing": e} glides the framing from the
+    previous item's crop to this one's (same clip only; no overlap).
   - Text items live in OUTPUT time (seconds into the rendered video), so they
     survive reordering of the video track underneath them.
 """
@@ -62,6 +65,18 @@ RANGE_PAD_S = 0.08
 MIN_SPEED, MAX_SPEED = 0.25, 20.0  # up to 20x for time-lapse speed-ups
 MIN_CROP = 0.1  # smallest crop side (fraction of the frame) — caps zoom at 10x
 MAX_CROSSFADE_S = 3.0
+# Animated crop-to-crop move ("zoom" transition_in): the camera glides from the
+# previous item's framing to this item's over the first `duration` seconds.
+DEFAULT_ZOOM_S = 0.5
+MAX_ZOOM_S = 3.0
+DEFAULT_ZOOM_EASING = "ease_in_out"
+# Progress curves p(u) for u in [0, 1], as ffmpeg expressions of `u`.
+ZOOM_EASINGS = {
+    "ease_in_out": "(1-cos(PI*{u}))/2",
+    "linear": "{u}",
+    "ease_in": "(1-cos(PI*{u}/2))",
+    "ease_out": "sin(PI*{u}/2)",
+}
 TEXT_POSITIONS = ("center", "upper", "lower")
 # Alpha of the box behind caption text. Dark enough to stay readable over the
 # bright, busy footage captions usually sit on; override per item via
@@ -338,6 +353,69 @@ def _validate_crop(crop: object, label: str) -> list[str]:
     return errors
 
 
+def _same_clip(a: dict, b: dict) -> bool:
+    """True when two video items cut from the same source clip — the only case
+    where a framing can glide from one to the other (it's one camera)."""
+    if a.get("kind") != "clip" or b.get("kind") != "clip":
+        return False
+    if a.get("clip_id") and b.get("clip_id"):
+        return a["clip_id"] == b["clip_id"]
+    if a.get("clip_id") or b.get("clip_id"):
+        # One global reference, one home-project filename: can't tell for
+        # sure, so only allow it when the labels agree too.
+        return bool(a.get("source")) and a.get("source") == b.get("source")
+    return bool(a.get("source")) and a.get("source") == b.get("source")
+
+
+def _zoom_params(tr: dict) -> tuple[float, str]:
+    """(duration, easing) of a zoom transition, with defaults filled in."""
+    dur = tr.get("duration")
+    return (
+        DEFAULT_ZOOM_S if dur is None else float(dur),
+        tr.get("easing") or DEFAULT_ZOOM_EASING,
+    )
+
+
+def _validate_zoom(
+    tr: dict, prev: dict, item: dict, label: str, item_dur: float | None,
+) -> list[str]:
+    """Validate a {"type": "zoom"} transition_in joining `prev` → `item`."""
+    dur = tr.get("duration")
+    if dur is not None and (
+        isinstance(dur, bool) or not isinstance(dur, (int, float))
+        or not (0 < float(dur) <= MAX_ZOOM_S)
+    ):
+        return [f"{label}: zoom duration must be in (0, {MAX_ZOOM_S}]"]
+    easing = tr.get("easing")
+    if easing is not None and easing not in ZOOM_EASINGS:
+        return [f"{label}: zoom easing must be one of {sorted(ZOOM_EASINGS)} "
+                f"(got {easing!r})"]
+    if not _same_clip(prev, item):
+        return [f"{label}: a zoom transition only works between two items "
+                "cut from the same clip (it moves the framing within one "
+                "shot); use a hard cut or crossfade between different clips"]
+    d, _ = _zoom_params(tr)
+    if item_dur is not None and d >= item_dur:
+        return [f"{label}: zoom ({d:.2f}s) must be shorter than the item "
+                f"it lands on ({item_dur:.2f}s)"]
+    return []
+
+
+def _drop_stale_zooms(timeline: dict) -> None:
+    """Clear zoom transitions whose previous item is no longer the same clip.
+
+    A move/delete/insert can put a different shot in front of a zoom; the
+    glide then has nothing to move from, so it falls back to a hard cut
+    instead of failing the whole edit (like a leading transition_in)."""
+    vitems = video_items(timeline)
+    for i, item in enumerate(vitems):
+        tr = item.get("transition_in")
+        if isinstance(tr, dict) and tr.get("type") == "zoom" and (
+            i == 0 or not _same_clip(vitems[i - 1], item)
+        ):
+            item["transition_in"] = None
+
+
 def validate_timeline(timeline: dict) -> list[str]:
     """Return a list of error strings; empty list means the timeline renders."""
     errors: list[str] = []
@@ -456,9 +534,16 @@ def validate_timeline(timeline: dict) -> list[str]:
         if i == 0:
             errors.append(f"{label}: first item cannot have a transition_in")
             continue
+        if isinstance(tr, dict) and tr.get("type") == "zoom":
+            errors.extend(_validate_zoom(
+                tr, vitems[i - 1], item, label,
+                durations[i] if i < len(durations) else None,
+            ))
+            continue
         if not isinstance(tr, dict) or tr.get("type") != "crossfade":
-            errors.append(f"{label}: transition_in must be null or "
-                          "{{'type': 'crossfade', 'duration': s}}")
+            errors.append(f"{label}: transition_in must be null, "
+                          "{'type': 'crossfade', 'duration': s} or "
+                          "{'type': 'zoom', 'duration': s, 'easing': e}")
             continue
         td = tr.get("duration")
         if not isinstance(td, (int, float)) or not (0 < float(td) <= MAX_CROSSFADE_S):
@@ -727,6 +812,15 @@ def _op_set_crop(timeline: dict, op: dict) -> None:
         item["crop"] = {k: float(crop[k]) for k in ("x", "y", "w", "h")}
 
 
+def _safe_duration(item: dict) -> float | None:
+    """item_duration, or None when the item's fields aren't valid yet (the
+    final validate_timeline reports those)."""
+    try:
+        return item_duration(item)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def _op_set_transition(timeline: dict, op: dict) -> None:
     idx, item = _find_video(timeline, op.get("id", ""))
     tr = op.get("transition")
@@ -735,10 +829,21 @@ def _op_set_transition(timeline: dict, op: dict) -> None:
             raise TimelineError(
                 "set_transition: the first item cannot have a transition_in"
             )
-        if not isinstance(tr, dict) or tr.get("type") != "crossfade":
+        if isinstance(tr, dict) and tr.get("type") == "zoom":
+            errs = _validate_zoom(
+                tr, video_items(timeline)[idx - 1], item, "set_transition",
+                _safe_duration(item),
+            )
+            if errs:
+                raise TimelineError("; ".join(errs))
+            d, easing = _zoom_params(tr)
+            tr = {"type": "zoom", "duration": d, "easing": easing}
+        elif not isinstance(tr, dict) or tr.get("type") != "crossfade":
             raise TimelineError(
-                "set_transition: transition must be null or "
-                "{'type': 'crossfade', 'duration': seconds}"
+                "set_transition: transition must be null, "
+                "{'type': 'crossfade', 'duration': seconds} or "
+                "{'type': 'zoom', 'duration': seconds, 'easing': "
+                "'ease_in_out'|'linear'|'ease_in'|'ease_out'}"
             )
     item["transition_in"] = tr
 
@@ -772,6 +877,11 @@ def _op_insert_clip(timeline: dict, op: dict) -> None:
             f"insert_clip: index must be between 0 and {len(items)} (got {index!r})"
         )
     items.insert(index, item)
+    if op.get("transition") is not None:
+        # Same rules as set_transition (e.g. a zoom from the previous shot).
+        _op_set_transition(
+            timeline, {"id": item["id"], "transition": op["transition"]}
+        )
 
 
 def _op_insert_blank(timeline: dict, op: dict) -> None:
@@ -916,6 +1026,7 @@ def apply_ops(
             vitems = video_items(result)
             if vitems and vitems[0].get("transition_in"):
                 vitems[0]["transition_in"] = None
+            _drop_stale_zooms(result)
             continue
         fn = _OPS.get(name)
         if fn is None:
@@ -927,10 +1038,12 @@ def apply_ops(
         except TimelineError as exc:
             raise TimelineError(f"op {i} ({name}): {exc}") from exc
         # Structural ops can promote an item to first position; a leading
-        # transition_in has nothing to fade from, so drop it.
+        # transition_in has nothing to fade from, so drop it. Likewise a zoom
+        # whose previous shot is no longer the same clip.
         vitems = video_items(result)
         if vitems and vitems[0].get("transition_in"):
             vitems[0]["transition_in"] = None
+        _drop_stale_zooms(result)
 
     errors = validate_timeline(result)
     if errors:
@@ -1576,6 +1689,88 @@ def _captions_module():
     return mod
 
 
+def _framing(
+    crop: dict | None, src: tuple[float, float], w: int, h: int,
+) -> tuple[float, float, float, float]:
+    """The part of the source a static item shows: (cx, cy, vw, vh) — centre
+    and size as fractions of the source frame. Mirrors the static render: a
+    crop is scaled to cover the canvas (centred, overflow trimmed); no crop
+    fits the whole frame (centred, padded), so vw/vh can exceed 1."""
+    iw, ih = src
+    if crop:
+        cw, ch = float(crop["w"]) * iw, float(crop["h"]) * ih
+        s = max(w / cw, h / ch)
+        cx = float(crop["x"]) + float(crop["w"]) / 2
+        cy = float(crop["y"]) + float(crop["h"]) / 2
+    else:
+        s = min(w / iw, h / ih)
+        cx = cy = 0.5
+    return cx, cy, w / (s * iw), h / (s * ih)
+
+
+def _zoom_filter(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+    n_frames: int, easing: str, w: int, h: int,
+) -> str:
+    """Filter chain that glides the visible window from framing `a` to `b`
+    over `n_frames` frames (frame 0 shows `a`; `b` is reached on the frame
+    after the last one). Input: the source at the output fps, timestamps from
+    0. Output: w x h.
+
+    The motion is a pure zoom about the one point that both framings share
+    (both windows have the canvas aspect, so one similarity maps a → b): that
+    point stays put on screen while everything else moves towards or away
+    from it, so a push-in onto a face never drifts sideways. The zoom factor
+    is interpolated geometrically, so its speed feels even.
+
+    Rendered with `perspective` (sub-pixel, per-frame corners in source
+    pixels) and then scaled to the canvas, so the window can move by fractions
+    of a pixel without the stair-step jitter of zoompan.
+    """
+    u = f"min(in/{n_frames},1)"
+    p = "(" + ZOOM_EASINGS[easing].format(u=u) + ")"
+    (ax, ay, aw, ah), (bx, by, bw, bh) = a, b
+    k = bw / aw  # window size ratio b/a (same on both axes)
+    if abs(1 - k) < 1e-4:
+        size_w, size_h = f"{aw:.6f}", f"{ah:.6f}"
+
+        def centre(ca: float, cb: float) -> str:
+            return f"({ca:.6f}+{cb - ca:.6f}*{p})"
+    else:
+        f = f"pow({k:.9f},{p})"  # window size relative to a
+        size_w, size_h = f"({aw:.6f}*{f})", f"({ah:.6f}*{f})"
+
+        def centre(ca: float, cb: float) -> str:
+            q = (cb - k * ca) / (1 - k)  # the fixed point
+            return f"({q:.6f}+{ca - q:.6f}*{f})"
+
+    # Pad the source if either window reaches past it (an uncropped end that
+    # letterboxes); every window in between lies inside both ends' bounds.
+    mx = max(0.0, *(abs(c - 0.5) + v / 2 - 0.5 for c, v in ((ax, aw), (bx, bw))))
+    my = max(0.0, *(abs(c - 0.5) + v / 2 - 0.5 for c, v in ((ay, ah), (by, bh))))
+    chain = ""
+    if mx > 1e-6 or my > 1e-6:
+        chain = (
+            f"pad=w='ceil(iw*{1 + 2 * mx:.6f}/2)*2'"
+            f":h='ceil(ih*{1 + 2 * my:.6f}/2)*2'"
+            f":x='(ow-iw)/2':y='(oh-ih)/2':color=black,"
+        )
+    cx, cy = centre(ax, bx), centre(ay, by)
+    # Source fraction -> pixel of the (possibly padded) input.
+    left = f"W*(0.5+({cx}-{size_w}/2-0.5)/{1 + 2 * mx:.6f})"
+    right = f"W*(0.5+({cx}+{size_w}/2-0.5)/{1 + 2 * mx:.6f})"
+    top = f"H*(0.5+({cy}-{size_h}/2-0.5)/{1 + 2 * my:.6f})"
+    bottom = f"H*(0.5+({cy}+{size_h}/2-0.5)/{1 + 2 * my:.6f})"
+    chain += (
+        f"perspective=x0='{left}':y0='{top}':x1='{right}':y1='{top}'"
+        f":x2='{left}':y2='{bottom}':x3='{right}':y3='{bottom}'"
+        f":interpolation=cubic:eval=frame,"
+        f"scale={w}:{h}:flags=bicubic,setsar=1"
+    )
+    return chain
+
+
 def _drawtext(item: dict, textfile: str, font_path: str) -> str:
     """Build one drawtext filter for a text item (output-time enable window)."""
     size = int(item.get("size") or 64)
@@ -1621,8 +1816,14 @@ def compile_timeline(
     font_path: str,
     resolve_music=None,
     fonts_dir: str | None = None,
+    source_dims=None,
 ) -> dict:
     """Compile a timeline into ffmpeg invocation pieces.
+
+    source_dims(item) -> (width, height) display size of a clip item's source,
+    or None. Only asked for items with a zoom transition (and the item before
+    them), to place the animated framing exactly; when it is missing the
+    source is assumed to share the canvas aspect.
 
     resolve_source(item) -> local file path for a clip item. The callback is
     passed the whole clip item so it can resolve cross-project clips by the
@@ -1752,7 +1953,40 @@ def compile_timeline(
             )
         else:
             vchain = vnorm
-        parts.append(f"[{vidx}:v]{vsetpts},{vchain}{fit_video(i)}[v{i}]")
+        tr = item.get("transition_in") if i else None
+        n_zoom = 0
+        if isinstance(tr, dict) and tr.get("type") == "zoom":
+            zdur, easing = _zoom_params(tr)
+            n_zoom = min(frames[i], max(1, round(zdur * fps)))
+        if n_zoom:
+            # Glide from the previous item's framing over the first n_zoom
+            # frames, then hand over to the usual static chain for the rest.
+            dims = source_dims(item) if source_dims else None
+            src = tuple(float(d) for d in dims) if dims else (float(w), float(h))
+            zf = _zoom_filter(
+                _framing(vitems[i - 1].get("crop"), src, w, h),
+                _framing(crop, src, w, h),
+                n_zoom, easing, w, h,
+            )
+            parts.append(
+                f"[{vidx}:v]{vsetpts},fps={fps},split=2[zs{i}][zt{i}]"
+            )
+            parts.append(
+                f"[zs{i}]trim=end_frame={n_zoom},setpts=PTS-STARTPTS,{zf}[zm{i}]"
+            )
+            if n_zoom < frames[i]:
+                parts.append(
+                    f"[zt{i}]trim=start_frame={n_zoom},setpts=PTS-STARTPTS,"
+                    f"{vchain}[zh{i}]"
+                )
+                parts.append(
+                    f"[zm{i}][zh{i}]concat=n=2:v=1:a=0{fit_video(i)}[v{i}]"
+                )
+            else:
+                parts.append(f"[zt{i}]nullsink")
+                parts.append(f"[zm{i}]null{fit_video(i)}[v{i}]")
+        else:
+            parts.append(f"[{vidx}:v]{vsetpts},{vchain}{fit_video(i)}[v{i}]")
         parts.append(
             f"[{vidx}:a]asetpts=PTS-STARTPTS,{aspeed}"
             f"aresample={sr},aformat=channel_layouts=stereo{afx_chain}{mute_chain}"
